@@ -1,0 +1,65 @@
+# Loam project config consumed by the `fluxor` CLI (see
+# ../standards/dependencies.md). Declares loam's cross-project
+# dependencies: fluxor (SDK + runtime) and clustor (the Raft substrate
+# whose fmod palette the composed metadata-plane profiles run against).
+
+[project]
+name    = "loam"
+version = "0.0.1"
+
+[dependencies]
+fluxor  = "0.0.1"
+clustor = "0.0.1"
+# wave provides the S3 protocol module (`s3`) + the wave-common source
+# artefact (s3_core SigV4 signer, s3_wire records) — relocated there per
+# rfc_storage_capability_symmetry §7.
+wave    = "0.0.1"
+
+[ci]
+targets = ["bcm2712"]
+[ci.hygiene]
+# Tiers where inline tests are banned: PIC modules are no_std (test
+# code can't even compile there) and src/ keeps tests in tests/
+# (enforced by `fluxor lint hygiene`).
+forbid_inline_tests = ["modules", "src"]
+mode                = "strict"
+
+[ci.test]
+# Shadow-checkout hard-fail guard (standards/test-tracking.md §7):
+# tests/ and examples/ are shadow-tracked in .git-shadow/, so a
+# checkout of the primary repo alone has zero files there — the cargo
+# test phases would pass vacuously and the e2e would have no graph to
+# boot. The guard fails CI instead.
+#
+# `s3_driven.sh` is the connector's behavioural gate: it stands up loam's own
+# `--s3-listen` gateway and drives PUT/GET/HEAD/DELETE through the s3_client
+# graph, chosen at runtime and signed per request, then reads the object back
+# with curl INDEPENDENTLY of the connector. The host vectors in
+# `tests/s3_wire_core.rs` pin the framing and the signature; this pins that a
+# real endpoint accepts them.
+# `tier_guard.sh` enforces the storage tier boundary
+# (rfc_storage_capability_symmetry §6): mechanics vs replicated rosters,
+# no upward common/ reach, no clustor from the mechanics tier.
+# `metadata_load.sh` drives the replicated metadata plane under offered
+# load and gates on conservation — every record the plane accepts is
+# either committed or refused, never dropped. Host tests cover the
+# splitting logic; only a real graph under load covers the seams
+# between the modules that carry it.
+# `composed_node.sh` puts a public surface on that plane in one graph and
+# gates both conservation claims at once: every proposal resolved, and
+# every request answered. It also runs a module the way a module is
+# actually run — loaded, at an address it was not linked for — which is
+# the one thing no host test can do.
+scripts = [
+  "tools/ci/shadow_guard.sh",
+  "tools/ci/tier_guard.sh",
+  "tools/e2e/s3_driven.sh",
+  "tools/e2e/metadata_load.sh",
+  "tools/e2e/composed_node.sh",
+]
+
+[ci.cargo]
+# Loam is a plain host workspace (no embedded-only root features):
+# the cargo-test phase runs at the project root and covers every
+# workspace member via default-members.
+host_tools_crate = "."

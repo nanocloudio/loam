@@ -1,0 +1,35 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+# Channels-as-state-surfaces discipline: this PIC owns the fleet
+# membership table and broadcasts the current FleetEpoch snapshot
+# on `fleet_epoch`. Consumers (admin_router, future EC body router,
+# future read-path router) cache the latest snapshot and compute
+# per-object targets locally via `loam_placement::pick_targets` —
+# there is no per-PUT RPC into this PIC.
+
+# Control input: FleetUpdate messages atomically replace the
+# membership list. Producers are the operator-CLI path (initial
+# seed via `params.seed_members`), the raft_metadata_client (when
+# membership itself is replicated), and a future healthcheck PIC.
+[[ports]]
+name = "fleet_updates"
+direction = "input"
+content_type = "OctetStream"
+
+# Authoritative broadcast: `[op:u8=0x60][epoch:u64][count:u8]
+# [members:count u8]`. Re-emitted on every membership change.
+[[ports]]
+name = "fleet_epoch"
+direction = "output"
+content_type = "OctetStream"
+
+# Metrics counters (broadcast/update/error rates). Not yet wired
+# in the step body — reserved for the telemetry_agg integration.
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+exempt = "in-arena state counters (ops/errors/scrub tallies) readable by the host harness; typed MSG_METRIC_SAMPLE emission is tracked RFC 0004 polish"

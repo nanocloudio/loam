@@ -1,0 +1,42 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+# Bridge between loam's raft_metadata_client (loam_decision_wire:
+# Propose/Committed, raw records) and a Clustor replica group
+# (3-byte-enveloped MSG_CLIENT_PROPOSAL into raft_engine.proposals;
+# MSG_COMMITTED_ENTRY from apply_pipeline.committed_entries). The loam
+# Propose record travels VERBATIM as Clustor's opaque command body, so
+# the committed entry hands back everything needed (plane, correlation
+# id, inner) to synthesize the loam Committed with a real witness epoch
+# (the Raft commit index).
+#
+# Params:
+#   witness_quorum — quorum size reported in Committed (default 1 for a
+#                    single-node group; set to the voter count).
+
+[[ports]]
+name = "proposals"
+direction = "input"
+content_type = "OctetStream"
+# raw loam_decision_wire Propose from raft_metadata_client.clustor_requests
+
+[[ports]]
+name = "commits"
+direction = "output"
+content_type = "OctetStream"
+# raw loam_decision_wire Committed to raft_metadata_client.clustor_commits
+
+[[ports]]
+name = "clustor_in"
+direction = "input"
+content_type = "OctetStream"
+# clustor-enveloped MSG_COMMITTED_ENTRY from apply_pipeline.committed_entries
+
+[[ports]]
+name = "clustor_out"
+direction = "output"
+content_type = "OctetStream"
+# clustor-enveloped MSG_CLIENT_PROPOSAL to raft_engine.proposals
+
+[observability]
+exempt = "in-arena state counters (ops/errors/scrub tallies) readable by the host harness; typed MSG_METRIC_SAMPLE emission is tracked RFC 0004 polish"

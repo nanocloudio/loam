@@ -1,0 +1,29 @@
+[control_plane]
+mode = "embedded"
+embedded_http_bind = "127.0.0.1:19100"
+embedded_raft_bind = "127.0.0.1:19101"
+cache_ttl_seconds = 5
+
+[storage]
+node_id = "local"
+default_fence = "replicated_durable"
+# AchievableFence values: volatile, local_durable, replicated_durable,
+# content_hashed, revision_monotone, view_consistent
+namespace_shards = 1
+object_shards = 1
+block_volume_count = 1
+max_object_bytes = 1073741824
+max_volume_bytes = 1099511627776
+
+[paths]
+data_dir = "data"
+wal_dir = "data/wal"
+object_dir = "data/objects"
+block_dir = "data/blocks"
+cache_dir = "data/cache"
+
+[fluxor]
+target = "linux"
+module_profile = "loam-linux-minimal"
+validate_graphs = true
+

@@ -1,0 +1,15 @@
+[package]
+name = "loam-client"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Loam Authors <eng@nanocloud.local>"]
+description = "Rust client for loam's admin surface — file put/get (single-shot and streamed), ranged reads, stat, list, delete over the loam-server unix admin socket. The consumer-facing crate for volume backends (nanocloud CsiPlugin), tooling, and tests."
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+tempfile = "3.23.0"

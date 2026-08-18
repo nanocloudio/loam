@@ -1,0 +1,11 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "acks"
+direction = "input"
+content_type = "OctetStream"
+required = true
+
+[observability]
+exempt = "diagnostic rate reporter; its output IS the measurement"

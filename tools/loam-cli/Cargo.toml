@@ -1,0 +1,30 @@
+[package]
+name = "loam-cli"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Loam Authors <eng@nanocloud.local>"]
+description = "Host dev CLI for Loam — links the loam library directly. The fluxor-native client over an admin channel is a follow-up (see .context/migration/PHASE_4_CLI_MIGRATION.md)."
+
+[[bin]]
+name = "loam"
+path = "src/main.rs"
+
+[[bin]]
+name = "loam-server"
+path = "src/server.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+tempfile = "3.23.0"
+anyhow = "1.0.95"
+clap = { version = "4.5.20", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.145", features = ["preserve_order"] }
+loam = { path = "../.." }
+
+[dev-dependencies]
+tempfile = "3.23.0"
+loam-client = { path = "../loam-client" }

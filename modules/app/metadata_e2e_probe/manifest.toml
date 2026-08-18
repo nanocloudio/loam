@@ -1,0 +1,21 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+# Runtime e2e probe for the replicated metadata plane: sends one
+# loam_decision_wire Propose into raft_metadata_client.metadata_ops and
+# expects a Committed on metadata_results whose inner bytes round-trip
+# and whose witness_epoch is a real Raft commit index (> 0). Success =
+# "[meta_e2e] PASS" in the log.
+
+[[ports]]
+name = "ops_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "results_in"
+direction = "input"
+content_type = "OctetStream"
+
+[observability]
+exempt = "self-contained e2e fixture; success is its PASS log"

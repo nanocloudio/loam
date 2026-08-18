@@ -1,0 +1,38 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+# Body fan-out router: sits between admin_router and a fleet of
+# body_store instances. Subscribes to placement_router's fleet_epoch
+# broadcast, caches the snapshot, and on each upstream body PUT
+# fans the bytes to N targets per rendezvous-hashing placement.
+# Semantics: all-must-succeed PUT; GET/HEAD fall back serially
+# through the ranked replica set, with read repair (a fallback GET
+# success re-PUTs the body to replicas that NAKed NOT_FOUND);
+# DELETE fans out to the full replica set.
+
+# Upstream-facing input — admin_router speaks loam_body_wire here.
+[[ports]]
+name = "body_requests"
+direction = "input"
+content_type = "OctetStream"
+
+# Upstream-facing output — PutResp / GetResp / NAK back upstream.
+[[ports]]
+name = "body_responses"
+direction = "output"
+content_type = "OctetStream"
+
+# Subscription to placement_router's FleetEpoch broadcast.
+[[ports]]
+name = "fleet_epoch"
+direction = "input"
+content_type = "OctetStream"
+
+# Per-target body_store request/response channel arrays are wired
+# at instantiation time via channel-port lookup; not enumerable in
+# the manifest port table (which only models slot-0 in/out for the
+# PIC ABI). Production graph wiring is blocked on the upstream
+# channel-port-lookup helper, same constraint as admin_router.
+
+[observability]
+exempt = "in-arena state counters (ops/errors/scrub tallies) readable by the host harness; typed MSG_METRIC_SAMPLE emission is tracked RFC 0004 polish"

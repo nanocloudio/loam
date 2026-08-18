@@ -1,0 +1,35 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+# Erasure-coding body router: sits between admin_router and a
+# fleet of body_store instances. Subscribes to placement_router's
+# fleet_epoch broadcast; a body with digest D is split into k data
+# + m parity shards, shard i stored on ranked target i under the
+# derived key sha256("loam-ec-shard" || D || i) via PUT_KEYED.
+# Any k shards reconstruct the body; a reconstructed body must
+# sha256 back to D before it is served.
+
+# Upstream-facing input — admin_router speaks loam_body_wire here.
+[[ports]]
+name = "body_requests"
+direction = "input"
+content_type = "OctetStream"
+
+# Upstream-facing output — PutResp / GetResp / NAK back upstream.
+[[ports]]
+name = "body_responses"
+direction = "output"
+content_type = "OctetStream"
+
+# Subscription to placement_router's FleetEpoch broadcast.
+[[ports]]
+name = "fleet_epoch"
+direction = "input"
+content_type = "OctetStream"
+
+# Per-target body_store request/response channel arrays are wired
+# at instantiation time via channel-port lookup; not enumerable in
+# the manifest port table (same constraint as body_fanout_router).
+
+[observability]
+exempt = "in-arena state counters (ops/errors/scrub tallies) readable by the host harness; typed MSG_METRIC_SAMPLE emission is tracked RFC 0004 polish"

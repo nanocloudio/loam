@@ -1,0 +1,15 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "metrics"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "reports"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+exempt = "stub module (ping/noop protocol); no data plane yet"

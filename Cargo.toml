@@ -1,0 +1,73 @@
+[package]
+name = "loam"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Loam Authors <eng@nanocloud.local>"]
+description = "Loam — fluxor-native vocabulary crate for the loam PIC modules under modules/"
+
+[workspace]
+members = [".", "tools/loam-cli", "tools/loam-client"]
+# Bare `cargo test`/`build` in the root dir covers the whole
+# workspace (the root manifest is package+workspace, which would
+# otherwise scope commands to the root package alone — and silently
+# drop the loam-cli/loam-client suites from `fluxor ci`).
+default-members = [".", "tools/loam-cli", "tools/loam-client"]
+
+[workspace.package]
+version = "0.0.1"
+
+[workspace.lints.rust]
+
+[workspace.lints.clippy]
+# Loam's PIC discipline conflicts with these style lints by DESIGN:
+# indexed loops keep bare-metal module builds panic-free (iterator
+# adapters and slice copies pull core::panicking symbols the SDK
+# doesn't stub — see modules/README.md), and bounded no_std step
+# functions pass explicit scalar params rather than allocate
+# context structs.
+needless_range_loop = "allow"
+manual_find = "allow"
+too_many_arguments = "allow"
+manual_flatten = "allow"
+manual_memcpy = "allow"
+manual_is_multiple_of = "allow"
+
+[lints]
+workspace = true
+
+[lib]
+name = "loam"
+path = "src/lib.rs"
+
+# The host runtime previously here (`LoamInstance`,
+# `body_provider`, per-surface stores, in-process Clustor proxy)
+# was deleted in the fluxor-native sunset. All runtime logic now
+# lives in the PIC modules under `modules/`. The legacy host CLI
+# was replaced by `tools/loam-cli/` which drives PIC bodies
+# in-process.
+
+[features]
+default = ["std", "serde"]
+std = []
+# Activates the serde derives inside the mounted fluxor contracts source
+# (src/lib.rs `#[path]` mount): its `cfg(feature = "serde")` gates evaluate
+# against THIS crate's features. Default-on; loam itself uses serde
+# unconditionally.
+serde = []
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.145", features = ["preserve_order"] }
+thiserror = "2.0.17"
+toml = "0.8.19"
+
+[dev-dependencies]
+pretty_assertions = "1.4.0"
+proptest = "1.5.0"
+tempfile = "3.23.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

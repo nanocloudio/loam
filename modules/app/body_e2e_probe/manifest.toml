@@ -1,0 +1,22 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+# Runtime end-to-end probe for the disk-backed body_store: PUTs a body,
+# GETs it back by digest, verifies the bytes, and logs PASS/FAIL. The
+# runtime sibling of tests/pic_body_store.rs — it exercises the packed
+# .fmod through the real scheduler, capability gate, and fs provider
+# (which host tests cannot). Success = "[body_e2e] PASS" in the log and
+# a content-addressed file in the body root.
+
+[[ports]]
+name = "req_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "resp_in"
+direction = "input"
+content_type = "OctetStream"
+
+[observability]
+exempt = "self-contained e2e fixture; success is its PASS log"

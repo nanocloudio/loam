@@ -1,0 +1,50 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+# Proposer-side adapter between the public-surface PICs and a
+# Clustor replica group. Modes:
+#   single-replica: every Propose is durably WAL-logged then
+#     immediately echoed back as Committed with a synthetic
+#     LocalDurable witness (quorum = 1).
+#   replicated: each Propose is logged then forwarded to
+#     `clustor_requests`; Committed events arriving on
+#     `clustor_commits` route back to `metadata_results` with the
+#     upstream witness preserved.
+
+# Port order matters for the PIC ABI's slot-0 convention: the
+# kernel hands `module_new` the first declared output as
+# `out_chan`. We don't actually use slot-0-only in this body
+# (Committed events go to `metadata_results`, the second
+# declared output) — the body looks up channels by name via
+# `dev_channel_port` when we add that wiring in a follow-up.
+# For now the manifest puts `metadata_results` first so the
+# fallback slot-0 write reaches the right consumer in
+# single-port test wirings.
+
+[[ports]]
+name = "metadata_ops"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metadata_results"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "clustor_requests"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "clustor_commits"
+direction = "input"
+content_type = "OctetStream"
+required = false
+
+[[resources]]
+requires_contract = "fs"
+access = "write"
+
+[observability]
+exempt = "stub module (ping/noop protocol); no data plane yet"

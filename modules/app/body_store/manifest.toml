@@ -1,0 +1,35 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+# Deliberately NO `provides` claim: body_store is loam's INTERNAL
+# content-addressed byte plane, reached through the body wire by the
+# routers above it (body_fanout_router / ec_body_router) and composed
+# behind `object_index` — which holds the graph's one unkeyed
+# `storage.object` claim. Declaring it here too would be two default
+# providers of one contract in the same graph, which the config gate
+# rejects as silent shadowing. Fence class: LocalDurable (fsynced
+# blobs); the replicated tier lifts this to ReplicatedDurable.
+
+# Content-addressed object body store. Bodies are keyed by their
+# SHA-256 digest; the PIC exposes channel-based put/get/head/
+# delete (see modules/common/mechanics/loam_body_wire.rs). DISK-BACKED
+# (Phase 5): bodies live at <root_dir>/<hex(sha256)>, the in-arena
+# slot table is a cache/index, GET falls back to disk with digest
+# verification (restart-safe), DELETE unlinks the file.
+
+[[ports]]
+name = "body_requests"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "body_responses"
+direction = "output"
+content_type = "OctetStream"
+
+[[resources]]
+requires_contract = "fs"
+access = "write"
+
+[observability]
+exempt = "in-arena state counters (ops/errors/scrub tallies) readable by the host harness; typed MSG_METRIC_SAMPLE emission is tracked RFC 0004 polish"

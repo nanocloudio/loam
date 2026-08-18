@@ -1,0 +1,14 @@
+# Workspace-shared Clippy configuration. Per standards/lints.md §6.
+# This file holds lints that take *configuration* (paths, names), not
+# levels — levels live in [workspace.lints.clippy] in Cargo.toml.
+
+disallowed-macros = [
+    # loam-cli's contract is JSON on stdout, so std::println is its
+    # output surface, not a logging smell — no blanket ban here.
+    # std::dbg is covered by clippy::dbg_macro where a crate opts in.
+]
+
+disallowed-methods = [
+    # Add per-project entries here as the codebase grows (the standard
+    # example is std::env::var → a config helper); none today.
+]

@@ -1,0 +1,25 @@
+/.context/
+/.claude/
+.DS_Store
+
+# Cargo output. Unanchored: host crates under tools/ each build their
+# own target/ once the root workspace retires.
+target/
+/artifacts/
+
+# Shadow-tracked (see standards/test-tracking.md) — versioned in
+# .git-shadow/, never pushed to this repo's remote. `benches/` and
+# `fuzz/` are omitted until those tiers exist; add them here and in
+# .git-shadow/info/exclude together if introduced.
+/tests/
+/examples/
+/.git-shadow/
+
+# Machine-local sibling-checkout symlinks (workspace-mode dev layout);
+# the OCI-store cutover replaces these mounts with fluxor-sync-staged
+# source under target/fluxor/ (see src/lib.rs).
+/deps/
+
+# Runtime state, created by graphs and tests.
+/data/
+/wal/

@@ -1,0 +1,40 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+# Front-door admin router. Translates external admin requests
+# (loam_admin_wire format) into the public-surface PICs' native
+# channel formats, and routes responses back tagged with the
+# caller's correlation_id.
+#
+# Phase 4a: handles AdminBind → namespace_router only. Future
+# ops (PutBody, GetBody, PutFile composed) land in follow-ups.
+#
+# Port order: admin_in first (inbound), then admin_out (slot-0
+# output → reply channel), then the downstream namespace pair.
+# `module_new` only receives slot-0 in_chan / out_chan; the
+# other channels need explicit `dev_channel_port` lookup or
+# graph-side wiring overrides — same follow-up as
+# namespace_router's metadata_ops/metrics ports.
+
+[[ports]]
+name = "admin_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "admin_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ns_req"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ns_resp"
+direction = "input"
+content_type = "OctetStream"
+
+[observability]
+exempt = "in-arena state counters (ops/errors/scrub tallies) readable by the host harness; typed MSG_METRIC_SAMPLE emission is tracked RFC 0004 polish"

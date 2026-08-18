@@ -1,0 +1,10 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "ops"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+exempt = "diagnostic load injector; drives offered load, not data-plane telemetry"

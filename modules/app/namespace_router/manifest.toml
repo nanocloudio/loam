@@ -1,0 +1,51 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+# Canonical storage surface this module provides (fluxor
+# storage_capability_surface.md; declared per
+# rfc_storage_capability_symmetry §4/§6 phase 4). Consumers reach it
+# by naming the ports below — the documented channel-provider path.
+# Honest fence class: ReplicatedDurable (via raft_metadata_client) or LocalDurable (WAL-only single node).
+# The channel wire (common/mechanics/loam_wire.rs OP_BIND/OP_RENAME/OP_UNBIND/OP_LOOKUP) carries the same operation set as the canonical namespace contract (fluxor namespace.rs BIND 0x1308 / RENAME / DELETE / LOOKUP); the fused single-round-trip forms are equivalent per the OPEN_CREATE ≡ BIND + OPEN rule.
+provides = ["storage.namespace"]
+
+# Port order matters for the PIC ABI's slot-0 convention:
+# `module_new(in_chan, out_chan, …)` receives the FIRST declared output
+# as `out_chan`. namespace_pic_body writes 1-byte ack/nak frames to
+# `out_chan`, so `responses` must be the first output. The other two
+# outputs are accessed by name from the wiring resolver in production
+# configs and stay unwired in the throughput probe.
+[[ports]]
+name = "requests"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "committed"
+direction = "input"
+content_type = "OctetStream"
+# loam_decision_wire Committed records from raft_metadata_client
+# (replicated mode); unwired in single-node profiles.
+
+[[ports]]
+name = "responses"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metadata_ops"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+
+[[resources]]
+requires_contract = "fs"
+access = "write"
+
+[observability]
+exempt = "in-arena state counters (ops/errors/scrub tallies) readable by the host harness; typed MSG_METRIC_SAMPLE emission is tracked RFC 0004 polish"

@@ -1,0 +1,30 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+# Channel-fronted append-only log. Consumer PICs (namespace_router,
+# object_index, etc.) talk to block_log over its request/response
+# pair instead of doing fs syscalls directly. This preserves the
+# mesh discipline and lets the bare-metal build swap in a
+# block-device backing without touching consumers.
+#
+# First-cut backing: the fluxor `fs` contract via FS_OPEN_CREATE /
+# FS_WRITE / FS_FSYNC. The block-device alternative
+# backing — direct block-device channels — is a sibling PIC body
+# (`block_log_block_body.rs`) tracked as a follow-up.
+
+[[ports]]
+name = "log_requests"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "log_responses"
+direction = "output"
+content_type = "OctetStream"
+
+[[resources]]
+requires_contract = "fs"
+access = "write"
+
+[observability]
+exempt = "in-arena state counters (ops/errors/scrub tallies) readable by the host harness; typed MSG_METRIC_SAMPLE emission is tracked RFC 0004 polish"

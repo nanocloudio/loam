@@ -1,0 +1,1 @@
+../target/fluxor/fluxor-abi/sdk/module.ld
