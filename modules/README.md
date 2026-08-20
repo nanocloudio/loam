@@ -132,10 +132,8 @@ bodies (< k sources) are counted and retried on later rounds.
 | `loam_throughput_counter` | Counts resolved operations per window and since boot, split committed from refused. Reads either the plane's decision records or a surface's one-byte acks (`stream`) |
 | `metadata_e2e_probe` / `body_e2e_probe` | Single-shot runtime probes; success is their PASS log |
 
-Driven by [`tools/e2e/metadata_load.sh`](../tools/e2e/metadata_load.sh)
-(bounded, gates on conservation) and
-[`tools/e2e/metadata_soak.sh`](../tools/e2e/metadata_soak.sh)
-(sustained, samples throughout).
+The invariant a load run holds the plane to is conservation: every
+record the plane accepts is committed or refused, never dropped.
 
 ## WAL plumbing (public surfaces)
 
@@ -169,13 +167,7 @@ advertises it through `fs::CAPS`. It also offers the write and fsync
 submit/poll pair, which is the shape a bounded step needs: a module
 submits and polls across steps instead of blocking inside one.
 
-So the WAL path has a durable backing on both profiles. The host
-profile is covered by
-[`tests/pic_entry_points.rs`](../tests/pic_entry_points.rs),
-[`tests/pic_object.rs`](../tests/pic_object.rs) and
-[`tests/pic_block.rs`](../tests/pic_block.rs); the embedded profile
-is covered by the `fluxor rig test` scenarios in
-[`tests/hardware/`](../tests/hardware/).
+So the WAL path has a durable backing on both profiles.
 
 `FS_OPEN` does not create a file; `FS_OPEN_CREATE` does, on both
 profiles, so a PIC lands its WAL on first boot without the graph

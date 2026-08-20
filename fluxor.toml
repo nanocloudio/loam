@@ -1,6 +1,5 @@
-# Loam project config consumed by the `fluxor` CLI (see
-# ../standards/dependencies.md). Declares loam's cross-project
-# dependencies: fluxor (SDK + runtime) and clustor (the Raft substrate
+# Loam project config consumed by the `fluxor` CLI. Declares loam's
+# cross-project dependencies: fluxor (SDK + runtime) and clustor (the Raft substrate
 # whose fmod palette the composed metadata-plane profiles run against).
 
 [project]
@@ -10,9 +9,8 @@ version = "0.0.1"
 [dependencies]
 fluxor  = "0.0.1"
 clustor = "0.0.1"
-# wave provides the S3 protocol module (`s3`) + the wave-common source
-# artefact (s3_core SigV4 signer, s3_wire records) — relocated there per
-# rfc_storage_capability_symmetry §7.
+# wave owns the S3 protocol tier: the `s3` module plus the wave-common
+# source artefact (SigV4 signing, S3 wire records).
 wave    = "0.0.1"
 
 [ci]
@@ -25,7 +23,7 @@ forbid_inline_tests = ["modules", "src"]
 mode                = "strict"
 
 [ci.test]
-# Shadow-checkout hard-fail guard (standards/test-tracking.md §7):
+# Shadow-checkout hard-fail guard:
 # tests/ and examples/ are shadow-tracked in .git-shadow/, so a
 # checkout of the primary repo alone has zero files there — the cargo
 # test phases would pass vacuously and the e2e would have no graph to
@@ -37,9 +35,9 @@ mode                = "strict"
 # with curl INDEPENDENTLY of the connector. The host vectors in
 # `tests/s3_wire_core.rs` pin the framing and the signature; this pins that a
 # real endpoint accepts them.
-# `tier_guard.sh` enforces the storage tier boundary
-# (rfc_storage_capability_symmetry §6): mechanics vs replicated rosters,
-# no upward common/ reach, no clustor from the mechanics tier.
+# `tier_guard.sh` enforces the storage tier boundary: mechanics vs
+# replicated rosters, no upward common/ reach, no clustor from the
+# mechanics tier.
 # `metadata_load.sh` drives the replicated metadata plane under offered
 # load and gates on conservation — every record the plane accepts is
 # either committed or refused, never dropped. Host tests cover the

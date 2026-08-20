@@ -1,40 +1,89 @@
 # Loam
 
-Fluxor-native distributed storage foundation. Every line of
-production logic runs in a [Fluxor](https://github.com/nanocloudio/fluxor)
-PIC module under [`modules/`](modules/); the `loam` crate under
-[`src/`](src/) is a thin vocabulary library that PIC tests, the
-CLI, and the fluxor build tool all consume. Clustor is the
-replication substrate (see [../clustor](../clustor)).
+Loam is a fluxor-native distributed storage foundation: a namespace
+of path bindings, an object index, and a content-addressed body
+plane, replicated through clustor when composed with it. Every line
+of production storage logic runs as a [fluxor](../fluxor/)
+position-independent (PIC) module under [`modules/`](modules/); the
+`loam` crate under [`src/`](src/) is a vocabulary library of shared
+types that the CLI, the PIC bodies, and the fluxor build tool all
+consume.
 
-## Project shape
+## Quick start
 
+```sh
+make build                     # workspace crates + PIC module artefacts
+
+# body-plane smoke: a probe writes a blob to a content-addressed
+# store and reads it back
+mkdir -p data/bodies-0
+fluxor run - <<'EOF'
+target: linux
+tick_us: 1000
+scheduler:
+  accept_cycles: true
+modules:
+  - name: body_a
+    type: body_store
+    params:
+      root_dir: "data/bodies-0"
+  - name: probe
+    type: body_e2e_probe
+wiring:
+  - from: probe.req_out
+    to: body_a.body_requests
+  - from: body_a.body_responses
+    to: probe.resp_in
+EOF
 ```
-modules/           # Fluxor PIC modules — all runtime logic
-src/               # vocabulary types (no runtime)
-config/            # loam.toml — the config `loam validate` parses
-tools/ci/          # CI gates ([ci.test] scripts)
-tools/e2e/         # e2e drivers (s3_driven, multi3_bringup, …)
-tools/diag/        # diagnostics, run by hand after a failure
-tools/loam-cli/    # fluxor-native dev CLI + loam-server daemon
-tools/loam-client/ # client library for the daemon's admin surface
-examples/          # graph profiles (shadow-tracked — see Tests)
-tests/             # PIC harness tests (shadow-tracked)
-docs/              # architecture + specification
-.context/          # product brief, RFCs, stress tests
+
+Success is `[body_e2e] PASS` in the log and a content-addressed file
+under `data/bodies-0/`. Stop the graph with Ctrl-C.
+[`docs/running.md`](docs/running.md) continues from here: the CLI, the
+`loam-server` daemon with its S3 gateway, and the replicated
+deployment shapes.
+
+## Setup
+
+Loam consumes fluxor through the local OCI store. One-time setup on
+a development machine:
+
+```sh
+git clone git@github.com:nanocloudio/fluxor.git ../fluxor
+make -C ../fluxor install    # put the fluxor CLI launcher on PATH
+make -C ../fluxor publish    # publish SDK, module palette, runtime into the store
+
+# in loam's checkout
+make build
 ```
 
+`fluxor.toml [dependencies]` declares fluxor, clustor, and wave;
+each dependency publishes its artefacts into the same store with
+`make publish` from its own checkout. `fluxor sync` stages every
+pinned artefact under `target/fluxor/` — nothing reaches into a
+sibling checkout at build time. To pick up newly published
+dependency versions, run `fluxor update` and commit the lockfile.
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `modules/app/` | One directory per PIC module: `mod.rs` + `manifest.toml`. All runtime logic. |
+| `modules/common/` | Shared `no_std` source, split by storage tier: `mechanics/` (single-node) and `replicated/` (quorum; may reach clustor). |
+| `src/` | The `loam` vocabulary crate — types only, no runtime. |
+| `config/` | `loam.toml`, the config `loam validate` and `loam plan` parse. |
+| `tools/loam-cli/` | Host crate: the `loam` CLI and the `loam-server` daemon. |
+| `tools/loam-client/` | Host crate: client library for the daemon's admin surface. |
+| `docs/` | Reference documentation, indexed by [`docs/overview.md`](docs/overview.md). |
+| `fluxor.toml` | Project manifest for the `fluxor` CLI: identity, dependencies, policy. |
+| `Makefile` | Thin alias layer over the `fluxor` CLI; `make help` lists the targets. |
+
+[`modules/README.md`](modules/README.md) documents the wire formats,
+arena sizing, snapshots, erasure coding, and keyed extents.
 [`tools/README.md`](tools/README.md) says what each script and crate
 is for.
 
-Dependencies resolve from the store: `fluxor sync` stages every
-declared project's published modules and source artefacts under
-`target/fluxor/`. Nothing reaches into a sibling checkout.
-
-See [`docs/architecture.md`](docs/architecture.md) for the
-type-by-type tour.
-
-## What's in `modules/`
+## The modules
 
 | Module | Surface | What it does |
 |---|---|---|
@@ -42,7 +91,7 @@ type-by-type tour.
 | `object_index` | `storage.object` | Object descriptors — OBJ_PUT / UPDATE / REMOVE / GET, WAL-backed |
 | `block_allocator` | `storage.block` | Block volume metadata, WAL-backed |
 | `raft_metadata_client` | — (internal) | Proposes metadata decisions through a replica group; single and replicated modes |
-| `clustor_bridge` | — (internal) | Carries loam decision records across Clustor's channel envelope |
+| `clustor_bridge` | — (internal) | Carries loam decision records across the replica group's channel envelope |
 | `body_store` | — (internal) | Content-addressed blobs on disk, with streamed writes and keyed extents |
 | `placement_router` | — (internal) | Fleet membership; broadcasts a FleetEpoch snapshot on every change |
 | `body_fanout_router` | — (internal) | Replicated bodies: all-must-succeed PUT, ranked GET/HEAD fallback with read repair, full-set DELETE, background scrub |
@@ -51,104 +100,55 @@ type-by-type tour.
 | `block_log` | — (internal) | Channel-fronted append-only log over an fs or block backend |
 | `loam_load_gen` | — (probe) | Offers Propose records at a controlled rate, reporting offered against emitted |
 | `loam_throughput_counter` | — (probe) | Counts resolved operations per window, committed split from refused |
-| `metadata_e2e_probe` | — (probe) | Single-shot metadata round trip; PASS is the result |
+| `metadata_e2e_probe` | — (probe) | Single-shot metadata round trip |
 | `body_e2e_probe` | — (probe) | Single-shot body round trip |
 
 `cache_manager`, `io_scheduler` and `telemetry_agg` are reserved
 names carrying the stub step body — they hold their place in a graph
 and do nothing else.
 
-See [`modules/README.md`](modules/README.md) for wire formats, arena
-sizing, snapshots, erasure coding, and keyed extents.
-
-## Build and test
-
-```bash
-make build                    # fluxor build — workspace + PIC modules
-make test                     # fluxor test — workspace suites + [ci.test] scripts
-fluxor modules build --target bcm2712   # PIC .fmod artifacts (pi5 board, bcm2712 silicon)
-```
-
-### Tests
-
-Per the team's test-tracking standard (`../standards/test-tracking.md`,
-alongside this checkout), `tests/` and `examples/` are versioned in a
-second, local-only Git repo rooted at `.git-shadow/`. It shares this
-working tree and has no path to the GitHub remote, so deployment
-topology and unpublished performance numbers stay off a public history
-without losing version control over them.
-
-For contributors holding that repo: shadow edits are invisible to
-`git status` on the primary, so run `git shadow status` alongside it out
-of habit (`git shadow log --oneline -20` for recent history).
-`fluxor ci` hard-fails when the shadow checkout is missing rather than
-reporting green having run nothing.
-
-Staging **new** files needs `-f` — the primary `.gitignore` outranks the
-shadow exclude — and MUST keep the exclude pathspec, or `-f` force-adds
-every cargo build blob:
-
-```sh
-git shadow add -Af tests examples ':(exclude)*target/*'
-```
-
-Two of the gates hold the running system to conservation rather than
-to a rate, so they stay meaningful on any machine. The load gate
-drives the metadata plane under offered load: every record the plane
-accepts is either committed or refused, never dropped. The
-composed-node gate puts a public surface on that plane and adds the
-claim only a composition can make — every request that entered the
-surface received exactly one answer.
-
 ## CLI — two modes
 
-**In-process** (`loam` binary): each subcommand spins up the PICs
-it needs, sends one request through the appropriate wire format,
-drives the step bodies until the response lands, and prints JSON.
+**In-process** (`loam` binary): each subcommand spins up the PICs it
+needs, sends one request through the appropriate wire format, drives
+the step bodies until the response lands, and prints JSON. `make
+build` leaves the binaries under `target/debug/`.
 
-```bash
+```sh
 loam validate --config config/loam.toml
 loam plan     --config config/loam.toml
 loam surfaces
-loam bind        --wal /tmp/ns.wal acme /users/alice sha256:cafe
-loam read        --wal /tmp/ns.wal acme /users/alice
-loam put-body    --body-root /tmp/bodies <my-file.bin
-loam put-object  --wal /tmp/obj.wal --id sha256:... --namespace acme --key /k --size 12
-loam resolve     --ns-wal /tmp/ns.wal --obj-wal /tmp/obj.wal acme /file.txt
-loam put-file    --wal /tmp/ns.wal --body-root /tmp/bodies acme /file.txt <content
+loam bind        --wal data/ns.wal acme /users/alice sha256:cafe
+loam read        --wal data/ns.wal acme /users/alice
+loam put-body    --body-root data/bodies - <my-file.bin
+loam put-object  --wal data/obj.wal --id sha256:... --namespace acme --key /k --size 12
+loam resolve     --ns-wal data/ns.wal --obj-wal data/obj.wal acme /file.txt
+loam put-file    --wal data/ns.wal --body-root data/bodies acme /file.txt - <content
 ```
 
-**Daemon + remote client** (`loam-server`, with `loam admin-bind`
-as the one-shot CLI client and
-[`tools/loam-client/`](tools/loam-client/) as the library one):
-the daemon hosts a long-running graph (admin_router +
-namespace_router + body_store + object_index) and exposes it
-through up to three surfaces — a unix admin socket, an
-S3-compatible HTTP gateway, and the loam_net_wire TCP bridge
-that lets the body plane live on another machine.
+**Daemon + remote client** (`loam-server`, with `loam admin-bind` as
+the one-shot CLI client and [`tools/loam-client/`](tools/loam-client/)
+as the library one): the daemon hosts a long-running graph
+(admin_router + namespace_router + body_store + object_index) and
+exposes it through up to three surfaces — a unix admin socket, an
+S3-compatible HTTP gateway, and the loam_net_wire TCP bridge that
+lets the body plane live on another machine.
 
-```bash
+```sh
 # single node: admin socket + S3 gateway, one local body store
 loam-server --socket /tmp/loam.sock --s3-listen 127.0.0.1:9000 \
-            --ns-wal /tmp/ns.wal --obj-wal /tmp/obj.wal \
-            --fleet dir:/tmp/bodies
+            --ns-wal data/ns.wal --obj-wal data/obj.wal \
+            --fleet dir:data/bodies
 loam admin-bind --socket /tmp/loam.sock acme /users/alice sha256:cafe
 curl -T report.pdf http://127.0.0.1:9000/docs/report.pdf
 curl http://127.0.0.1:9000/docs/report.pdf
-
-# replicated: gateway + metadata on A, bodies on B and C. Every
-# object lands on 2 nodes (all-must-succeed PUT); reads fall back
-# to the surviving replica when a body node dies; --scrub-interval
-# heals under-replication in the background.
-loam-server --serve-body 0.0.0.0:7100 --body-root /var/lib/loam/bodies   # nodes B, C
-loam-server --s3-listen 0.0.0.0:9000 --ns-wal ... --obj-wal ... \
-            --fleet tcp:nodeB:7100,tcp:nodeC:7100 \
-            --replica-count 2 --scrub-interval 5000                       # node A
 ```
 
-This is the architecturally cleanest fluxor-native model: the
-PIC graph is the kernel; sockets, HTTP, and the net bridge are
-public surfaces onto its channels.
+For the replicated shape (gateway and metadata on one node, bodies
+on others, background scrub healing under-replication), see
+[`docs/running.md`](docs/running.md). The PIC graph is the kernel;
+sockets, HTTP, and the net bridge are public surfaces onto its
+channels.
 
 ### The S3 gateway
 
@@ -172,39 +172,37 @@ DELETE, guarded against in-flight composed writes.
 
 ## Replication
 
-The metadata plane binds through Clustor: `raft_metadata_client` in
+The metadata plane binds through clustor: `raft_metadata_client` in
 replicated mode proposes through `clustor_bridge` into a replica
-group, behind a plane-level read gate.
-[`tools/e2e/multi3_bringup.sh`](tools/e2e/multi3_bringup.sh) runs
-three fluxor processes — full loam plus clustor replica graphs, from
-[`examples/linux/clustor_multi3.yaml`](examples/linux/clustor_multi3.yaml)
-— commits a loam bind through a 2-of-3 quorum, and checks that the
-three per-node WAL segments are byte-identical. See
-[`docs/clustor-bring-up.md`](docs/clustor-bring-up.md).
-
-The body plane replicates outside Raft, through `placement_router`
-and `body_fanout_router`, and the network contract
+group, behind a plane-level read gate. The body plane replicates
+outside Raft, through `placement_router` and `body_fanout_router`;
+the network contract
 ([`modules/common/mechanics/loam_net_wire.rs`](modules/common/mechanics/loam_net_wire.rs))
 bridges channel pairs between nodes over TCP so the body plane can
-live on a separate machine.
+live on a separate machine. [`docs/running.md`](docs/running.md)
+describes the deployment shapes.
 
 ## Project family
 
-- **Fluxor** provides the kernel, graph runtime, PIC ABI,
-  storage contracts, and the `fs` provider. Loam's PIC
-  modules consume fluxor's `fs` contract and (in production)
-  block-device channels.
-- **Clustor** is the Raft substrate. The `raft_metadata_client`
-  PIC talks to a Clustor PIC over channels.
-- **Wave** owns the S3 protocol: the `s3` connector module the
-  graphs in [`examples/s3/`](examples/s3/) run, and the
-  `wave-common` `s3_core` SigV4 signer + `s3_wire` records it
-  signs and frames with. Loam's gateway is the verifying side;
-  `tools/e2e/s3_driven.sh` gates that the two agree.
-- **Lattice** is the Raft-backed KV sibling.
-- **Quantum** is the multi-protocol messaging sibling.
-- **Truffle** is the media sibling; uses Loam as its storage
+- **fluxor** provides the kernel, graph runtime, PIC ABI, storage
+  contracts, and the `fs` provider loam's modules consume.
+- **clustor** is the Raft substrate; `raft_metadata_client` talks to
+  it over channels.
+- **wave** owns the S3 protocol: the signing side of the requests
+  loam's gateway verifies.
+- **lattice** is the Raft-backed KV sibling.
+- **quantum** is the multi-protocol messaging sibling.
+- **truffle** is the media sibling; uses loam as its storage
   foundation.
 
-The working plan lives in
-[`.context/rfcs/`](.context/rfcs/), not here.
+## Documentation
+
+- [`docs/overview.md`](docs/overview.md) — index of the doc set
+- [`docs/running.md`](docs/running.md) — validated bring-up: graphs,
+  CLI, daemon, replicated shapes
+- [`docs/architecture.md`](docs/architecture.md) — layout, the
+  two-plane model, durability, scaling
+- [`docs/native_fluxor.md`](docs/native_fluxor.md) — how loam sits on
+  fluxor: surfaces, fences, the step contract
+- [`docs/specification.md`](docs/specification.md) — the invariants
+  loam holds itself to
