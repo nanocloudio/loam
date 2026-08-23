@@ -5,9 +5,8 @@
 //
 // Like body_fanout_router, only slot-0 in/out arrive through
 // `module_new`; resolving the per-target downstream channels by name
-// with `dev_channel_port` is outstanding work (RFC 0005 P1.1). Until
-// then the host harness drives the body's internals directly via
-// `module_new_with_targets_impl`.
+// with `dev_channel_port` is not done here yet; the body's internals
+// are driven directly via `module_new_with_targets_impl`.
 
 use core::ffi::c_void;
 

@@ -48,12 +48,17 @@ mode                = "strict"
 # every request answered. It also runs a module the way a module is
 # actually run — loaded, at an address it was not linked for — which is
 # the one thing no host test can do.
+# `body_publication.sh` gates the fence the body store negotiates from a
+# live filesystem provider, and that the artefact lands under it with no
+# staging file beside it. Host tests present synthetic capability
+# bitmaps; only a real graph shows the bitmap a real provider returns.
 scripts = [
   "tools/ci/shadow_guard.sh",
   "tools/ci/tier_guard.sh",
   "tools/e2e/s3_driven.sh",
   "tools/e2e/metadata_load.sh",
   "tools/e2e/composed_node.sh",
+  "tools/e2e/body_publication.sh",
 ]
 
 [ci.cargo]

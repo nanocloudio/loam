@@ -18,6 +18,9 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
 
 #[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[path = "../../common/mechanics/fs_names.rs"]
+mod fs_names;
+
 #[path = "../../common/mechanics/loam_body_wire.rs"]
 mod wire;
 
@@ -116,7 +119,16 @@ unsafe fn decode_root_dir_params(
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
-    unsafe { body::module_step_impl(state_ptr) }
+    unsafe {
+        let rc = body::module_step_impl(state_ptr);
+        if let Some(line) = body::take_tier_report(state_ptr) {
+            let s = &*(state_ptr as *const body::ModuleState);
+            if let Some(sys) = s.syscalls.as_ref() {
+                dev_log(sys, 3, line.as_ptr(), line.len());
+            }
+        }
+        rc
+    }
 }
 
 // Panic handler comes from `runtime.rs` via the include! above.

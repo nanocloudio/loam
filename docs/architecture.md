@@ -80,11 +80,19 @@ re-exported through the `prelude`.
 Each public-surface PIC (`namespace_router`, `object_index`,
 `block_allocator`) and `raft_metadata_client` writes every applied
 event to a WAL via the fluxor `fs` contract before mutating its
-in-arena state, then replays the WAL on open. `body_store` writes
-each content-addressed blob to `<root_dir>/<hex_digest>` and
-persists slot metadata in arena. Files are created on first boot via
-`FS_OPEN_CREATE` — no pre-touch required. Shared primitives:
-[`modules/common/mechanics/wal_io.rs`](../modules/common/mechanics/wal_io.rs).
+in-arena state, then replays the WAL on open. That WAL is the
+module's recovery authority; the metadata plane above it is
+authoritative for acceptance, not for replay. An append is a state
+machine rather than a call, so a device that has accepted work but
+not finished it costs a later step instead of an operation refusal.
+`body_store` writes each content-addressed blob to
+`<root_dir>/<hex_digest>` and persists slot metadata in arena, and
+publishes it with the strongest recipe the storage provider offers —
+refusing rather than acknowledging a blob it cannot publish durably.
+Files are created on first boot via `FS_OPEN_CREATE` — no pre-touch
+required. Shared primitives:
+[`modules/common/mechanics/wal_io.rs`](../modules/common/mechanics/wal_io.rs);
+the contracts are in [`durability.md`](durability.md).
 
 `admin_router` fronts the public PICs. External admin clients speak
 [`loam_admin_wire.rs`](../modules/common/mechanics/loam_admin_wire.rs)
@@ -95,7 +103,11 @@ single-shot cap (`PUT_FILE_OPEN` / `_CHUNK` / `_COMMIT` and
 `READ_FILE_RANGE`), and the raw body ops (`PUT_BODY`, `GET_BODY`,
 `PUT_BODY_KEYED`, `DELETE_BODY`). The router demuxes each to the
 right downstream PIC, runs a 3-stage state machine for the composed
-`PUT_FILE`, and hosts the orphan-body GC loop.
+`PUT_FILE`, and hosts the lifecycle sweep that reclaims orphaned body
+blobs and unbound object descriptors. The composed write's crash
+model — idempotent retry, unreachable intermediate state, and
+conservative reclamation, with the fault matrix behind it — is in
+[`durability.md`](durability.md).
 
 For multi-client production deployments the `loam-server` binary in
 [`tools/loam-cli/`](../tools/loam-cli/) hosts the full graph and

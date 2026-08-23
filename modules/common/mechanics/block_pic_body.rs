@@ -25,6 +25,9 @@ const REQ_ASM: usize = READ_BUF * (MAX_OPS_PER_STEP as usize + 1);
 /// Inline WAL-path buffer size; see `namespace_pic_body.rs`.
 pub const WAL_PATH_BUF: usize = 256;
 
+/// The block PIC answers with a 1-byte ack; a read buffer is ample.
+pub type Reply = super::reply_out::ReplyOut<READ_BUF>;
+
 #[repr(C)]
 pub struct ModuleState {
     pub syscalls: *const super::SyscallTable,
@@ -38,12 +41,24 @@ pub struct ModuleState {
     /// Set while walking past bytes that do not start a record. One
     /// NAK is emitted on entering that state, not one per byte.
     pub req_resyncing: u8,
+    /// The answer this module owes. A channel that refuses the write
+    /// leaves it owed rather than lost; no new work is taken until it
+    /// lands.
+    pub reply: Reply,
     pub volumes: super::state::PicBlockState<ARENA_CAPACITY>,
     pub ticks: u32,
     pub ops_applied: u32,
     pub apply_errors: u32,
     pub wal_fd: i32,
     pub append_scratch: [u8; super::wal::APPEND_SCRATCH],
+    /// Resumable WAL append. Owns the staged frame, so a device that
+    /// answers `E_AGAIN` costs a later step rather than an operation
+    /// refusal.
+    pub appender: super::wal::WalAppender,
+    /// A record has left `requests` and is staged for durability. It
+    /// is not applied, acked, or discarded until the append resolves,
+    /// and no other work is consumed meanwhile.
+    pub wal_staged: u8,
     pub wal_path: [u8; WAL_PATH_BUF],
     pub wal_path_len: u16,
 }
@@ -88,6 +103,9 @@ pub unsafe fn open_and_replay_wal(state_ptr: *mut u8, wal_path: &[u8]) -> i32 {
         Err(_) => return -3,
     };
     s.wal_fd = fd;
+    // The appender's tail knowledge belongs to the previous fd.
+    s.appender.reset();
+    s.wal_staged = 0;
 
     let mut scratch = [0u8; super::wal::MAX_WAL_REC];
     let volumes_ptr: *mut super::state::PicBlockState<ARENA_CAPACITY> = &mut s.volumes;
@@ -191,8 +209,52 @@ unsafe fn init_state(
     s.req_asm_len = 0;
     s.req_resyncing = 0;
     s.wal_fd = -1;
+    s.wal_staged = 0;
+    core::ptr::write_bytes(
+        core::ptr::addr_of_mut!(s.appender) as *mut u8,
+        0,
+        core::mem::size_of::<super::wal::WalAppender>(),
+    );
     s.wal_path_len = 0;
     0
+}
+
+/// Staged-record buffer. Sized by what the appender can hold, NOT by
+/// `READ_BUF` — that is the channel-read chunk size, and a record
+/// reassembled across chunks is legitimately larger. Undersizing here
+/// refuses a record the WAL already made durable, so the requester is
+/// told it failed and replay applies it anyway.
+const STAGED_REC: usize = super::wal::MAX_WAL_REC;
+
+/// Resolve the record a staged append took off `requests`. `durable`
+/// licenses the arena mutation and the success ack; without it the
+/// record is refused, because a refusal the requester can see is the
+/// only honest answer to a durability failure.
+unsafe fn resolve_staged(s: &mut ModuleState, syscalls: &super::SyscallTable, durable: bool) {
+    s.wal_staged = 0;
+    let mut payload = [0u8; STAGED_REC];
+    let n = s.appender.payload().len();
+    let ok = durable && n != 0 && n <= payload.len();
+    if ok {
+        payload[..n].copy_from_slice(s.appender.payload());
+    }
+    let op = if ok {
+        super::wire::peek_opcode(&payload[..n])
+    } else {
+        None
+    };
+    match (op, ok) {
+        (Some(op), true) if apply_to_arena(&mut s.volumes, &payload[..n]).is_ok() => {
+            s.ops_applied = s.ops_applied.wrapping_add(1);
+            let ack = [op];
+            let _ = s.reply.send(syscalls.channel_write, s.out_chan, &ack);
+        }
+        _ => {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            let nak = [0xFFu8];
+            let _ = s.reply.send(syscalls.channel_write, s.out_chan, &nak);
+        }
+    }
 }
 
 pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
@@ -206,6 +268,24 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         Some(t) => t,
         None => return -1,
     };
+
+    // A staged append owns the step until it resolves: the record it
+    // describes has left `requests` and no other work may overtake
+    // it, reuse the frame buffer, or acknowledge ahead of it.
+    // An owed answer owns the step until the channel takes it: the
+    // record it answers has already left `requests` and changed the
+    // arena.
+    if !s.reply.flush(syscalls.channel_write, s.out_chan) {
+        return 0;
+    }
+
+    if s.wal_staged != 0 {
+        match s.appender.poll(syscalls, s.wal_fd) {
+            super::wal::AppendState::Pending => return 0,
+            super::wal::AppendState::Durable => resolve_staged(s, syscalls, true),
+            _ => resolve_staged(s, syscalls, false),
+        }
+    }
 
     // `requests` is a byte stream. Refill a reassembly buffer, then
     // take whole records off the front of it — up to the step budget,
@@ -231,6 +311,11 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     let mut handled: u32 = 0;
     let mut req_off: usize = 0;
     while handled < MAX_OPS_PER_STEP {
+        // An answer still owed means the channel is not draining;
+        // taking another record could not be answered either.
+        if s.reply.owed() {
+            break;
+        }
         let rec_len = match super::wire::request_record_len(&s.req_asm[req_off..s.req_asm_len]) {
             Ok(Some(len)) => len,
             // Nothing, or an incomplete tail: keep it and wait.
@@ -243,7 +328,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                 if s.req_resyncing == 0 {
                     s.req_resyncing = 1;
                     let nak = [0xFFu8];
-                    let _ = (syscalls.channel_write)(s.out_chan, nak.as_ptr(), 1);
+                    let _ = s.reply.send(syscalls.channel_write, s.out_chan, &nak);
                 }
                 req_off += 1;
                 handled = handled.wrapping_add(1);
@@ -264,36 +349,53 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
             _ => {
                 s.apply_errors = s.apply_errors.wrapping_add(1);
                 let nak = [0xFFu8];
-                let _ = (syscalls.channel_write)(s.out_chan, nak.as_ptr(), 1);
+                let _ = s.reply.send(syscalls.channel_write, s.out_chan, &nak);
                 handled = handled.wrapping_add(1);
                 continue;
             }
         };
 
+        // A WAL that was configured and is now gone is not the same
+        // as never having had one: the arena would mutate with no
+        // durable backing while the ack claimed otherwise. Refuse
+        // until an open succeeds again.
+        if s.wal_fd < 0 && s.wal_path_len > 0 {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            let nak = [0xFFu8];
+            let _ = s.reply.send(syscalls.channel_write, s.out_chan, &nak);
+            continue;
+        }
+
+        // Durability first: the append is staged, not completed here.
+        // A device that has accepted the frame but not finished it
+        // leaves the record staged and the step returns; the arena
+        // and the ack wait for the fence.
         if s.wal_fd >= 0 {
-            let wal_rc = super::wal::wal_append(syscalls, s.wal_fd, bytes, &mut s.append_scratch);
-            if wal_rc.is_err() {
-                s.apply_errors = s.apply_errors.wrapping_add(1);
-                let nak = [0xFFu8];
-                let _ = (syscalls.channel_write)(s.out_chan, nak.as_ptr(), 1);
-                handled = handled.wrapping_add(1);
-                continue;
+            match s.appender.begin(syscalls, s.wal_fd, bytes) {
+                super::wal::AppendState::Durable => {}
+                super::wal::AppendState::Pending => {
+                    s.wal_staged = 1;
+                    break;
+                }
+                _ => {
+                    s.apply_errors = s.apply_errors.wrapping_add(1);
+                    let nak = [0xFFu8];
+                    let _ = s.reply.send(syscalls.channel_write, s.out_chan, &nak);
+                    handled = handled.wrapping_add(1);
+                    continue;
+                }
             }
         }
 
         match apply_to_arena(&mut s.volumes, bytes) {
             Ok(_) => {
                 s.ops_applied = s.ops_applied.wrapping_add(1);
-                let ack = [op];
-                let wrote = (syscalls.channel_write)(s.out_chan, ack.as_ptr(), 1);
-                if wrote < 0 {
-                    break;
-                }
+                let _ = s.reply.send(syscalls.channel_write, s.out_chan, &[op]);
             }
             Err(_) => {
                 s.apply_errors = s.apply_errors.wrapping_add(1);
                 let nak = [0xFFu8];
-                let _ = (syscalls.channel_write)(s.out_chan, nak.as_ptr(), 1);
+                let _ = s.reply.send(syscalls.channel_write, s.out_chan, &nak);
             }
         }
         handled = handled.wrapping_add(1);

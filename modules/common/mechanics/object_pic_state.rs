@@ -14,10 +14,46 @@ pub struct ObjectSlot {
     pub namespace_hash: u64,
     pub size_bytes: u64,
     pub revision: u64,
+    /// The content digest when the object id carries the
+    /// content-derived form `sha256:<64 lowercase hex>`. Only such
+    /// descriptors are enumerable, because only they have a
+    /// lifecycle the storage substrate owns; an id from anywhere else
+    /// belongs to whoever minted it, the same rule keyed body blobs
+    /// follow.
+    pub content_digest: [u8; DIGEST_LEN],
+    pub id_derived: bool,
     pub data_class: u8,
     pub replica_count: u8,
     pub erasure: Option<(u8, u8)>,
     pub occupied: bool,
+}
+
+/// Content-derived object ids are `"sha256:"` plus 64 lowercase hex.
+pub const DIGEST_LEN: usize = 32;
+const ID_PREFIX: &[u8] = b"sha256:";
+const DERIVED_ID_LEN: usize = 7 + 64;
+
+/// Decode the content-derived object-id form, or `None` for any other
+/// id shape.
+pub fn derived_digest(object_id: &[u8]) -> Option<[u8; DIGEST_LEN]> {
+    if object_id.len() != DERIVED_ID_LEN || &object_id[..7] != ID_PREFIX {
+        return None;
+    }
+    let mut out = [0u8; DIGEST_LEN];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let hi = hex_val(object_id[7 + 2 * i])?;
+        let lo = hex_val(object_id[8 + 2 * i])?;
+        *byte = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    }
 }
 
 impl ObjectSlot {
@@ -27,6 +63,8 @@ impl ObjectSlot {
             namespace_hash: 0,
             size_bytes: 0,
             revision: 0,
+            content_digest: [0u8; DIGEST_LEN],
+            id_derived: false,
             data_class: 0,
             replica_count: 0,
             erasure: None,
@@ -131,6 +169,7 @@ impl<const N: usize> PicObjectState<N> {
             }
             return Err(ApplyError::AlreadyPresent);
         }
+        let derived = derived_digest(object_id);
         for s in self.slots.iter_mut() {
             if !s.occupied {
                 *s = ObjectSlot {
@@ -138,6 +177,8 @@ impl<const N: usize> PicObjectState<N> {
                     namespace_hash: fnv1a64(namespace),
                     size_bytes,
                     revision,
+                    content_digest: derived.unwrap_or([0u8; DIGEST_LEN]),
+                    id_derived: derived.is_some(),
                     data_class,
                     replica_count,
                     erasure,
@@ -186,6 +227,32 @@ impl<const N: usize> PicObjectState<N> {
             }
         }
         Err(ApplyError::NotPresent)
+    }
+
+    /// One page of the descriptor inventory. Walks slots from
+    /// `cursor`, writing the content digest of each occupied slot whose
+    /// id is content-derived into `out`. Returns
+    /// `(next_cursor, count)`; `next_cursor == 0` means the sweep
+    /// wrapped, so a caller pages until it sees zero.
+    ///
+    /// Slot order is arena order, which changes as slots are reused.
+    /// That makes the page boundary approximate: a descriptor can be
+    /// missed or repeated across one pass. Both are safe — the sweep
+    /// that consumes this proves absence again before deleting
+    /// anything, and a missed descriptor is collected on a later pass.
+    pub fn scan(&self, cursor: u32, out: &mut [[u8; DIGEST_LEN]]) -> (u32, usize) {
+        let mut idx = cursor as usize;
+        let mut count = 0usize;
+        while idx < N && count < out.len() {
+            let s = &self.slots[idx];
+            if s.occupied && s.id_derived {
+                out[count] = s.content_digest;
+                count += 1;
+            }
+            idx += 1;
+        }
+        let next = if idx >= N { 0 } else { idx as u32 };
+        (next, count)
     }
 
     /// Sum of `size_bytes` across all occupied slots — what a body

@@ -110,6 +110,21 @@ pub struct ModuleState {
     /// The WAL open should be attempted again on a later step; see
     /// `WalOpenError::Again`.
     pub wal_retry: u8,
+    /// Resumable WAL append. Owns the staged frame, so a device that
+    /// answers `E_AGAIN` costs a later step rather than a refused
+    /// proposal.
+    pub appender: super::wal::WalAppender,
+    /// The Propose still owed to the Clustor channel. A channel may
+    /// accept only part of a write; abandoning the remainder and
+    /// re-encoding the whole record on a later retry leaves a
+    /// truncated prefix on the wire, and the bridge's frame splitter
+    /// then parses across the seam — corrupting the NEXT record rather
+    /// than the one that was cut. The remainder is resumed instead.
+    pub forward_out: super::reply_out::ReplyOut<{ super::wal::APPEND_SCRATCH }>,
+    /// A Propose has left `metadata_ops` and is staged for durability.
+    /// It is not reserved, forwarded, or aborted until the append
+    /// resolves, and no other proposal is consumed meanwhile.
+    pub wal_staged: u8,
     /// Reassembly for the `clustor_commits` byte stream (records
     /// coalesce across reads; same discipline as every other stream).
     pub cin_asm: [u8; 8192],
@@ -207,6 +222,12 @@ unsafe fn init_state(
     s.results_out_chan = results_out_chan;
     s.clustor_in_chan = clustor_in_chan;
     s.wal_fd = -1;
+    s.wal_staged = 0;
+    core::ptr::write_bytes(
+        core::ptr::addr_of_mut!(s.appender) as *mut u8,
+        0,
+        core::mem::size_of::<super::wal::WalAppender>(),
+    );
     s.mode = MODE_SINGLE_REPLICA;
     s.next_correlation_id = 1;
     s.next_epoch = 1;
@@ -293,6 +314,10 @@ pub unsafe fn open_and_replay_wal(state_ptr: *mut u8, wal_path: &[u8]) -> i32 {
                 super::wal::WalOpenError::NotFound => -19,
                 super::wal::WalOpenError::Again => -11,
                 super::wal::WalOpenError::OpenFailed(rc) => rc,
+                // No durable name for the log: EROFS, because the
+                // artefact cannot be published on this provider and
+                // retrying will not change that.
+                super::wal::WalOpenError::NameUnfenceable => -30,
             };
             // "Again" is the provider saying it has not finished, not
             // that it refused: on a profile where the filesystem sits
@@ -304,6 +329,9 @@ pub unsafe fn open_and_replay_wal(state_ptr: *mut u8, wal_path: &[u8]) -> i32 {
         }
     };
     s.wal_fd = fd;
+    // The appender's tail knowledge belongs to the previous fd.
+    s.appender.reset();
+    s.wal_staged = 0;
 
     // Replay every Propose record back into the pending table so
     // a restart-after-crash retries downstream emission for any
@@ -527,11 +555,83 @@ unsafe fn forward_to_clustor(s: &mut ModuleState, correlation_id: u32) -> bool {
         Some(t) => t,
         None => return false,
     };
-    let wrote = (sys.channel_write)(out_chan, scratch.as_ptr(), n);
-    if wrote < 0 || (wrote as usize) != n {
+    if !s.forward_out.stage(&scratch[..n]) {
         return false;
     }
-    true
+    s.forward_out.flush(sys.channel_write, out_chan)
+}
+
+/// Take a durably-logged proposal into the pending table and start it
+/// downstream.
+///
+/// A full table means the plane is already carrying `PENDING_CAP`
+/// proposals it has not resolved — upstream is offering faster than
+/// downstream is committing, which is exactly the state a producer has
+/// to see to back off.
+unsafe fn admit_proposal(s: &mut ModuleState, plane: u8, origin: u32, inner: &[u8]) {
+    let cid = match reserve_pending(s, plane, origin, inner) {
+        Ok(cid) => cid,
+        Err(_) => {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            emit_aborted_for(s, origin);
+            return;
+        }
+    };
+    s.proposed = s.proposed.wrapping_add(1);
+
+    match s.mode {
+        MODE_REPLICATED => {
+            if forward_to_clustor(s, cid) {
+                if let Some(p) = find_pending(s, cid) {
+                    p.forwarded = 1;
+                    p.forward_age = 0;
+                }
+            }
+        }
+        _ => {
+            // Single-replica: emit Committed immediately with a
+            // synthetic LocalDurable witness (quorum = 1, epoch =
+            // monotone counter).
+            let epoch = s.next_epoch;
+            s.next_epoch = s.next_epoch.wrapping_add(1);
+            emit_committed_for(s, cid, 1, epoch);
+        }
+    }
+}
+
+/// Resolve the proposal a staged append took off `metadata_ops`.
+/// `durable` licenses admission; without it the proposal is aborted,
+/// because a refusal the producer can see is the only honest answer to
+/// a durability failure.
+unsafe fn resolve_staged(s: &mut ModuleState, durable: bool) {
+    s.wal_staged = 0;
+    // Copy the staged frame out first: everything below borrows the
+    // local, so admitting or aborting can take `s` mutably.
+    let mut record = [0u8; READ_BUF];
+    let n = s.appender.payload().len();
+    if n == 0 || n > record.len() {
+        s.apply_errors = s.apply_errors.wrapping_add(1);
+        return;
+    }
+    record[..n].copy_from_slice(s.appender.payload());
+    let (plane, origin, inner_len, inner) = match super::wire::decode_propose(&record[..n]) {
+        Ok(d) => {
+            let mut inner = [0u8; super::wire::MAX_INNER];
+            let len = d.inner.len().min(inner.len());
+            inner[..len].copy_from_slice(&d.inner[..len]);
+            (d.plane, d.correlation_id, len, inner)
+        }
+        Err(_) => {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            return;
+        }
+    };
+    if !durable {
+        s.apply_errors = s.apply_errors.wrapping_add(1);
+        emit_aborted_for(s, origin);
+        return;
+    }
+    admit_proposal(s, plane, origin, &inner[..inner_len]);
 }
 
 pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
@@ -555,6 +655,29 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         Some(t) => t,
         None => return -1,
     };
+
+    // A Propose still owed to the Clustor channel owns the step. It
+    // has already been logged and reserved, so re-encoding it later
+    // would double-forward; the remainder is resumed instead, and no
+    // new proposal is taken while it is outstanding.
+    if s.clustor_out_chan >= 0
+        && !s
+            .forward_out
+            .flush(syscalls.channel_write, s.clustor_out_chan)
+    {
+        return 0;
+    }
+
+    // A staged append owns the step until it resolves: the proposal it
+    // describes has left `metadata_ops` and no other work may overtake
+    // it, reuse the frame buffer, or be admitted ahead of it.
+    if s.wal_staged != 0 {
+        match s.appender.poll(syscalls, s.wal_fd) {
+            super::wal::AppendState::Pending => return 0,
+            super::wal::AppendState::Durable => resolve_staged(s, true),
+            _ => resolve_staged(s, false),
+        }
+    }
 
     // ── 1. Drain inbound Propose requests from public PICs. ────
     //
@@ -625,51 +748,28 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         }
 
         // Durability first: log the proposal before doing anything
-        // else. If it cannot be logged it has not been accepted, and
-        // the producer is told so.
-        if s.wal_fd >= 0
-            && super::wal::wal_append(syscalls, s.wal_fd, bytes, &mut s.append_scratch).is_err()
-        {
-            s.apply_errors = s.apply_errors.wrapping_add(1);
-            emit_aborted_for(s, origin);
-            handled = handled.wrapping_add(1);
-            continue;
-        }
-
-        // Reserve a pending slot. A full table means the plane is
-        // already carrying PENDING_CAP proposals it has not resolved —
-        // upstream is offering faster than downstream is committing,
-        // which is exactly the state a producer has to see to back off.
-        let cid = match reserve_pending(s, decoded.plane, origin, decoded.inner) {
-            Ok(cid) => cid,
-            Err(_) => {
-                s.apply_errors = s.apply_errors.wrapping_add(1);
-                emit_aborted_for(s, origin);
-                handled = handled.wrapping_add(1);
-                continue;
-            }
-        };
-        s.proposed = s.proposed.wrapping_add(1);
-
-        match s.mode {
-            MODE_REPLICATED => {
-                if forward_to_clustor(s, cid) {
-                    if let Some(p) = find_pending(s, cid) {
-                        p.forwarded = 1;
-                        p.forward_age = 0;
-                    }
+        // else. The append is staged, not completed here — a device
+        // that has accepted the frame but not finished it leaves the
+        // proposal staged and the step returns. If the append fails
+        // the proposal has not been accepted, and the producer is
+        // told so.
+        if s.wal_fd >= 0 {
+            match s.appender.begin(syscalls, s.wal_fd, bytes) {
+                super::wal::AppendState::Durable => {}
+                super::wal::AppendState::Pending => {
+                    s.wal_staged = 1;
+                    break;
+                }
+                _ => {
+                    s.apply_errors = s.apply_errors.wrapping_add(1);
+                    emit_aborted_for(s, origin);
+                    handled = handled.wrapping_add(1);
+                    continue;
                 }
             }
-            _ => {
-                // Single-replica: emit Committed immediately
-                // with a synthetic LocalDurable witness
-                // (quorum = 1, epoch = monotone counter).
-                let epoch = s.next_epoch;
-                s.next_epoch = s.next_epoch.wrapping_add(1);
-                emit_committed_for(s, cid, 1, epoch);
-            }
         }
 
+        admit_proposal(s, decoded.plane, origin, decoded.inner);
         handled = handled.wrapping_add(1);
     }
     // Keep whatever the step budget did not reach. Records left here
@@ -788,7 +888,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     // WAL rotation: once replay has drained AND no pending proposal
     // is in flight, every logged record is committed downstream —
     // rotate so the next boot replays only its own tail.
-    if s.wal_rotated == 0 && s.replay_marker_sent == 1 && s.wal_fd >= 0 {
+    if s.wal_rotated == 0 && s.replay_marker_sent == 1 && s.wal_fd >= 0 && s.wal_staged == 0 {
         let mut any_pending = false;
         for slot in s.pending.iter() {
             if slot.in_use != 0 {
@@ -801,15 +901,28 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
             let mut path = [0u8; WAL_PATH_BUF];
             path[..plen].copy_from_slice(&s.wal_path[..plen]);
             match super::wal::wal_rotate(syscalls, s.wal_fd, &path[..plen]) {
-                Ok(fd) => {
+                Ok(super::wal::RotateOutcome::Rotated(fd)) => {
                     s.wal_fd = fd;
+                    // Fresh, empty file: the appender's tail knowledge
+                    // belongs to the rotated-away fd.
+                    s.appender.reset();
+                    s.wal_rotated = 1;
+                }
+                // Left intact, and still the right log to propose
+                // against — the next boot just replays more of it.
+                Ok(super::wal::RotateOutcome::Skipped) => {
                     s.wal_rotated = 1;
                 }
                 Err(_) => {
-                    // Keep the old WAL; retry next tick is pointless
-                    // (fd is closed) — mark rotated to avoid thrash.
+                    // Replaced but not reopenable, so there is no log
+                    // to propose against. Refusing is the honest
+                    // answer: `wal_unavailable` gates intake until a
+                    // later open succeeds. Marked rotated so the
+                    // attempt does not thrash.
                     s.wal_fd = -1;
+                    s.wal_unavailable = 1;
                     s.wal_rotated = 1;
+                    s.appender.reset();
                 }
             }
         }

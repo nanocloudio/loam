@@ -20,6 +20,9 @@ target/
 # source under target/fluxor/ (see src/lib.rs).
 /deps/
 
-# Runtime state, created by graphs and tests.
+# Runtime state, created by graphs and tests. Clustor's replica
+# metadata and WAL segments are cwd-relative, so they land here
+# whenever a composed metadata graph runs.
 /data/
 /wal/
+/raft/

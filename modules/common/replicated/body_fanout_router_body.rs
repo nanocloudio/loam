@@ -64,6 +64,8 @@ const KIND_STREAM_OPEN: u8 = 5;
 const KIND_STREAM_APPEND: u8 = 6;
 const KIND_STREAM_COMMIT: u8 = 7;
 const KIND_STREAM_ABORT: u8 = 8;
+/// An upstream inventory SCAN, answered from one member.
+const KIND_ADMIN_SCAN: u8 = 9;
 
 /// Concurrent upstream streams the router can fan out.
 const ROUTER_STREAMS: usize = 4;
@@ -469,6 +471,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                 handle_stream_ctl(s, syscalls, bytes, super::body_wire::OP_WABORT);
             }
             super::body_wire::OP_RANGE => handle_range_read(s, syscalls, bytes),
+            super::body_wire::OP_SCAN => handle_admin_scan(s, syscalls, bytes),
             _ => {
                 emit_nak(s, syscalls, super::body_wire::ERR_BAD_REQ);
             }
@@ -1127,6 +1130,19 @@ unsafe fn apply_join_response(
         return;
     }
 
+    // ── Upstream inventory SCAN: the member's page, verbatim. ───
+    if j_kind == KIND_ADMIN_SCAN {
+        free_join(s, join_idx);
+        if succeeded {
+            let n = resp.len().min(s.scratch.len());
+            s.scratch[..n].copy_from_slice(&resp[..n]);
+            let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), n);
+        } else {
+            emit_nak(s, syscalls, nak_errno);
+        }
+        return;
+    }
+
     // ── Scrub joins: never touch upstream. ──────────────────────
     if j_kind == KIND_SCRUB_SCAN {
         free_join(s, join_idx);
@@ -1430,6 +1446,41 @@ unsafe fn spawn_repair_puts(
 // member is scanned — a digest is probed as long as ANY member
 // remembers it. A disk-inventory (READDIR-backed) scan is the
 // remaining gap for an all-members-rebooted-at-once fleet.
+
+/// Answer an upstream inventory SCAN from one fleet member.
+///
+/// Under whole-body replication every selected member holds the same
+/// bodies, so one member's page is the inventory. A body that reached
+/// only some members is missed on this pass, which is the direction
+/// that keeps rather than collects — the caller of a SCAN is a
+/// lifecycle sweep, and a sweep that cannot see something leaves it
+/// alone. Scrub is what converges the members themselves.
+unsafe fn handle_admin_scan(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) {
+    if s.body_fleet_count == 0 {
+        emit_nak(s, syscalls, super::body_wire::ERR_NOT_FOUND);
+        return;
+    }
+    let join_idx = match alloc_join(s) {
+        Some(i) => i,
+        None => {
+            emit_nak(s, syscalls, super::body_wire::ERR_IO);
+            return;
+        }
+    };
+    let gen = {
+        let j = &mut s.joins[join_idx as usize];
+        j.kind = KIND_ADMIN_SCAN;
+        j.op = super::body_wire::OP_SCAN;
+        j.need = 1;
+        j.gen
+    };
+    let req_n = bytes.len().min(s.scratch.len());
+    s.scratch[..req_n].copy_from_slice(&bytes[..req_n]);
+    if !dispatch_to_target(s, syscalls, 0, join_idx, gen, req_n) {
+        free_join(s, join_idx);
+        emit_nak(s, syscalls, super::body_wire::ERR_IO);
+    }
+}
 
 /// Send one SCAN page request to the current scrub target.
 unsafe fn scrub_kick(s: &mut ModuleState, syscalls: &super::SyscallTable) {

@@ -28,6 +28,9 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 #[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[path = "../../common/mechanics/reply_out.rs"]
+mod reply_out;
+
 #[path = "../../common/replicated/loam_decision_wire.rs"]
 mod wire;
 
@@ -67,6 +70,12 @@ pub struct ModuleState {
     req_asm: [u8; BUF],
     req_asm_len: usize,
     buf: [u8; BUF],
+    /// The framed proposal still owed to `clustor_out`. A channel may
+    /// accept only part of a write, and the envelope is framed
+    /// precisely so the reader can split the stream — a truncated
+    /// prefix left behind defeats that, and the reader parses across
+    /// the seam into the next record. The remainder is resumed.
+    out_owed: reply_out::ReplyOut<BUF>,
     forwarded: u32,
     committed: u32,
     errors: u32,
@@ -155,6 +164,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             dev_log(sys, 3, m.as_ptr(), m.len());
         }
 
+        // A framed proposal still owed to `clustor_out` owns the step.
+        // Taking another record would overwrite the frame buffer and
+        // leave the truncated prefix on the wire for the reader to
+        // parse across.
+        if s.clustor_out >= 0 && !s.out_owed.flush(sys.channel_write, s.clustor_out) {
+            return 0;
+        }
+
         // ── Proposal path: loam Propose → MSG_CLIENT_PROPOSAL ────────
         if s.proposals_in >= 0 && s.clustor_out >= 0 {
             // The proposer forwards up to a step's worth of records, so
@@ -176,6 +193,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let mut n_ops = 0u32;
             let mut off = 0usize;
             while n_ops < MAX_OPS_PER_STEP {
+                if s.out_owed.owed() {
+                    break;
+                }
                 let rec_len = match wire::record_len(&s.req_asm[off..s.req_asm_len]) {
                     Ok(Some(len)) => len,
                     Ok(None) => break,
@@ -202,9 +222,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // frame atomic against the reader splitting the stream.
                 match facade::frame(&mut s.buf, facade::MSG_CLIENT_PROPOSAL, rec) {
                     Ok(total) => {
-                        let wrote = (sys.channel_write)(s.clustor_out, s.buf.as_ptr(), total);
-                        if wrote == total as i32 {
-                            s.forwarded = s.forwarded.wrapping_add(1);
+                        let framed =
+                            core::slice::from_raw_parts(s.buf.as_ptr(), total) as *const [u8];
+                        if s.out_owed.stage(&*framed) {
+                            if s.out_owed.flush(sys.channel_write, s.clustor_out) {
+                                s.forwarded = s.forwarded.wrapping_add(1);
+                            }
                         } else {
                             s.errors = s.errors.wrapping_add(1);
                         }

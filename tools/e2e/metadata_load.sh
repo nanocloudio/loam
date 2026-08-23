@@ -21,6 +21,7 @@
 # Usage: tools/e2e/metadata_load.sh [total] [inject_period] [batch]
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+. tools/e2e/graph_run.sh
 
 TOTAL="${1:-2000}"
 INJECT_PERIOD="${2:-4}"
@@ -43,10 +44,12 @@ mkdir -p target
 # otherwise replay at boot and the numbers would describe two runs.
 rm -rf wal "$PROPOSER_WAL" "$LOG"
 
+PORT=$(free_port)
 sed -e "s|total: 0 .*|total: $TOTAL|" \
     -e "s|inject_period: .*|inject_period: $INJECT_PERIOD|" \
     -e "s|batch_per_step: .*|batch_per_step: $BATCH|" \
     -e "s|wal_path: .*|wal_path: \"$PROPOSER_WAL\"|" \
+    -e "s|listen_port: .*|listen_port: $PORT|" \
     "$GRAPH" > "$RENDERED"
 
 echo "[load] offering $TOTAL records (batch $BATCH every $INJECT_PERIOD ticks)"
@@ -66,18 +69,13 @@ runner=$!
 # compiled config, not the YAML. Killing only the wrapper leaves that
 # child running: it keeps stepping a graph, competing for the machine
 # with whatever runs next, and the symptom lands on the innocent test.
-reap() {
-  kill "$runner" 2>/dev/null || true
-  wait "$runner" 2>/dev/null || true
-  pkill -f "loam_metadata_load" 2>/dev/null || true
-  sleep 1
-  pkill -9 -f "loam_metadata_load" 2>/dev/null || true
-}
+reap() { reap_graph "loam_metadata_load" "$runner"; }
 trap reap EXIT
 
 # Stop as soon as the run has settled: everything offered has been
 # emitted, and everything emitted has resolved one way or the other.
 # Waiting out the full timeout after that only makes the gate slow.
+stalled=0
 deadline=$((SECONDS + RUN_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
   sleep 2
@@ -90,9 +88,19 @@ while [ "$SECONDS" -lt "$deadline" ]; do
     break
   fi
   kill -0 "$runner" 2>/dev/null || break
+  if graph_stalled "$LOG"; then
+    stalled=1
+    break
+  fi
 done
 reap
 trap - EXIT
+
+reason=$(graph_fault_reason "$LOG")
+if [ -n "$reason" ]; then
+  echo "[load] FAILED: $reason — see $LOG" >&2
+  exit 1
+fi
 
 # Last report from each module carries the since-boot totals.
 lg=$(last_lg)
@@ -114,6 +122,14 @@ echo "[load] offered=$TOTAL emitted=$emitted refused=$refused"
 echo "[load] committed=$committed aborted=$aborted resolved=$resolved"
 
 fail=0
+# Said first, because it changes what every number below means: the two
+# counters come from different modules' reports, so a graph that stops
+# between them reads as records accepted and then lost.
+if [ "$stalled" -ne 0 ]; then
+  echo "[load] FAILED: the graph stopped producing output; the counts below" >&2
+  echo "[load]   are from before it stopped, not from a settled run" >&2
+  fail=1
+fi
 if [ "$emitted" -eq 0 ]; then
   echo "[load] FAILED: nothing was emitted in ${RUN_SECONDS}s; the plane never opened" >&2
   fail=1

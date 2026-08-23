@@ -67,6 +67,10 @@ const REQ_ASM: usize = READ_BUF * (MAX_OPS_PER_STEP as usize + 1);
 /// reasonable filesystem path with headroom.
 pub const WAL_PATH_BUF: usize = 256;
 
+/// The namespace PIC answers with a 1-byte ack or an encoded lookup /
+/// list / referenced response, all bounded by a read buffer.
+pub type Reply = super::reply_out::ReplyOut<READ_BUF>;
+
 #[repr(C)]
 pub struct ModuleState {
     pub syscalls: *const super::SyscallTable,
@@ -121,6 +125,10 @@ pub struct ModuleState {
     /// records the revision it observed so a later `STAT` answers
     /// against the same view, which is what the surface promises.
     pub ns_open: [NsOpenSlot; NS_OPEN_MAX],
+    /// The answer this module owes. A channel that refuses the write
+    /// leaves it owed rather than lost; no new work is taken until it
+    /// lands.
+    pub reply: Reply,
     pub bindings: super::state::PicNamespaceState<ARENA_CAPACITY>,
     pub ticks: u32,
     pub ops_applied: u32,
@@ -129,10 +137,29 @@ pub struct ModuleState {
     /// set, each successful apply path writes a record + fsyncs before
     /// the arena mutates.
     pub wal_fd: i32,
-    /// Per-record scratch reused across appends. Sized to hold the
-    /// 8-byte header plus the largest legal payload — avoids any
-    /// runtime allocation under no_std.
+    /// Per-record scratch for the replicated-mode Propose encode.
+    /// Sized to hold the 8-byte header plus the largest legal payload
+    /// — avoids any runtime allocation under no_std.
     pub append_scratch: [u8; super::wal::APPEND_SCRATCH],
+    /// Resumable WAL append. Owns the staged frame, so a device that
+    /// answers `E_AGAIN` costs a later step rather than an operation
+    /// refusal.
+    pub appender: super::wal::WalAppender,
+    /// Which stream the staged append belongs to: `WAL_STAGE_NONE`,
+    /// `WAL_STAGE_REQUEST`, or `WAL_STAGE_COMMITTED`. While it is not
+    /// `NONE` the step consumes no new work — the record it describes
+    /// has been taken off its stream and is not applied, acked, or
+    /// discarded until the append resolves.
+    pub wal_stage: u8,
+    /// Committed-stream staging: whether the record answers a live
+    /// local request and therefore owes an ack byte.
+    pub wal_stage_live: u8,
+    /// Object ids a lifecycle sweep has reserved for deletion, by
+    /// hash. A BIND naming a reserved id is refused with
+    /// `NAK_RESERVED` so the sweep's absence proof holds up to the
+    /// deletion. Arena-only and never logged — see
+    /// `loam_wire::encode_gc_reserve_req`.
+    pub gc_reserved: [u64; GC_RESERVE_MAX],
     /// Inline WAL path, populated by the TLV `wal_path` param
     /// handler in the PIC mod.rs. `wal_path_len == 0` means
     /// channel-only mode (no WAL).
@@ -162,6 +189,19 @@ pub struct ModuleState {
     pub evictions: u32,
     pub snap_misses: u32,
 }
+
+/// Concurrent deletion reservations. The sweep holds one at a time;
+/// the spare slots absorb a second sweep instance without making the
+/// table a queue.
+pub const GC_RESERVE_MAX: usize = 4;
+/// Nak byte for a BIND refused because its object id is reserved for
+/// deletion. Distinct from the generic 0xFF so a client can tell
+/// "retry this" from "this was wrong".
+pub const NAK_RESERVED: u8 = 0xFD;
+
+pub const WAL_STAGE_NONE: u8 = 0;
+pub const WAL_STAGE_REQUEST: u8 = 1;
+pub const WAL_STAGE_COMMITTED: u8 = 2;
 
 /// Compactor work bound per step.
 const CMP_RECORDS_PER_STEP: usize = 32;
@@ -236,6 +276,10 @@ pub unsafe fn open_and_replay_wal(state_ptr: *mut u8, wal_path: &[u8]) -> i32 {
         Err(_) => return -3,
     };
     s.wal_fd = fd;
+    // The appender's tail knowledge belongs to the previous fd.
+    s.appender.reset();
+    s.wal_stage = WAL_STAGE_NONE;
+    s.wal_stage_live = 0;
     // Stash the path: the snapshot compactor derives its
     // generation filenames from it. The TLV boot path passes
     // `&s.wal_path` itself — skip the (overlapping) self-copy.
@@ -398,6 +442,14 @@ unsafe fn init_state(
     s.ops_applied = 0;
     s.apply_errors = 0;
     s.wal_fd = -1;
+    s.wal_stage = WAL_STAGE_NONE;
+    s.wal_stage_live = 0;
+    core::ptr::write_bytes(
+        core::ptr::addr_of_mut!(s.appender) as *mut u8,
+        0,
+        core::mem::size_of::<super::wal::WalAppender>(),
+    );
+    s.gc_reserved = [0u64; GC_RESERVE_MAX];
     s.snap_fd = -1;
     s.cmp_writer_fd = -1;
     s.wal_path_len = 0;
@@ -420,6 +472,25 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         Some(t) => t,
         None => return -1,
     };
+
+    // An owed answer owns the step until the channel takes it. The
+    // record it answers has already left its stream and changed the
+    // arena, so letting new work overtake it would leave a requester
+    // with a mutation and no reply.
+    if !s.reply.flush(syscalls.channel_write, s.out_chan) {
+        return 0;
+    }
+
+    // A staged append owns the step until it resolves: the record it
+    // describes has left its stream and no other work may overtake
+    // it, reuse the frame buffer, or acknowledge ahead of it.
+    if s.wal_stage != WAL_STAGE_NONE {
+        match s.appender.poll(syscalls, s.wal_fd) {
+            super::wal::AppendState::Pending => return 0,
+            super::wal::AppendState::Durable => resolve_staged(s, syscalls, true),
+            _ => resolve_staged(s, syscalls, false),
+        }
+    }
 
     // Incremental snapshot compaction: bounded records/step.
     compaction_step(s, syscalls);
@@ -455,6 +526,11 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     let mut handled: u32 = 0;
     let mut req_off: usize = 0;
     while handled < MAX_OPS_PER_STEP {
+        // An answer still owed means the channel is not draining;
+        // another record could not be answered either.
+        if s.reply.owed() {
+            break;
+        }
         let rec_len = match super::wire::request_record_len(&s.req_asm[req_off..s.req_asm_len]) {
             Ok(Some(len)) => len,
             // Nothing, or an incomplete tail: keep it and wait.
@@ -488,7 +564,9 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                 | super::wire::OP_UNBIND
                 | super::wire::OP_LOOKUP
                 | super::wire::OP_LIST
-                | super::wire::OP_REFERENCED),
+                | super::wire::OP_REFERENCED
+                | super::wire::OP_GC_RESERVE
+                | super::wire::OP_GC_RELEASE),
             ) => op,
             _ => {
                 s.apply_errors = s.apply_errors.wrapping_add(1);
@@ -497,6 +575,11 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                 continue;
             }
         };
+
+        // Reservations take the same path as every other mutating
+        // record — logged, and proposed in replicated mode — so they
+        // land in the same order as the binds they must exclude.
+        // `apply_op` is where both are resolved.
 
         // Read ops (LOOKUP) don't touch the WAL or the arena —
         // they answer from current arena state and return a
@@ -551,33 +634,48 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
             continue;
         }
 
+        // A WAL that was configured and is now gone is not the same
+        // as never having had one: the arena would mutate with no
+        // durable backing while the ack claimed otherwise. Refuse
+        // until an open succeeds again.
+        if s.wal_fd < 0 && s.wal_path_len > 0 {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            respond(s, syscalls, 0xFF);
+            handled = handled.wrapping_add(1);
+            continue;
+        }
+
         // Durability first: a successful arena mutation must have a
-        // durable backing by the time we ack. If WAL append fails,
-        // skip the arena and nak; the producer's retry will land
-        // clean once the device is happy.
+        // durable backing by the time we ack. The append is staged,
+        // not completed here — a device that has accepted the frame
+        // but not finished it leaves the record staged and the step
+        // returns; the arena and the ack wait for the fence.
         if s.wal_fd >= 0 {
-            let wal_rc = super::wal::wal_append(syscalls, s.wal_fd, bytes, &mut s.append_scratch);
-            if wal_rc.is_err() {
-                s.apply_errors = s.apply_errors.wrapping_add(1);
-                respond(s, syscalls, 0xFF);
-                handled = handled.wrapping_add(1);
-                continue;
+            match s.appender.begin(syscalls, s.wal_fd, bytes) {
+                super::wal::AppendState::Durable => {}
+                super::wal::AppendState::Pending => {
+                    s.wal_stage = WAL_STAGE_REQUEST;
+                    break;
+                }
+                _ => {
+                    s.apply_errors = s.apply_errors.wrapping_add(1);
+                    respond(s, syscalls, 0xFF);
+                    handled = handled.wrapping_add(1);
+                    continue;
+                }
             }
         }
 
-        match apply_op(s, syscalls, bytes) {
-            Ok(_) => {
-                s.ops_applied = s.ops_applied.wrapping_add(1);
-                respond(s, syscalls, op);
-            }
-            Err(_) => {
-                // Arena rejected (e.g. AlreadyBound) — the WAL
-                // already has the record. On replay the same
-                // arena rejection happens; net state is consistent.
-                s.apply_errors = s.apply_errors.wrapping_add(1);
-                respond(s, syscalls, 0xFF);
-            }
+        // The WAL already has the record. An arena rejection (e.g.
+        // AlreadyBound) replays the same way, so net state stays
+        // consistent whichever side of a restart it lands on.
+        let result = apply_op(s, syscalls, bytes);
+        if result.is_ok() {
+            s.ops_applied = s.ops_applied.wrapping_add(1);
+        } else {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
         }
+        respond_applied(s, syscalls, bytes, result);
         handled = handled.wrapping_add(1);
     }
     // Keep whatever the step budget did not reach. Records left here
@@ -683,23 +781,57 @@ unsafe fn drain_committed(s: &mut ModuleState, syscalls: &super::SyscallTable) {
         }
         inner_buf[..inner_len].copy_from_slice(&s.cmt_asm[off + 17..off + 17 + inner_len]);
         let inner = &inner_buf[..inner_len];
-        if s.wal_fd >= 0 {
-            let _ = super::wal::wal_append(syscalls, s.wal_fd, inner, &mut s.append_scratch);
-        }
         let live = s.outstanding > 0;
-        match apply_op(s, syscalls, inner) {
-            Ok(op) => {
+        // The local WAL is this PIC's recovery authority (see
+        // `docs/architecture.md`), so a committed record that cannot
+        // be logged locally must not be applied or acked: the plane
+        // upstream is a delivery buffer, not a replayable history.
+        // That holds whether the append fails or the log is gone
+        // altogether — `wal_path_len` is what separates a lost log
+        // from channel-only mode, where there was never one to lose.
+        if s.wal_fd < 0 && s.wal_path_len > 0 {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            if live {
+                s.outstanding -= 1;
+                respond(s, syscalls, 0xFF);
+            }
+            off += rec_len;
+            continue;
+        }
+        if s.wal_fd >= 0 {
+            match s.appender.begin(syscalls, s.wal_fd, inner) {
+                super::wal::AppendState::Durable => {}
+                super::wal::AppendState::Pending => {
+                    s.wal_stage = WAL_STAGE_COMMITTED;
+                    s.wal_stage_live = u8::from(live);
+                    off += rec_len;
+                    break;
+                }
+                _ => {
+                    s.apply_errors = s.apply_errors.wrapping_add(1);
+                    if live {
+                        s.outstanding -= 1;
+                        respond(s, syscalls, 0xFF);
+                    }
+                    off += rec_len;
+                    continue;
+                }
+            }
+        }
+        let result = apply_op(s, syscalls, inner);
+        match result {
+            Ok(_) => {
                 s.ops_applied = s.ops_applied.wrapping_add(1);
                 if live {
                     s.outstanding -= 1;
-                    respond(s, syscalls, op);
+                    respond_applied(s, syscalls, inner, result);
                 }
             }
             Err(_) => {
                 s.apply_errors = s.apply_errors.wrapping_add(1);
                 if live {
                     s.outstanding -= 1;
-                    respond(s, syscalls, 0xFF);
+                    respond_applied(s, syscalls, inner, result);
                 }
             }
         }
@@ -708,6 +840,61 @@ unsafe fn drain_committed(s: &mut ModuleState, syscalls: &super::SyscallTable) {
     if off > 0 {
         s.cmt_asm.copy_within(off..s.cmt_asm_len, 0);
         s.cmt_asm_len -= off;
+    }
+}
+
+/// Staged-record buffer. Sized by what the appender can hold, NOT by
+/// `READ_BUF` — that is the channel-read chunk size, and a record
+/// reassembled across chunks is legitimately larger. Undersizing here
+/// refuses a record the WAL already made durable, so the requester is
+/// told it failed and replay applies it anyway.
+const STAGED_REC: usize = super::wal::MAX_WAL_REC;
+
+/// Resolve the record a staged append took off its stream. `durable`
+/// licenses the arena mutation and the success ack; without it the
+/// record is refused, because a refusal the requester can see is the
+/// only honest answer to a durability failure.
+unsafe fn resolve_staged(s: &mut ModuleState, syscalls: &super::SyscallTable, durable: bool) {
+    let stage = core::mem::replace(&mut s.wal_stage, WAL_STAGE_NONE);
+    let live = s.wal_stage_live != 0;
+    s.wal_stage_live = 0;
+    let owes_ack = stage == WAL_STAGE_REQUEST || live;
+    if !durable {
+        s.apply_errors = s.apply_errors.wrapping_add(1);
+        if stage == WAL_STAGE_COMMITTED && live {
+            s.outstanding = s.outstanding.saturating_sub(1);
+        }
+        if owes_ack {
+            respond(s, syscalls, 0xFF);
+        }
+        return;
+    }
+    let mut payload = [0u8; STAGED_REC];
+    let n = s.appender.payload().len();
+    if n == 0 || n > payload.len() {
+        s.apply_errors = s.apply_errors.wrapping_add(1);
+        if stage == WAL_STAGE_COMMITTED && live {
+            s.outstanding = s.outstanding.saturating_sub(1);
+        }
+        if owes_ack {
+            respond(s, syscalls, 0xFF);
+        }
+        return;
+    }
+    payload[..n].copy_from_slice(s.appender.payload());
+    let result = apply_op(s, syscalls, &payload[..n]);
+    if stage == WAL_STAGE_COMMITTED && live {
+        s.outstanding = s.outstanding.saturating_sub(1);
+    }
+    if result.is_ok() {
+        s.ops_applied = s.ops_applied.wrapping_add(1);
+    } else {
+        s.apply_errors = s.apply_errors.wrapping_add(1);
+    }
+    if owes_ack {
+        let mut echo = [0u8; READ_BUF];
+        echo[..n].copy_from_slice(&payload[..n]);
+        respond_applied(s, syscalls, &echo[..n], result);
     }
 }
 
@@ -761,7 +948,9 @@ unsafe fn handle_lookup(s: &mut ModuleState, syscalls: &super::SyscallTable, byt
     match n {
         Ok(n) => {
             if s.out_chan >= 0 {
-                let _ = (syscalls.channel_write)(s.out_chan, s.append_scratch.as_ptr(), n);
+                let _ = s
+                    .reply
+                    .send(syscalls.channel_write, s.out_chan, &s.append_scratch[..n]);
             }
         }
         Err(_) => {
@@ -859,7 +1048,9 @@ unsafe fn handle_list(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes
     match super::wire::encode_list_resp(&mut s.append_scratch, next_cursor, &slices[..count]) {
         Ok(n) => {
             if s.out_chan >= 0 {
-                let _ = (syscalls.channel_write)(s.out_chan, s.append_scratch.as_ptr(), n);
+                let _ = s
+                    .reply
+                    .send(syscalls.channel_write, s.out_chan, &s.append_scratch[..n]);
             }
         }
         Err(_) => {
@@ -924,12 +1115,52 @@ unsafe fn handle_referenced(s: &mut ModuleState, syscalls: &super::SyscallTable,
     if s.out_chan >= 0
         && super::wire::encode_referenced_resp(&mut out, referenced, next_cursor).is_ok()
     {
-        let _ = (syscalls.channel_write)(s.out_chan, out.as_ptr(), out.len());
+        let _ = s.reply.send(syscalls.channel_write, s.out_chan, &out);
     }
+}
+
+/// Answer one applied record. A reserve carries whether the id is now
+/// held — the sweep needs the grant, not just an ack — and a bind
+/// refused by a standing reservation gets its own nak so the client
+/// can tell "retry this" from "this was wrong".
+unsafe fn respond_applied(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    payload: &[u8],
+    result: Result<u8, ApplyFault>,
+) {
+    match result {
+        Ok(op) if op == super::wire::OP_GC_RESERVE => {
+            let held = match super::wire::decode_gc_reserve_req(payload) {
+                Ok(id) => s.gc_reserved.contains(&super::state::fnv1a64(id)),
+                Err(_) => false,
+            };
+            let mut buf = [0u8; 2];
+            if let Ok(n) = super::wire::encode_gc_reserve_resp(&mut buf, held) {
+                if s.out_chan >= 0 {
+                    let _ = s.reply.send(syscalls.channel_write, s.out_chan, &buf[..n]);
+                }
+            }
+        }
+        Ok(op) => respond(s, syscalls, op),
+        Err(ApplyFault::Reserved) => respond(s, syscalls, NAK_RESERVED),
+        Err(ApplyFault::Rejected) => respond(s, syscalls, 0xFF),
+    }
+}
+
+/// Why an apply produced no state change. `Reserved` is a deliberate,
+/// deterministic refusal — the id is held for deletion — and every
+/// replica reaches it at the same point in the log. `Rejected` is
+/// everything else.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApplyFault {
+    Reserved,
+    Rejected,
 }
 
 /// Apply one op with snapshot semantics wrapped around the pure
 /// arena apply:
+///
 /// - UNBIND with an active snapshot TOMBSTONES (masking the
 ///   on-disk record) instead of clearing, at the binding's
 ///   current revision so a later re-bind wins normally.
@@ -940,13 +1171,51 @@ unsafe fn apply_op(
     s: &mut ModuleState,
     syscalls: &super::SyscallTable,
     payload: &[u8],
-) -> Result<u8, ()> {
-    let op = super::wire::peek_opcode(payload).ok_or(())?;
+) -> Result<u8, ApplyFault> {
+    let op = super::wire::peek_opcode(payload).ok_or(ApplyFault::Rejected)?;
+    // Deletion reservations are applied HERE, in log order, rather
+    // than when the request arrives. That is what makes them safe
+    // against a replicated bind: every replica applies the same
+    // reserve, release and bind records in the same order, so every
+    // replica reaches the same admission decision for a bind naming a
+    // reserved id. Checking at arrival instead would be a local
+    // decision about a globally ordered stream — the leader could
+    // admit a bind that a follower refuses.
+    if op == super::wire::OP_GC_RESERVE || op == super::wire::OP_GC_RELEASE {
+        let object_id =
+            super::wire::decode_gc_reserve_req(payload).map_err(|_| ApplyFault::Rejected)?;
+        let oid_h = super::state::fnv1a64(object_id);
+        if op == super::wire::OP_GC_RELEASE {
+            for slot in s.gc_reserved.iter_mut() {
+                if *slot == oid_h {
+                    *slot = 0;
+                }
+            }
+        } else if !s.gc_reserved.contains(&oid_h) {
+            // A full table leaves the id unreserved. The sweep reads
+            // that back and leaves the descriptor for a later pass,
+            // which is the conservative direction.
+            if let Some(slot) = s.gc_reserved.iter_mut().find(|slot| **slot == 0) {
+                *slot = oid_h;
+            }
+        }
+        return Ok(op);
+    }
+    if op == super::wire::OP_BIND {
+        let dec = super::wire::decode_bind(payload).map_err(|_| ApplyFault::Rejected)?;
+        if s.gc_reserved
+            .contains(&super::state::fnv1a64(dec.object_id))
+        {
+            return Err(ApplyFault::Reserved);
+        }
+    }
     if op == super::wire::OP_UNBIND && s.snap_active != 0 {
-        let dec = super::wire::decode_unbind(payload).map_err(|_| ())?;
+        let dec = super::wire::decode_unbind(payload).map_err(|_| ApplyFault::Rejected)?;
         let (ns_h, p_h) = super::state::key_hash(dec.namespace_root, dec.path);
         let revision = match s.bindings.lookup_hashed(ns_h, p_h) {
-            Some(slot) if slot.kind == super::state::KIND_TOMBSTONE => return Err(()),
+            Some(slot) if slot.kind == super::state::KIND_TOMBSTONE => {
+                return Err(ApplyFault::Rejected)
+            }
             Some(slot) => slot.revision,
             None => {
                 let snap = super::snapshot::OpenSnapshot {
@@ -956,7 +1225,7 @@ unsafe fn apply_op(
                 };
                 match super::snapshot::snap_search(syscalls, &snap, ns_h, p_h) {
                     Some(rec) => rec.revision,
-                    None => return Err(()),
+                    None => return Err(ApplyFault::Rejected),
                 }
             }
         };
@@ -966,7 +1235,9 @@ unsafe fn apply_op(
             s.evictions = s.evictions.wrapping_add(1);
             res = s.bindings.tombstone(dec.namespace_root, dec.path, revision);
         }
-        return res.map(|_| super::wire::OP_UNBIND).map_err(|_| ());
+        return res
+            .map(|_| super::wire::OP_UNBIND)
+            .map_err(|_| ApplyFault::Rejected);
     }
     match apply_to_arena(&mut s.bindings, payload) {
         Ok(op) => Ok(op),
@@ -979,9 +1250,9 @@ unsafe fn apply_op(
                 && s.bindings.evict_one_snapshotted()
             {
                 s.evictions = s.evictions.wrapping_add(1);
-                return apply_to_arena(&mut s.bindings, payload).map_err(|_| ());
+                return apply_to_arena(&mut s.bindings, payload).map_err(|_| ApplyFault::Rejected);
             }
-            Err(())
+            Err(ApplyFault::Rejected)
         }
     }
 }
@@ -1136,14 +1407,27 @@ unsafe fn compaction_step(s: &mut ModuleState, syscalls: &super::SyscallTable) {
                 s.snap_count = new_snap.count;
                 s.snap_gen = new_snap.generation;
                 if s.wal_fd >= 0 {
-                    if let Ok(new_fd) = super::wal::wal_rotate(
+                    match super::wal::wal_rotate(
                         syscalls,
                         s.wal_fd,
                         &s.wal_path[..s.wal_path_len as usize],
                     ) {
-                        s.wal_fd = new_fd;
-                    } else {
-                        s.wal_fd = -1;
+                        Ok(super::wal::RotateOutcome::Rotated(new_fd)) => {
+                            s.wal_fd = new_fd;
+                            s.appender.reset();
+                        }
+                        // The log was left intact: boot replays the
+                        // snapshot plus a longer tail, which costs time
+                        // and nothing else.
+                        Ok(super::wal::RotateOutcome::Skipped) => {}
+                        // Replaced but not reopenable. `wal_path_len`
+                        // still says a log was configured, which is
+                        // what lets the write path refuse rather than
+                        // silently drop to no durability.
+                        Err(_) => {
+                            s.wal_fd = -1;
+                            s.appender.reset();
+                        }
                     }
                 }
                 let tag = (s.cmp_writer_gen % 251 + 1) as u8;
@@ -1323,12 +1607,14 @@ unsafe fn write_fence_out(s: &ModuleState, ptr: *mut u8, cap: usize) {
 /// surface and observes it elsewhere leaves it unconnected. Writing to
 /// an unwired port is not a no-op at the syscall boundary, so every
 /// response goes through here rather than assuming a reader exists.
-unsafe fn respond(s: &ModuleState, syscalls: &super::SyscallTable, byte: u8) {
+/// Take ownership of the one-byte answer this record owes. A channel
+/// that refuses it leaves it owed and the step re-offers it, rather
+/// than dropping an answer for a record already applied.
+unsafe fn respond(s: &mut ModuleState, syscalls: &super::SyscallTable, byte: u8) {
     if s.out_chan < 0 {
         return;
     }
-    let b = [byte];
-    let _ = (syscalls.channel_write)(s.out_chan, b.as_ptr(), 1);
+    let _ = s.reply.send(syscalls.channel_write, s.out_chan, &[byte]);
 }
 
 /// Find the live binding for `path`, or `None`.

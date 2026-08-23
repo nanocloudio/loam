@@ -36,7 +36,7 @@ export PATH=$PWD/target/debug:$PATH
 
 The smallest live graph: a probe writes a blob into a
 content-addressed store and reads it back. `root_dir` must exist
-before the graph starts — the fluxor `fs` contract has no mkdir.
+before the graph starts — `body_store` does not create it.
 
 ```sh
 mkdir -p data/bodies-0
@@ -121,7 +121,8 @@ restart replays to the same contents.
 
 `--s3-credentials FILE` turns on SigV4 verification with
 per-access-key bucket scopes; without it the gateway is anonymous.
-`--gc-interval N` sweeps orphaned body blobs every N ticks.
+`--gc-interval N` sweeps orphaned body blobs and unbound object
+descriptors every N ticks — see [durability.md](durability.md).
 
 ## Replicated body plane
 
@@ -155,10 +156,12 @@ ls data/2node/bodies-b data/2node/bodies-c   # same digest on both
 ```
 
 With `--replica-count 2` every PUT lands on both nodes before it is
-acknowledged. Kill one body node and the GET still answers from the
-survivor; `--scrub-interval` heals under-replication in the
-background once the fleet is whole again. Stop everything with
-`kill` on the three processes.
+acknowledged — desired replicas and required synchronous replicas are
+one number, for the reasons in [durability.md](durability.md). Kill
+one body node and the GET still answers from the survivor;
+`--scrub-interval` heals under-replication in the background once the
+fleet is whole again. Stop everything with `kill` on the three
+processes.
 
 ## Replicated metadata
 

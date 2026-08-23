@@ -24,6 +24,10 @@ const REQ_ASM: usize = READ_BUF * (MAX_OPS_PER_STEP as usize + 1);
 /// Inline WAL-path buffer size; see `namespace_pic_body.rs`.
 pub const WAL_PATH_BUF: usize = 256;
 
+/// The object PIC answers with a 1-byte ack or an encoded get
+/// response; both sit well inside a read buffer.
+pub type Reply = super::reply_out::ReplyOut<READ_BUF>;
+
 #[repr(C)]
 pub struct ModuleState {
     pub syscalls: *const super::SyscallTable,
@@ -37,12 +41,24 @@ pub struct ModuleState {
     /// Set while walking past bytes that do not start a record. One
     /// NAK is emitted on entering that state, not one per byte.
     pub req_resyncing: u8,
+    /// The answer this module owes. A channel that refuses the write
+    /// leaves it owed rather than lost; no new work is taken until it
+    /// lands.
+    pub reply: Reply,
     pub objects: super::state::PicObjectState<ARENA_CAPACITY>,
     pub ticks: u32,
     pub ops_applied: u32,
     pub apply_errors: u32,
     pub wal_fd: i32,
     pub append_scratch: [u8; super::wal::APPEND_SCRATCH],
+    /// Resumable WAL append. Owns the staged frame, so a device that
+    /// answers `E_AGAIN` costs a later step rather than an operation
+    /// refusal.
+    pub appender: super::wal::WalAppender,
+    /// A record has left `requests` and is staged for durability. It
+    /// is not applied, acked, or discarded until the append resolves,
+    /// and no other work is consumed meanwhile.
+    pub wal_staged: u8,
     pub wal_path: [u8; WAL_PATH_BUF],
     pub wal_path_len: u16,
 }
@@ -92,6 +108,9 @@ pub unsafe fn open_and_replay_wal(state_ptr: *mut u8, wal_path: &[u8]) -> i32 {
         Err(_) => return -3,
     };
     s.wal_fd = fd;
+    // The appender's tail knowledge belongs to the previous fd.
+    s.appender.reset();
+    s.wal_staged = 0;
 
     let mut scratch = [0u8; super::wal::MAX_WAL_REC];
     let objects_ptr: *mut super::state::PicObjectState<ARENA_CAPACITY> = &mut s.objects;
@@ -195,8 +214,68 @@ unsafe fn init_state(
     s.req_asm_len = 0;
     s.req_resyncing = 0;
     s.wal_fd = -1;
+    s.wal_staged = 0;
+    core::ptr::write_bytes(
+        core::ptr::addr_of_mut!(s.appender) as *mut u8,
+        0,
+        core::mem::size_of::<super::wal::WalAppender>(),
+    );
     s.wal_path_len = 0;
     0
+}
+
+/// Staged-record buffer. Sized by what the appender can hold, NOT by
+/// `READ_BUF` — that is the channel-read chunk size, and a record
+/// reassembled across chunks is legitimately larger. Undersizing here
+/// refuses a record the WAL already made durable, so the requester is
+/// told it failed and replay applies it anyway.
+const STAGED_REC: usize = super::wal::MAX_WAL_REC;
+
+/// Resolve the record a staged append took off `requests`. `durable`
+/// licenses the arena mutation and the success ack; without it the
+/// record is refused, because a refusal the requester can see is the
+/// only honest answer to a durability failure.
+unsafe fn resolve_staged(s: &mut ModuleState, syscalls: &super::SyscallTable, durable: bool) {
+    s.wal_staged = 0;
+    let mut payload = [0u8; STAGED_REC];
+    let n = s.appender.payload().len();
+    let ok = durable && n != 0 && n <= payload.len();
+    if ok {
+        payload[..n].copy_from_slice(s.appender.payload());
+    }
+    let op = if ok {
+        super::wire::peek_opcode(&payload[..n])
+    } else {
+        None
+    };
+    let outcome = match (op, ok) {
+        (Some(op), true) => match apply_to_arena(&mut s.objects, &payload[..n]) {
+            Ok(_) => Ok(op),
+            Err(fault) => Err(fault),
+        },
+        _ => Err(ApplyFault::Rejected),
+    };
+    let ack_byte = match outcome {
+        Ok(op) => {
+            s.ops_applied = s.ops_applied.wrapping_add(1);
+            op
+        }
+        Err(fault) => {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            reply_for(fault)
+        }
+    };
+    let _ = s
+        .reply
+        .send(syscalls.channel_write, s.out_chan, &[ack_byte]);
+}
+
+/// The one-byte answer a fault produces on `responses`.
+fn reply_for(fault: ApplyFault) -> u8 {
+    match fault {
+        ApplyFault::Absent => super::wire::ACK_ABSENT,
+        ApplyFault::Rejected => 0xFF,
+    }
 }
 
 pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
@@ -210,6 +289,25 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         Some(t) => t,
         None => return -1,
     };
+
+    // An owed answer owns the step until the channel takes it. The
+    // record it answers has already left `requests` and changed the
+    // arena, so letting new work overtake it would leave a requester
+    // with a mutation and no reply.
+    if !s.reply.flush(syscalls.channel_write, s.out_chan) {
+        return 0;
+    }
+
+    // A staged append owns the step until it resolves: the record it
+    // describes has left `requests` and no other work may overtake
+    // it, reuse the frame buffer, or acknowledge ahead of it.
+    if s.wal_staged != 0 {
+        match s.appender.poll(syscalls, s.wal_fd) {
+            super::wal::AppendState::Pending => return 0,
+            super::wal::AppendState::Durable => resolve_staged(s, syscalls, true),
+            _ => resolve_staged(s, syscalls, false),
+        }
+    }
 
     // `requests` is a byte stream. Refill a reassembly buffer, then
     // take whole records off the front of it — up to the step budget,
@@ -235,6 +333,13 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     let mut handled: u32 = 0;
     let mut req_off: usize = 0;
     while handled < MAX_OPS_PER_STEP {
+        // An answer still owed for the previous record means the
+        // channel is not draining. Taking another record would either
+        // overwrite that answer or mutate the arena for a request that
+        // cannot be answered either.
+        if s.reply.owed() {
+            break;
+        }
         let rec_len = match super::wire::request_record_len(&s.req_asm[req_off..s.req_asm_len]) {
             Ok(Some(len)) => len,
             // Nothing, or an incomplete tail: keep it and wait.
@@ -247,7 +352,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                 if s.req_resyncing == 0 {
                     s.req_resyncing = 1;
                     let nak = [0xFFu8];
-                    let _ = (syscalls.channel_write)(s.out_chan, nak.as_ptr(), 1);
+                    let _ = s.reply.send(syscalls.channel_write, s.out_chan, &nak);
                 }
                 req_off += 1;
                 handled = handled.wrapping_add(1);
@@ -264,12 +369,13 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                 op @ (super::wire::OP_OBJ_PUT
                 | super::wire::OP_OBJ_UPDATE
                 | super::wire::OP_OBJ_REMOVE
-                | super::wire::OP_OBJ_GET),
+                | super::wire::OP_OBJ_GET
+                | super::wire::OP_OBJ_SCAN),
             ) => op,
             _ => {
                 s.apply_errors = s.apply_errors.wrapping_add(1);
                 let nak = [0xFFu8];
-                let _ = (syscalls.channel_write)(s.out_chan, nak.as_ptr(), 1);
+                let _ = s.reply.send(syscalls.channel_write, s.out_chan, &nak);
                 handled = handled.wrapping_add(1);
                 continue;
             }
@@ -281,31 +387,53 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
             handled = handled.wrapping_add(1);
             continue;
         }
+        if op == super::wire::OP_OBJ_SCAN {
+            handle_scan(s, syscalls, bytes);
+            handled = handled.wrapping_add(1);
+            continue;
+        }
 
+        // A WAL that was configured and is now gone is not the same
+        // as never having had one: the arena would mutate with no
+        // durable backing while the ack claimed otherwise. Refuse
+        // until an open succeeds again.
+        if s.wal_fd < 0 && s.wal_path_len > 0 {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            let nak = [0xFFu8];
+            let _ = s.reply.send(syscalls.channel_write, s.out_chan, &nak);
+            continue;
+        }
+
+        // Durability first: the append is staged, not completed here.
+        // A device that has accepted the frame but not finished it
+        // leaves the record staged and the step returns; the arena
+        // and the ack wait for the fence.
         if s.wal_fd >= 0 {
-            let wal_rc = super::wal::wal_append(syscalls, s.wal_fd, bytes, &mut s.append_scratch);
-            if wal_rc.is_err() {
-                s.apply_errors = s.apply_errors.wrapping_add(1);
-                let nak = [0xFFu8];
-                let _ = (syscalls.channel_write)(s.out_chan, nak.as_ptr(), 1);
-                handled = handled.wrapping_add(1);
-                continue;
+            match s.appender.begin(syscalls, s.wal_fd, bytes) {
+                super::wal::AppendState::Durable => {}
+                super::wal::AppendState::Pending => {
+                    s.wal_staged = 1;
+                    break;
+                }
+                _ => {
+                    s.apply_errors = s.apply_errors.wrapping_add(1);
+                    let nak = [0xFFu8];
+                    let _ = s.reply.send(syscalls.channel_write, s.out_chan, &nak);
+                    handled = handled.wrapping_add(1);
+                    continue;
+                }
             }
         }
 
         match apply_to_arena(&mut s.objects, bytes) {
             Ok(_) => {
                 s.ops_applied = s.ops_applied.wrapping_add(1);
-                let ack = [op];
-                let wrote = (syscalls.channel_write)(s.out_chan, ack.as_ptr(), 1);
-                if wrote < 0 {
-                    break;
-                }
+                let _ = s.reply.send(syscalls.channel_write, s.out_chan, &[op]);
             }
-            Err(_) => {
+            Err(fault) => {
                 s.apply_errors = s.apply_errors.wrapping_add(1);
-                let nak = [0xFFu8];
-                let _ = (syscalls.channel_write)(s.out_chan, nak.as_ptr(), 1);
+                let nak = [reply_for(fault)];
+                let _ = s.reply.send(syscalls.channel_write, s.out_chan, &nak);
             }
         }
         handled = handled.wrapping_add(1);
@@ -333,7 +461,7 @@ unsafe fn handle_get(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes:
         Err(_) => {
             s.apply_errors = s.apply_errors.wrapping_add(1);
             let nak = [0xFFu8];
-            let _ = (syscalls.channel_write)(s.out_chan, nak.as_ptr(), 1);
+            let _ = s.reply.send(syscalls.channel_write, s.out_chan, &nak);
             return;
         }
     };
@@ -351,24 +479,64 @@ unsafe fn handle_get(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes:
     };
     match n {
         Ok(n) => {
-            let _ = (syscalls.channel_write)(s.out_chan, s.append_scratch.as_ptr(), n);
+            let _ = s
+                .reply
+                .send(syscalls.channel_write, s.out_chan, &s.append_scratch[..n]);
         }
         Err(_) => {
             s.apply_errors = s.apply_errors.wrapping_add(1);
             let nak = [0xFFu8];
-            let _ = (syscalls.channel_write)(s.out_chan, nak.as_ptr(), 1);
+            let _ = s.reply.send(syscalls.channel_write, s.out_chan, &nak);
         }
     }
+}
+
+/// Serve an OP_OBJ_SCAN request: one bounded page of the descriptor
+/// inventory. No WAL touch, no arena mutation.
+unsafe fn handle_scan(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) {
+    let (cursor, max) = match super::wire::decode_scan_req(bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            let nak = [0xFFu8];
+            let _ = s.reply.send(syscalls.channel_write, s.out_chan, &nak);
+            return;
+        }
+    };
+    let take = (max as usize).min(super::wire::MAX_OBJ_SCAN);
+    let mut digests = [[0u8; super::wire::DIGEST_LEN]; super::wire::MAX_OBJ_SCAN];
+    let (next, count) = s.objects.scan(cursor, &mut digests[..take]);
+    match super::wire::encode_scan_resp(&mut s.append_scratch, next, &digests[..count]) {
+        Ok(n) => {
+            let _ = s
+                .reply
+                .send(syscalls.channel_write, s.out_chan, &s.append_scratch[..n]);
+        }
+        Err(_) => {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            let nak = [0xFFu8];
+            let _ = s.reply.send(syscalls.channel_write, s.out_chan, &nak);
+        }
+    }
+}
+
+/// Why an apply produced no state change. `Absent` is a definite
+/// answer about the arena; `Rejected` means the record could not be
+/// applied at all, and a caller must not read absence into it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ApplyFault {
+    Absent,
+    Rejected,
 }
 
 pub(super) fn apply_to_arena(
     objects: &mut super::state::PicObjectState<ARENA_CAPACITY>,
     payload: &[u8],
-) -> Result<u8, ()> {
-    let op = super::wire::peek_opcode(payload).ok_or(())?;
+) -> Result<u8, ApplyFault> {
+    let op = super::wire::peek_opcode(payload).ok_or(ApplyFault::Rejected)?;
     match op {
         super::wire::OP_OBJ_PUT => {
-            let p = super::wire::decode_put(payload).map_err(|_| ())?;
+            let p = super::wire::decode_put(payload).map_err(|_| ApplyFault::Rejected)?;
             objects
                 .put_new(
                     p.id,
@@ -379,11 +547,11 @@ pub(super) fn apply_to_arena(
                     p.replica_count,
                     p.erasure,
                 )
-                .map_err(|_| ())?;
+                .map_err(|_| ApplyFault::Rejected)?;
             Ok(super::wire::OP_OBJ_PUT)
         }
         super::wire::OP_OBJ_UPDATE => {
-            let p = super::wire::decode_update(payload).map_err(|_| ())?;
+            let p = super::wire::decode_update(payload).map_err(|_| ApplyFault::Rejected)?;
             objects
                 .update(
                     p.id,
@@ -394,14 +562,17 @@ pub(super) fn apply_to_arena(
                     p.replica_count,
                     p.erasure,
                 )
-                .map_err(|_| ())?;
+                .map_err(|_| ApplyFault::Rejected)?;
             Ok(super::wire::OP_OBJ_UPDATE)
         }
         super::wire::OP_OBJ_REMOVE => {
-            let d = super::wire::decode_remove(payload).map_err(|_| ())?;
-            objects.remove(d.id).map_err(|_| ())?;
+            let d = super::wire::decode_remove(payload).map_err(|_| ApplyFault::Rejected)?;
+            objects.remove(d.id).map_err(|e| match e {
+                super::state::ApplyError::NotPresent => ApplyFault::Absent,
+                _ => ApplyFault::Rejected,
+            })?;
             Ok(super::wire::OP_OBJ_REMOVE)
         }
-        _ => Err(()),
+        _ => Err(ApplyFault::Rejected),
     }
 }

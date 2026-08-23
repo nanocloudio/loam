@@ -43,6 +43,12 @@ pub mod sha256 {
     pub use super::sha256_impl::Sha256;
 }
 
+#[path = "../../../modules/common/mechanics/reply_out.rs"]
+mod reply_out;
+
+#[path = "../../../modules/common/mechanics/fs_names.rs"]
+mod fs_names;
+
 #[path = "../../../modules/common/mechanics/loam_wire.rs"]
 pub mod ns_wire;
 
@@ -80,6 +86,10 @@ pub mod ns_body;
 
 // Object body wrapping (same pattern as pic.rs).
 pub mod obj_scope {
+    pub mod reply_out {
+        pub use super::super::reply_out::*;
+    }
+
     pub use super::abi::SyscallTable;
     pub mod wire {
         pub use super::super::obj_wire::*;
@@ -105,6 +115,10 @@ pub use obj_scope::body as obj_body;
 
 // Body store body wrapping.
 pub mod body_store_scope {
+    pub mod fs_names {
+        pub use super::super::fs_names::*;
+    }
+
     pub use super::abi::SyscallTable;
     pub mod sha256 {
         pub use super::super::sha256_impl::Sha256;
@@ -316,6 +330,21 @@ const FS_FSYNC: u32 = 0x0905;
 const FS_WRITE: u32 = 0x0906;
 const FS_OPEN_CREATE: u32 = 0x0909;
 const FS_UNLINK: u32 = 0x090A;
+const FS_RENAME: u32 = 0x090D;
+const FS_FSYNC_NAME: u32 = 0x0912;
+const FS_CAPS: u32 = 0x09FF;
+/// OPEN | OPENDIR | OPEN_CREATE | WRITE | FSYNC | UNLINK | MKDIR |
+/// RENAME | FSYNC_NAME — the Linux provider's surface, which is what
+/// this in-process dispatch mirrors.
+const FS_CAP_MASK: u32 = (1 << 0)
+    | (1 << 1)
+    | (1 << 2)
+    | (1 << 3)
+    | (1 << 4)
+    | (1 << 5)
+    | (1 << 7)
+    | (1 << 8)
+    | (1 << 11);
 
 fn fs_slot_for(file: File) -> i32 {
     let mut files = FS_FILES.lock().unwrap();
@@ -331,6 +360,73 @@ fn fs_slot_for(file: File) -> i32 {
 
 unsafe extern "C" fn fs_provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
     match op {
+        // Durable name publication. `FSYNC` fences a file's bytes, never
+        // the directory entry that finds them, so the byte tier needs
+        // its own name fence and an atomic rename.
+        FS_CAPS => {
+            if arg.is_null() || arg_len < 4 {
+                return -22;
+            }
+            let out = unsafe { std::slice::from_raw_parts_mut(arg, 4) };
+            out.copy_from_slice(&FS_CAP_MASK.to_le_bytes());
+            4
+        }
+        FS_FSYNC_NAME => {
+            if arg.is_null() || arg_len == 0 {
+                return -22;
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(arg as *const u8, arg_len) };
+            let path = match std::str::from_utf8(bytes) {
+                Ok(p) => p,
+                Err(_) => return -22,
+            };
+            let parent = match std::path::Path::new(path).parent() {
+                Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                _ => std::path::PathBuf::from("."),
+            };
+            match File::open(&parent).and_then(|d| d.sync_all()) {
+                Ok(()) => 0,
+                Err(_) => -5,
+            }
+        }
+        FS_RENAME => {
+            if arg.is_null() || arg_len < 4 {
+                return -22;
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(arg as *const u8, arg_len) };
+            let src_len = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+            if arg_len < 2 + src_len + 2 {
+                return -22;
+            }
+            let dst_at = 2 + src_len;
+            let dst_len = u16::from_le_bytes([bytes[dst_at], bytes[dst_at + 1]]) as usize;
+            if arg_len < dst_at + 2 + dst_len {
+                return -22;
+            }
+            let src = match std::str::from_utf8(&bytes[2..2 + src_len]) {
+                Ok(p) => p.to_string(),
+                Err(_) => return -22,
+            };
+            let dst = match std::str::from_utf8(&bytes[dst_at + 2..dst_at + 2 + dst_len]) {
+                Ok(p) => p.to_string(),
+                Err(_) => return -22,
+            };
+            if std::fs::rename(&src, &dst).is_err() {
+                return -5;
+            }
+            // The rename IS the publication, so both parents are made
+            // durable before it returns.
+            for path in [&dst, &src] {
+                let parent = match std::path::Path::new(path).parent() {
+                    Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                    _ => std::path::PathBuf::from("."),
+                };
+                if File::open(&parent).and_then(|d| d.sync_all()).is_err() {
+                    return -5;
+                }
+            }
+            0
+        }
         FS_OPEN | FS_OPEN_CREATE => {
             if arg.is_null() || arg_len == 0 {
                 return -22;

@@ -25,6 +25,12 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 #[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[path = "../../common/mechanics/reply_out.rs"]
+mod reply_out;
+
+#[path = "../../common/mechanics/fs_names.rs"]
+mod fs_names;
+
 #[path = "../../common/mechanics/loam_wire.rs"]
 mod wire;
 
@@ -125,8 +131,7 @@ pub extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
 //
 // The loader registers a contract provider by resolving these two
 // symbols. Without them a manifest's `provides = ["storage.namespace"]`
-// advertises a surface nothing can reach — which is what it did before
-// these landed (RFC 0005 P2.8).
+// advertises a surface nothing can reach.
 
 #[no_mangle]
 #[link_section = ".text.module_provides_contract"]

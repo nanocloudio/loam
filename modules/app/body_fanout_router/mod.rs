@@ -5,10 +5,10 @@
 //
 // Like admin_router, only slot-0 in/out arrive through `module_new`;
 // the per-target downstream channels are resolved by name at
-// instantiation. Resolving them here is outstanding work (RFC 0005
-// P1.1) — `dev_channel_port` is what does it, as `clustor_bridge` and
-// `namespace_router` already show. Until then the host harness drives
-// the body's internals directly via `module_new_with_targets_impl`.
+// instantiation. Resolving them here is not done yet —
+// `dev_channel_port` is what does it, as `clustor_bridge` and
+// `namespace_router` already show. Until then the body's internals
+// are driven directly via `module_new_with_targets_impl`.
 
 use core::ffi::c_void;
 

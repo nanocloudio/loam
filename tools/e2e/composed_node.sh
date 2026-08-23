@@ -36,6 +36,7 @@
 # Usage: tools/e2e/composed_node.sh [total] [inject_period] [batch]
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+. tools/e2e/graph_run.sh
 
 TOTAL="${1:-200}"
 INJECT_PERIOD="${2:-8}"
@@ -54,10 +55,12 @@ mkdir -p target
 # as duplicates — a graph in perfect health reporting total refusal.
 rm -rf wal "$PROPOSER_WAL" "$LOG"
 
+PORT=$(free_port)
 sed -e "s|      total: .*|      total: $TOTAL|" \
     -e "s|      inject_period: .*|      inject_period: $INJECT_PERIOD|" \
     -e "s|      batch_per_step: .*|      batch_per_step: $BATCH|" \
     -e "s|wal_path: .*|wal_path: \"$PROPOSER_WAL\"|" \
+    -e "s|listen_port: .*|listen_port: $PORT|" \
     "$GRAPH" > "$RENDERED"
 
 echo "[composed] offering $TOTAL bind requests at the namespace surface"
@@ -78,15 +81,10 @@ runner=$!
 # `fluxor run` spawns `fluxor-linux` as a child whose argv is the
 # compiled config, not the YAML. Killing only the wrapper leaves that
 # child stepping a graph and competing with whatever runs next.
-reap() {
-  kill "$runner" 2>/dev/null || true
-  wait "$runner" 2>/dev/null || true
-  pkill -f "loam_composed_node" 2>/dev/null || true
-  sleep 1
-  pkill -9 -f "loam_composed_node" 2>/dev/null || true
-}
+reap() { reap_graph "loam_composed_node" "$runner"; }
 trap reap EXIT
 
+stalled=0
 deadline=$((SECONDS + RUN_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
   sleep 2
@@ -99,13 +97,17 @@ while [ "$SECONDS" -lt "$deadline" ]; do
     break
   fi
   kill -0 "$runner" 2>/dev/null || break
+  if graph_stalled "$LOG"; then
+    stalled=1
+    break
+  fi
 done
 reap
 trap - EXIT
 
-if grep -q "SIGSEGV" "$LOG"; then
-  echo "[composed] FAILED: the runtime faulted — see $LOG" >&2
-  grep -n "SIGSEGV" "$LOG" | tail -3 >&2
+reason=$(graph_fault_reason "$LOG")
+if [ -n "$reason" ]; then
+  echo "[composed] FAILED: $reason — see $LOG" >&2
   exit 1
 fi
 
@@ -127,6 +129,13 @@ echo "[composed] surface: emitted=$emitted acknowledged=$acked refused=$refused"
 echo "[composed] plane:   proposed=$proposed committed=$committed aborted=$aborted"
 
 fail=0
+# Said first, because it changes what every number below means: they are
+# a snapshot of the moment the graph stopped, not of a settled run.
+if [ "$stalled" -ne 0 ]; then
+  echo "[composed] FAILED: the graph stopped producing output; the counts" >&2
+  echo "[composed]   below are from before it stopped, not from a settled run" >&2
+  fail=1
+fi
 if [ "$emitted" -eq 0 ]; then
   echo "[composed] FAILED: nothing was emitted in ${RUN_SECONDS}s" >&2
   fail=1

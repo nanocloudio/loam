@@ -5,10 +5,9 @@
 // (digest, size) metadata so the PIC's memory footprint stays
 // flat regardless of how much body data has been stored.
 //
-// `<root_dir>` must already exist (the fluxor fs contract has no
-// MKDIR opcode). The graph profile / launch script is responsible
-// for creating it; PUT against a missing directory fails with
-// ERR_NO_ROOT.
+// `<root_dir>` must already exist — this module never creates it.
+// The graph profile / launch script is responsible for that; PUT
+// against a missing directory fails with ERR_NO_ROOT.
 //
 // DELETE clears the slot AND unlinks the on-disk file (fs contract
 // UNLINK, 0x090A). A DELETE for a digest with no slot still attempts
@@ -45,6 +44,30 @@ const FS_OPENDIR: u32 = 0x0907;
 const FS_READDIR: u32 = 0x0908;
 const FS_UNLINK: u32 = 0x090A;
 
+/// How a content-addressed artefact reaches its final name.
+///
+/// `FSYNC` fences a file's bytes and its own size, never the directory
+/// entry that finds it. A blob published without a name fence has
+/// durable bytes reachable by no durable name, so the tier is chosen
+/// from the provider's capabilities and the weakest tier refuses
+/// rather than acknowledging a publication it cannot make.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PublishTier {
+    /// Write a temporary, fence its bytes, rename onto the final path.
+    /// The rename is atomic and publishes both parents, so no partial
+    /// final artefact is ever observable.
+    Rename,
+    /// Write the final path in place, fence its bytes, then fence the
+    /// name. A crash mid-write leaves a short file under a name that
+    /// promises whole content; content addressing is what makes that
+    /// detectable, and a re-PUT republishes it.
+    NameFence,
+    /// Neither fence exists. A content-addressed PUT cannot be
+    /// acknowledged, because the acknowledgement is a durability
+    /// claim.
+    Unavailable,
+}
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct DiskSlot {
@@ -59,9 +82,9 @@ pub struct DiskSlot {
 }
 
 /// Concurrent chunked writes. Each session streams to
-/// `<root>/.wip_<wid>` with an incremental hash; COMMIT verifies
-/// the declared digest and publishes by copying to the content
-/// path (an FS_RENAME fs-contract op is the tracked optimization).
+/// `<root>/.wip_<wid>` with an incremental hash; COMMIT verifies the
+/// declared digest, then publishes under the provider's
+/// [`PublishTier`] — see `handle_wcommit`.
 pub const WRITE_SESSIONS: usize = 4;
 /// Sessions untouched this many ticks are reaped (client died
 /// mid-stream) — temp file unlinked, slot freed.
@@ -86,8 +109,29 @@ pub struct ModuleState {
     pub root_dir: [u8; ROOT_DIR_BUF],
     pub root_dir_len: u16,
     pub scratch: [u8; SCRATCH_OUT],
+    /// The response owed on `body_responses`, held in `scratch`.
+    /// `resp_len` is its length and `resp_sent` how much the channel
+    /// has taken; both zero means nothing is owed.
+    ///
+    /// This tracks the existing buffer rather than mounting
+    /// `reply_out.rs` as the arena PICs do: a body response is up to
+    /// `SCRATCH_OUT`, so a second copy would double the largest
+    /// allocation in this module for no gain. The discipline is the
+    /// same — an answer refused by the channel is retained, and no new
+    /// request is read while one is owed.
+    pub resp_len: u32,
+    pub resp_sent: u32,
     pub slots: [DiskSlot; BODY_SLOTS],
     pub wsessions: [WriteSession; WRITE_SESSIONS],
+    /// Provider capability bitmap, queried once. `caps_known` is what
+    /// distinguishes "no capabilities" from "not asked yet".
+    pub caps: u32,
+    pub caps_known: u8,
+    /// Set once the negotiated tier has been reported. Composites that
+    /// have a log surface drain this through [`take_tier_report`]; the
+    /// mechanics tier keeps no logging of its own, because it is mounted
+    /// into host contexts that have none.
+    pub tier_reported: u8,
     pub ticks: u32,
     pub stream_opens: u32,
     pub stream_commits: u32,
@@ -148,8 +192,17 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         None => return -1,
     };
 
+    // An owed response owns the step until the channel takes it. It
+    // lives in `scratch`, which the next request would overwrite.
+    if !flush_resp(s) {
+        return 0;
+    }
+
     let mut handled: u32 = 0;
     while handled < MAX_OPS_PER_STEP {
+        if s.resp_len != 0 {
+            break;
+        }
         let mut buf = [0u8; READ_BUF];
         let n = (syscalls.channel_read)(s.in_chan, buf.as_mut_ptr(), READ_BUF);
         if n <= 0 {
@@ -263,6 +316,119 @@ unsafe fn respond_put(s: &mut ModuleState, digest: &[u8; super::wire::DIGEST_LEN
     write_resp(s, n);
 }
 
+/// Which publication recipe this provider supports.
+///
+/// Queried until it is answered, not once: a probe that lands before the
+/// provider's volume has attached is refused, and recording that refusal
+/// would pin the store to its weakest recipe for good.
+pub unsafe fn publish_tier(s: &mut ModuleState) -> PublishTier {
+    if s.caps_known == 0 {
+        let probed = match s.syscalls.as_ref() {
+            Some(sys) => super::fs_names::caps(sys.provider_call),
+            None => None,
+        };
+        match probed {
+            Some(bits) => {
+                s.caps = bits;
+                s.caps_known = 1;
+            }
+            // Unanswered. Report the conservative tier for this call and
+            // leave the probe open so the next one asks again.
+            None => return PublishTier::Unavailable,
+        }
+    }
+    if s.caps & super::fs_names::CAP_RENAME != 0 {
+        PublishTier::Rename
+    } else if s.caps & super::fs_names::CAP_FSYNC_NAME != 0 {
+        PublishTier::NameFence
+    } else {
+        PublishTier::Unavailable
+    }
+}
+
+/// The negotiated publication tier as a line to log, returned once and
+/// then never again.
+///
+/// Which recipe a store runs is a property of the provider in front of
+/// it, so it is not derivable from the store's own configuration — a
+/// composite that can log should say it, or an operator is left
+/// inferring the fence from the artefacts it leaves behind. `None`
+/// before the first capability query, and after the line has been taken.
+pub unsafe fn take_tier_report(state_ptr: *mut u8) -> Option<&'static [u8]> {
+    let s = &mut *(state_ptr as *mut ModuleState);
+    if s.caps_known == 0 || s.tier_reported != 0 {
+        return None;
+    }
+    s.tier_reported = 1;
+    Some(if s.caps & super::fs_names::CAP_RENAME != 0 {
+        b"[body_store] publish tier=rename"
+    } else if s.caps & super::fs_names::CAP_FSYNC_NAME != 0 {
+        b"[body_store] publish tier=name_fence"
+    } else {
+        b"[body_store] publish tier=unavailable"
+    })
+}
+
+/// `<root>/.pub_<16 hex>` — the staging name a `Rename` publication
+/// writes before it publishes. Derived from the digest so two writers
+/// of the same content share it and no counter has to survive a
+/// restart; a crash leaves one behind and the boot sweep removes it.
+unsafe fn build_pub_path(
+    s: &ModuleState,
+    digest: &[u8; super::wire::DIGEST_LEN],
+    out: &mut [u8],
+) -> usize {
+    let rl = s.root_dir_len as usize;
+    const PREFIX: &[u8] = b"/.pub_";
+    const HEX: usize = 16;
+    if rl == 0 || out.len() < rl + PREFIX.len() + HEX {
+        return 0;
+    }
+    out[..rl].copy_from_slice(&s.root_dir[..rl]);
+    out[rl..rl + PREFIX.len()].copy_from_slice(PREFIX);
+    let hex_at = rl + PREFIX.len();
+    for i in 0..HEX / 2 {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        out[hex_at + 2 * i] = DIGITS[(digest[i] >> 4) as usize];
+        out[hex_at + 2 * i + 1] = DIGITS[(digest[i] & 0x0F) as usize];
+    }
+    hex_at + HEX
+}
+
+/// Write `bytes` to `path` and fence the bytes: create, write, fsync,
+/// close. Does not publish a name.
+unsafe fn write_and_fence(
+    sys: &super::SyscallTable,
+    path: &mut [u8],
+    plen: usize,
+    bytes: &[u8],
+) -> bool {
+    let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
+    if fd < 0 {
+        return false;
+    }
+    let wrote = (sys.provider_call)(fd, FS_WRITE, bytes.as_ptr() as *mut u8, bytes.len());
+    if wrote < 0 || (wrote as usize) != bytes.len() {
+        let _ = (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        return false;
+    }
+    let fenced = (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0) >= 0;
+    let _ = (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    fenced
+}
+
+unsafe fn rename_path(sys: &super::SyscallTable, src: &[u8], dst: &[u8]) -> bool {
+    super::fs_names::rename(sys.provider_call, src, dst)
+}
+
+unsafe fn fsync_name(sys: &super::SyscallTable, path: &mut [u8], plen: usize) -> bool {
+    super::fs_names::fsync_name(sys.provider_call, &path[..plen])
+}
+
+unsafe fn name_present(sys: &super::SyscallTable, path: &mut [u8], plen: usize) -> bool {
+    super::fs_names::name_present(sys.provider_call, &path[..plen])
+}
+
 /// Write `bytes` to `<root_dir>/<hex(digest)>` (create + write +
 /// fsync + close) and record a slot. Returns false on any disk
 /// failure or a full slot table.
@@ -277,45 +443,91 @@ unsafe fn write_blob_at(
     if plen == 0 {
         return false;
     }
+    let tier = publish_tier(s);
     let sys = match s.syscalls.as_ref() {
         Some(t) => t,
         None => return false,
     };
-    // FS_OPEN_CREATE does not truncate: a shorter overwrite
-    // (mutable keyed blob) would leave a stale tail that the
-    // restart-time disk-fallback read would serve. Unlink first —
-    // a crash inside the window is a torn extent write, which is
-    // exactly the contract a block device gives its filesystem.
-    let _ = (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), plen);
-    let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
-    if fd < 0 {
-        return false;
+    // A file already at the content path is NOT proof that its bytes
+    // hash to that path. A crash during an in-place publication can
+    // leave a full-length file whose interior was never fenced, and a
+    // length comparison accepts it forever without reading it. The
+    // supplied bytes are known-good and in hand, so republish them
+    // rather than acknowledge bytes nothing has verified. The cost is
+    // one rewrite per retried PUT; the alternative is a durability
+    // claim over unverified content.
+    // Keyed blobs are mutable — last write wins on a derived key — so
+    // they take the same recipe as content-addressed ones rather than
+    // a weaker one. On `Rename` that makes an overwrite atomic: the
+    // crash-visible outcomes are the old extent or the new one, never
+    // an absent or half-replaced extent.
+    match tier {
+        PublishTier::Rename => {
+            let mut tmp = [0u8; 256];
+            let tlen = build_pub_path(s, digest, &mut tmp);
+            if tlen == 0 {
+                return false;
+            }
+            // Staging is transient, and a crashed attempt can leave one
+            // behind. `FS_OPEN_CREATE` does not truncate, so a shorter
+            // payload would inherit the old tail and rename it into
+            // place. Remove it first.
+            let _ = (sys.provider_call)(-1, FS_UNLINK, tmp.as_mut_ptr(), tlen);
+            if !write_and_fence(sys, &mut tmp, tlen, bytes) {
+                let _ = (sys.provider_call)(-1, FS_UNLINK, tmp.as_mut_ptr(), tlen);
+                return false;
+            }
+            if !rename_path(sys, &tmp[..tlen], &path[..plen]) {
+                let _ = (sys.provider_call)(-1, FS_UNLINK, tmp.as_mut_ptr(), tlen);
+                return false;
+            }
+        }
+        PublishTier::NameFence => {
+            // No atomic replace on this tier. A keyed blob may shrink,
+            // and `FS_OPEN_CREATE` does not truncate, so the old entry
+            // has to go first — which leaves a window where the extent
+            // is absent. That window is the cost of the tier, not of
+            // the operation.
+            if keyed != 0 {
+                let _ = (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), plen);
+            }
+            if !write_and_fence(sys, &mut path, plen, bytes) {
+                return false;
+            }
+            if !fsync_name(sys, &mut path, plen) {
+                return false;
+            }
+        }
+        // No durable name publication exists on this backend, and the
+        // PUT response is a durability claim. Refuse it rather than
+        // acknowledge bytes reachable by no durable name.
+        PublishTier::Unavailable => return false,
     }
-    let wrote = (sys.provider_call)(fd, FS_WRITE, bytes.as_ptr() as *mut u8, bytes.len());
-    if wrote < 0 || (wrote as usize) != bytes.len() {
-        let _ = (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        return false;
-    }
-    if (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0) < 0 {
-        let _ = (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        return false;
-    }
-    let _ = (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-    // Upsert: an overwrite (mutable keyed blob, or identical
-    // content re-put) refreshes the existing slot in place.
+    record_slot(s, digest, bytes.len(), keyed)
+}
+
+/// Upsert the slot for a blob now on disk. An overwrite (mutable keyed
+/// blob, or identical content re-put) refreshes the existing slot in
+/// place.
+fn record_slot(
+    s: &mut ModuleState,
+    digest: &[u8; super::wire::DIGEST_LEN],
+    len: usize,
+    keyed: u8,
+) -> bool {
     if let Some(slot) = s
         .slots
         .iter_mut()
         .find(|sl| sl.in_use != 0 && sl.digest == *digest)
     {
-        slot.size = bytes.len() as u32;
+        slot.size = len as u32;
         slot.keyed = keyed;
         return true;
     }
     match find_empty_slot(s) {
         Some(slot) => {
             slot.digest = *digest;
-            slot.size = bytes.len() as u32;
+            slot.size = len as u32;
             slot.in_use = 1;
             slot.keyed = keyed;
             true
@@ -596,29 +808,56 @@ unsafe fn handle_delete(s: &mut ModuleState, bytes: &[u8]) {
     };
     let mut digest = [0u8; super::wire::DIGEST_LEN];
     digest.copy_from_slice(digest_bytes);
-    // Clear the slot AND unlink the on-disk file. The unlink is
-    // attempted even without a slot (restarts empty the in-arena
-    // table but leave files); `existed` reflects either.
-    let slot_existed = if let Some(slot) = find_slot(s, &digest) {
-        slot.in_use = 0;
-        slot.size = 0;
-        slot.digest = [0u8; super::wire::DIGEST_LEN];
-        true
-    } else {
-        false
-    };
+    // Retirement is fail-closed: the slot is the store's record that
+    // the blob is reachable, so it is cleared only once the file is
+    // provably gone. Clearing first would report a delete that did not
+    // happen — the file survives, the next disk sweep rehydrates it,
+    // and the caller has already been told it was retired.
+    let slot_present = find_slot(s, &digest).is_some();
     let mut file_existed = false;
+    let mut retired = true;
     if s.root_dir_len != 0 {
         let mut path = [0u8; 256];
         let plen = build_body_path(s, &digest, &mut path);
-        if plen != 0 {
-            if let Some(sys) = s.syscalls.as_ref() {
+        if plen == 0 {
+            nak(s, super::wire::ERR_IO);
+            return;
+        }
+        let _ = publish_tier(s); // populates `caps`
+        let names_are_fenceable = s.caps & super::fs_names::CAP_FSYNC_NAME != 0;
+        match s.syscalls.as_ref() {
+            Some(sys) => {
                 let rc = (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), plen);
                 file_existed = rc == 0;
+                if rc == 0 {
+                    // An unlink whose directory entry is still volatile
+                    // can reappear after a power cut, so the removal is
+                    // not retired until its name is fenced. Without
+                    // that fence the store cannot prove retirement and
+                    // must not claim it.
+                    retired = names_are_fenceable && fsync_name(sys, &mut path, plen);
+                } else {
+                    // Unlink failed. Deleting a blob that was never
+                    // there is a retirement that has already happened,
+                    // so probe the name rather than trust an errno
+                    // mapping: absent is success, present is failure.
+                    retired = !name_present(sys, &mut path, plen);
+                }
             }
+            None => retired = false,
         }
     }
-    let existed = slot_existed || file_existed;
+    if !retired {
+        s.apply_errors = s.apply_errors.wrapping_add(1);
+        nak(s, super::wire::ERR_IO);
+        return;
+    }
+    if let Some(slot) = find_slot(s, &digest) {
+        slot.in_use = 0;
+        slot.size = 0;
+        slot.digest = [0u8; super::wire::DIGEST_LEN];
+    }
+    let existed = slot_present || file_existed;
     let n = match super::wire::encode_delete_resp(&mut s.scratch, existed) {
         Ok(n) => n,
         Err(_) => {
@@ -692,6 +931,28 @@ fn hex_val(c: u8) -> Option<u8> {
     }
 }
 
+/// Parse a `.wip_<n>` temporary filename back into its session id.
+fn wip_id_from_name(name: &[u8]) -> Option<usize> {
+    const PREFIX: &[u8] = b".wip_";
+    if name.len() != PREFIX.len() + 1 || &name[..PREFIX.len()] != PREFIX {
+        return None;
+    }
+    let d = name[PREFIX.len()];
+    if d.is_ascii_digit() {
+        Some((d - b'0') as usize)
+    } else {
+        None
+    }
+}
+
+/// True for a `.pub_<hex>` publication staging name.
+fn is_pub_staging_name(name: &[u8]) -> bool {
+    const PREFIX: &[u8] = b".pub_";
+    name.len() > PREFIX.len()
+        && &name[..PREFIX.len()] == PREFIX
+        && name[PREFIX.len()..].iter().all(|c| hex_val(*c).is_some())
+}
+
 /// Parse a body filename (64 lowercase hex chars) back into its
 /// digest. Anything else in the root dir is not ours — skipped.
 fn hex_digest_from_name(name: &[u8]) -> Option<[u8; super::wire::DIGEST_LEN]> {
@@ -758,6 +1019,39 @@ unsafe fn rehydrate_from_disk(s: &mut ModuleState) {
             pos += name_len;
             seen += 1;
             if is_dir != 0 {
+                continue;
+            }
+            let raw_name = &buf[pos - name_len..pos];
+            // A `.wip_N` file is a streamed write's temporary. One
+            // whose session is gone belongs to a stream that died
+            // before its commit: no live state names it and no future
+            // one will, because the next WOPEN for that id unlinks it
+            // first. Remove it so the boot treatment of an interrupted
+            // stream is the same every time.
+            if let Some(wid) = wip_id_from_name(raw_name) {
+                if wid >= WRITE_SESSIONS || s.wsessions[wid].in_use == 0 {
+                    let mut wpath = [0u8; 256];
+                    let wplen = build_wip_path(s, wid as u8, &mut wpath);
+                    if wplen != 0 {
+                        let _ = (sys.provider_call)(-1, FS_UNLINK, wpath.as_mut_ptr(), wplen);
+                    }
+                }
+                continue;
+            }
+            // A `.pub_*` file is a publication that was interrupted
+            // before its rename. Its bytes are unreachable by any
+            // content path, so a re-PUT stages afresh; leaving it would
+            // accumulate one per interrupted write.
+            if is_pub_staging_name(raw_name) {
+                let rl = s.root_dir_len as usize;
+                let mut ppath = [0u8; 256];
+                if rl + 1 + name_len <= ppath.len() {
+                    ppath[..rl].copy_from_slice(&s.root_dir[..rl]);
+                    ppath[rl] = b'/';
+                    ppath[rl + 1..rl + 1 + name_len].copy_from_slice(raw_name);
+                    let _ =
+                        (sys.provider_call)(-1, FS_UNLINK, ppath.as_mut_ptr(), rl + 1 + name_len);
+                }
                 continue;
             }
             let digest = match hex_digest_from_name(&name[..name_len.min(HEX_DIGEST_LEN)]) {
@@ -980,6 +1274,7 @@ unsafe fn handle_wcommit(s: &mut ModuleState, bytes: &[u8]) {
         s.apply_errors = s.apply_errors.wrapping_add(1);
         return;
     }
+    let tier = publish_tier(s);
     let sys = match s.syscalls.as_ref() {
         Some(t) => t,
         None => {
@@ -995,13 +1290,55 @@ unsafe fn handle_wcommit(s: &mut ModuleState, bytes: &[u8]) {
         nak(s, super::wire::ERR_IO);
         return;
     }
-    // Publish: copy temp → content path. (FS_RENAME would make
-    // this O(1); tracked as the fs-contract optimization.)
+    // Publish. The stream has already written every byte to the
+    // temporary and verified the digest, and the fsync above fences
+    // those bytes; only the name is left.
+    //
+    // `Rename` publishes it atomically — the temporary IS the artefact,
+    // so the commit is one provider call and no partial final artefact
+    // is ever observable. `NameFence` has no atomic replace, so the
+    // bytes are copied to the content path and the name fenced after;
+    // content addressing is what makes an interrupted copy detectable.
+    // Without either, the commit cannot claim publication and refuses.
     let mut final_path = [0u8; 256];
     let plen = build_body_path(s, &digest, &mut final_path);
     if plen == 0 {
         session_cleanup(s, wid);
         nak(s, super::wire::ERR_IO);
+        return;
+    }
+    // No short-circuit on an existing same-length file: length is not
+    // a digest, and this session holds bytes whose digest is verified.
+    // Publishing them is the only path that makes the acknowledgement
+    // true.
+    if tier == PublishTier::Unavailable {
+        session_cleanup(s, wid);
+        nak(s, super::wire::ERR_IO);
+        s.apply_errors = s.apply_errors.wrapping_add(1);
+        return;
+    }
+    if tier == PublishTier::Rename {
+        // The temporary already holds the verified, fenced bytes: the
+        // publication is the rename of that file onto its content path.
+        let mut tmp_path = [0u8; 256];
+        let tlen = build_wip_path(s, wid as u8, &mut tmp_path);
+        let _ = (sys.provider_call)(tmp_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        s.wsessions[wid].fd = -1;
+        s.wsessions[wid].in_use = 0;
+        if tlen == 0 || !rename_path(sys, &tmp_path[..tlen], &final_path[..plen]) {
+            if tlen != 0 {
+                let _ = (sys.provider_call)(-1, FS_UNLINK, tmp_path.as_mut_ptr(), tlen);
+            }
+            nak(s, super::wire::ERR_IO);
+            return;
+        }
+        record_slot(s, &digest, written.min(u32::MAX as u64) as usize, 0);
+        s.stream_commits = s.stream_commits.wrapping_add(1);
+        let n = match super::wire::encode_wcommit_resp(&mut s.scratch, &digest) {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        write_resp(s, n);
         return;
     }
     let out_fd = (sys.provider_call)(-1, FS_OPEN_CREATE, final_path.as_mut_ptr(), plen);
@@ -1036,19 +1373,17 @@ unsafe fn handle_wcommit(s: &mut ModuleState, bytes: &[u8]) {
         ok = (sys.provider_call)(out_fd, FS_FSYNC, core::ptr::null_mut(), 0) >= 0;
     }
     let _ = (sys.provider_call)(out_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    // The name is what a later mount finds the bytes by, so it is
+    // fenced before the commit is acknowledged.
+    if ok {
+        ok = fsync_name(sys, &mut final_path, plen);
+    }
     session_cleanup(s, wid); // closes + unlinks the temp
     if !ok {
         nak(s, super::wire::ERR_IO);
         return;
     }
-    if find_slot(s, &digest).is_none() {
-        if let Some(slot) = find_empty_slot(s) {
-            slot.digest = digest;
-            slot.size = written.min(u32::MAX as u64) as u32;
-            slot.in_use = 1;
-            slot.keyed = 0;
-        }
-    }
+    record_slot(s, &digest, written.min(u32::MAX as u64) as usize, 0);
     s.stream_commits = s.stream_commits.wrapping_add(1);
     let n = match super::wire::encode_wcommit_resp(&mut s.scratch, &digest) {
         Ok(n) => n,
@@ -1167,12 +1502,46 @@ unsafe fn nak(s: &mut ModuleState, errno: u8) {
     s.apply_errors = s.apply_errors.wrapping_add(1);
 }
 
+/// Take ownership of the response now in `scratch` and offer it.
 unsafe fn write_resp(s: &mut ModuleState, n: usize) {
+    if n == 0 || n > s.scratch.len() {
+        s.apply_errors = s.apply_errors.wrapping_add(1);
+        return;
+    }
+    s.resp_len = n as u32;
+    s.resp_sent = 0;
+    let _ = flush_resp(s);
+}
+
+/// Offer the owed response. True once every byte has been accepted,
+/// and when nothing is owed, so a caller can gate on it directly.
+unsafe fn flush_resp(s: &mut ModuleState) -> bool {
+    if s.resp_len == 0 {
+        return true;
+    }
     let sys = match s.syscalls.as_ref() {
         Some(t) => t,
-        None => return,
+        None => return false,
     };
-    let _ = (sys.channel_write)(s.out_chan, s.scratch.as_ptr(), n);
+    if s.out_chan < 0 {
+        return false;
+    }
+    let at = s.resp_sent as usize;
+    let rc = (sys.channel_write)(
+        s.out_chan,
+        s.scratch.as_ptr().add(at),
+        s.resp_len as usize - at,
+    );
+    if rc <= 0 {
+        return false;
+    }
+    s.resp_sent = (s.resp_sent + rc as u32).min(s.resp_len);
+    if s.resp_sent < s.resp_len {
+        return false;
+    }
+    s.resp_len = 0;
+    s.resp_sent = 0;
+    true
 }
 
 fn find_slot<'a>(

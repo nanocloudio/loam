@@ -23,6 +23,12 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 mod wire;
 
 #[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[path = "../../common/mechanics/fs_names.rs"]
+mod fs_names;
+
+#[path = "../../common/mechanics/reply_out.rs"]
+mod reply_out;
+
 #[path = "../../common/mechanics/wal_io.rs"]
 mod wal;
 

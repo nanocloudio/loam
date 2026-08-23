@@ -25,6 +25,19 @@ pub const OP_OBJ_PUT: u8 = 4;
 pub const OP_OBJ_UPDATE: u8 = 5;
 pub const OP_OBJ_REMOVE: u8 = 6;
 pub const OP_OBJ_GET: u8 = 7;
+pub const OP_OBJ_SCAN: u8 = 8;
+
+/// Answer to a remove whose descriptor was not there. Distinct from
+/// the generic 0xFF failure so a caller can tell "definitely absent"
+/// from "could not tell" — a lifecycle sweep may act on the first and
+/// must retain on the second.
+pub const ACK_ABSENT: u8 = 0xFE;
+
+/// Digest length of a content-derived object id.
+pub const DIGEST_LEN: usize = 32;
+/// Descriptor digests per inventory page. The page is what bounds the
+/// sweep's step, so it is small on purpose.
+pub const MAX_OBJ_SCAN: usize = 16;
 
 pub const OBJ_FOUND: u8 = 1;
 pub const OBJ_NOT_FOUND: u8 = 0;
@@ -361,6 +374,91 @@ pub fn peek_opcode(src: &[u8]) -> Option<u8> {
     src.first().copied()
 }
 
+// ── Descriptor inventory scan ─────────────────────────────────────
+//
+//   ScanReq   [op=8][cursor:u32][max:u8]
+//   ScanResp  [op=8][next_cursor:u32][count:u8][digest × count]
+//
+// The descriptor lifecycle sweep's enumeration. Only content-derived
+// ids appear; a caller pages until `next_cursor` comes back zero.
+
+pub fn encode_scan_req(dst: &mut [u8], cursor: u32, max: u8) -> Result<usize, WireError> {
+    if dst.len() < 6 {
+        return Err(WireError::BufferTooSmall {
+            needed: 6,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = OP_OBJ_SCAN;
+    dst[1..5].copy_from_slice(&cursor.to_le_bytes());
+    dst[5] = max;
+    Ok(6)
+}
+
+pub fn decode_scan_req(src: &[u8]) -> Result<(u32, u8), WireError> {
+    if src.len() < 6 {
+        return Err(WireError::Truncated);
+    }
+    if src[0] != OP_OBJ_SCAN {
+        return Err(WireError::BadOpcode { observed: src[0] });
+    }
+    Ok((u32::from_le_bytes([src[1], src[2], src[3], src[4]]), src[5]))
+}
+
+pub fn encode_scan_resp(
+    dst: &mut [u8],
+    next_cursor: u32,
+    digests: &[[u8; DIGEST_LEN]],
+) -> Result<usize, WireError> {
+    // The count is one byte on the wire; refuse rather than truncate
+    // a page silently into a short one the peer would believe.
+    if digests.len() > MAX_OBJ_SCAN {
+        return Err(WireError::StringTooLong {
+            len: digests.len(),
+            max: MAX_OBJ_SCAN,
+        });
+    }
+    let needed = 6 + digests.len() * DIGEST_LEN;
+    if dst.len() < needed {
+        return Err(WireError::BufferTooSmall {
+            needed,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = OP_OBJ_SCAN;
+    dst[1..5].copy_from_slice(&next_cursor.to_le_bytes());
+    dst[5] = digests.len() as u8;
+    let mut at = 6;
+    for d in digests {
+        dst[at..at + DIGEST_LEN].copy_from_slice(d);
+        at += DIGEST_LEN;
+    }
+    Ok(needed)
+}
+
+/// Returns `(next_cursor, count)`; digests land in `out`.
+pub fn decode_scan_resp(
+    src: &[u8],
+    out: &mut [[u8; DIGEST_LEN]],
+) -> Result<(u32, usize), WireError> {
+    if src.len() < 6 {
+        return Err(WireError::Truncated);
+    }
+    if src[0] != OP_OBJ_SCAN {
+        return Err(WireError::BadOpcode { observed: src[0] });
+    }
+    let next = u32::from_le_bytes([src[1], src[2], src[3], src[4]]);
+    let count = src[5] as usize;
+    if count > out.len() || src.len() < 6 + count * DIGEST_LEN {
+        return Err(WireError::Truncated);
+    }
+    for (i, slot) in out.iter_mut().enumerate().take(count) {
+        let at = 6 + i * DIGEST_LEN;
+        slot.copy_from_slice(&src[at..at + DIGEST_LEN]);
+    }
+    Ok((next, count))
+}
+
 // ── Request stream splitting ───────────────────────────────────────
 
 /// Length of the request record at the front of `src`, or `None` when
@@ -394,6 +492,8 @@ pub fn request_record_len(src: &[u8]) -> Result<Option<usize>, WireError> {
                 None
             })
         }
+        // [op][cursor:u32][max:u8]
+        OP_OBJ_SCAN => Ok(if src.len() >= 6 { Some(6) } else { None }),
         // [op][id_len:u16][id]
         OP_OBJ_REMOVE | OP_OBJ_GET => {
             if src.len() < 3 {

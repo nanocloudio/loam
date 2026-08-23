@@ -36,12 +36,20 @@ const FS_STAT: u32 = 0x0904;
 const FS_FSYNC: u32 = 0x0905;
 const FS_WRITE: u32 = 0x0906;
 const FS_OPEN_CREATE: u32 = 0x0909;
+const FS_WRITE_ASYNC: u32 = 0x090F;
+const FS_FSYNC_SUBMIT: u32 = 0x0910;
+const FS_FSYNC_POLL: u32 = 0x0911;
+const FS_CAPS: u32 = 0x09FF;
+
+/// `caps::FSYNC_ASYNC` — the provider implements the pipelined
+/// `WRITE_ASYNC` + `FSYNC_SUBMIT` + `FSYNC_POLL` tier.
+const CAP_FSYNC_ASYNC: u32 = 1 << 10;
 
 /// Per-record cap. Matches `loam_wire::MAX_STRING`-bounded events
 /// plus their 16-byte fixed prefix, with headroom.
 pub const MAX_WAL_REC: usize = 4096;
 
-/// Combined record-header + payload scratch. Sized so a single
+/// Combined record-header + payload frame. Sized so a single
 /// FS_WRITE can land both the header and the payload atomically from
 /// the provider's point of view — one write, not two.
 pub const APPEND_SCRATCH: usize = 8 + MAX_WAL_REC;
@@ -60,14 +68,32 @@ pub enum WalOpenError {
     /// one.
     Again,
     OpenFailed(i32),
+    /// The WAL's own name could not be made durable. `FSYNC` fences a
+    /// file's bytes and its own size, never the directory entry that
+    /// finds them, so without a name fence a crash can leave records
+    /// acknowledged durable in a file no later mount can open. A WAL
+    /// that cannot publish its name carries no durability claim, so it
+    /// refuses to open rather than pretend.
+    NameUnfenceable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalAppendError {
     PayloadTooLarge,
+    /// A zero-length record. Indistinguishable from padding on
+    /// replay, so it is refused rather than written.
+    EmptyPayload,
+    /// An append is already staged on this appender.
+    Busy,
+    /// A partial frame sits at the tail, so this WAL can carry no
+    /// further durability claim. Latched until the WAL is re-opened.
+    Broken,
     SeekFailed(i32),
     WriteFailed(i32),
-    ShortWrite { wrote: i32, wanted: usize },
+    ShortWrite {
+        wrote: i32,
+        wanted: usize,
+    },
     FsyncFailed(i32),
 }
 
@@ -84,7 +110,7 @@ pub enum WalReplayError {
 
 /// Open a WAL at `path`. The file must already exist; fluxor's
 /// `FS_OPEN` does not auto-create. On success the returned fd is
-/// suitable for `wal_append` / `wal_replay` / `wal_close`.
+/// suitable for `WalAppender` / `wal_replay` / `wal_close`.
 ///
 /// For callers that want create-on-missing semantics — typically
 /// per-PIC WALs on first boot — use `wal_open_or_create` instead.
@@ -109,7 +135,33 @@ pub unsafe fn wal_open_or_create(
     syscalls: &SyscallTable,
     path: &[u8],
 ) -> Result<i32, WalOpenError> {
-    wal_open_opcode(syscalls, path, FS_OPEN_CREATE)
+    let fd = wal_open_opcode(syscalls, path, FS_OPEN_CREATE)?;
+    // `OPEN_CREATE` mints a directory entry; the entry is volatile
+    // until it is fenced. Publish it before the WAL carries a single
+    // record, and fail closed when the provider cannot — proceeding on
+    // file `FSYNC` alone would acknowledge records into a file whose
+    // name a power cut can erase.
+    if !name_is_fenceable(syscalls) || !fsync_name(syscalls, path) {
+        let _ = wal_close(syscalls, fd);
+        return Err(WalOpenError::NameUnfenceable);
+    }
+    Ok(fd)
+}
+
+/// True when the provider can durably publish a directory entry.
+///
+/// An unanswered query reads as "cannot", which is the safe answer for a
+/// decision taken per call: the open is refused and retried, rather than a
+/// name being certified that nothing can fence. Nothing is recorded, so the
+/// next attempt asks again.
+unsafe fn name_is_fenceable(syscalls: &SyscallTable) -> bool {
+    super::fs_names::caps(syscalls.provider_call).unwrap_or(0) & super::fs_names::CAP_FSYNC_NAME
+        != 0
+}
+
+/// Fence the directory entry the provider last minted for `path`.
+unsafe fn fsync_name(syscalls: &SyscallTable, path: &[u8]) -> bool {
+    super::fs_names::fsync_name(syscalls.provider_call, path)
 }
 
 unsafe fn wal_open_opcode(
@@ -147,75 +199,313 @@ unsafe fn fs_seek(syscalls: &SyscallTable, fd: i32, offset: i32) -> i32 {
     (syscalls.provider_call)(fd, FS_SEEK, bytes.as_ptr() as *mut u8, bytes.len())
 }
 
-/// Append one record. `payload` is written verbatim after an
-/// 8-byte `[len, crc32]` header, then the file is fsynced. Returns
-/// only after the bytes are durable.
-///
-/// `scratch` must be at least `8 + payload.len()`; pass a fixed
-/// `[u8; APPEND_SCRATCH]` from the module's `ModuleState`.
-pub unsafe fn wal_append(
-    syscalls: &SyscallTable,
-    fd: i32,
-    payload: &[u8],
-    scratch: &mut [u8],
-) -> Result<(), WalAppendError> {
-    if payload.len() > MAX_WAL_REC {
-        return Err(WalAppendError::PayloadTooLarge);
-    }
-    let frame_len = 8 + payload.len();
-    if scratch.len() < frame_len {
-        return Err(WalAppendError::PayloadTooLarge);
-    }
+// ── Resumable append ──────────────────────────────────────────────
+//
+// A provider over a real device answers `E_AGAIN` for any stage of an
+// append it accepted but has not finished. An append that collapses
+// that into a failure turns transient device latency into operation
+// refusal, so the append is a state machine instead: `begin` stages
+// one frame, `poll` drives it, and only `Durable` licenses the caller
+// to mutate state or acknowledge.
+//
+// Two device tiers, selected once per WAL from the provider's `CAPS`
+// bitmap:
+//
+//   `FSYNC_ASYNC` set — `WRITE_ASYNC` submits the frame, `FSYNC_SUBMIT`
+//     opens a fence ticket, `FSYNC_POLL` reports when the fence is on
+//     non-volatile media.
+//   otherwise        — checked `WRITE` + `FSYNC`, each retried across
+//     steps on `E_AGAIN`.
+//
+// A hard (non-`E_AGAIN`) error after any frame byte reached the file
+// leaves a partial frame at the tail. Replay stops cleanly there, but
+// a later frame appended past it would be unreachable — silently
+// dropped on the next replay. The FS contract has no truncate, so the
+// appender latches `broken` instead and refuses every subsequent
+// append. Callers must treat that as "this WAL can no longer carry a
+// durability claim" and fail closed.
 
-    // Position at end-of-file before each append. Fluxor's FS_SEEK
-    // is SEEK_SET-only (providers.rs:208); stat the file to find
-    // its tail. Doing this every append is cheap (one syscall) and
-    // means the WAL is robust against any other writer that may
-    // have moved the file pointer.
-    let size = match wal_size(syscalls, fd) {
-        Ok(s) => s,
-        Err(WalReplayError::StatFailed(rc)) => {
-            return Err(WalAppendError::SeekFailed(rc));
+/// Outcome of one `poll` of a `WalAppender`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppendState {
+    /// No append staged.
+    Idle,
+    /// Accepted by the provider, not yet durable. Poll again on a
+    /// later step. No caller state may change.
+    Pending,
+    /// The frame is on non-volatile media.
+    Durable,
+    /// The append failed. The WAL carries no claim for this record.
+    Failed(WalAppendError),
+}
+
+const PHASE_IDLE: u8 = 0;
+const PHASE_SEEK: u8 = 1;
+const PHASE_WRITE: u8 = 2;
+const PHASE_SUBMIT: u8 = 3;
+const PHASE_POLL: u8 = 4;
+const PHASE_FSYNC: u8 = 5;
+
+/// One WAL's append state machine. Owns the frame buffer so the bytes
+/// handed to an async provider stay valid until the fence completes;
+/// nothing else may reuse them mid-append.
+#[repr(C)]
+pub struct WalAppender {
+    phase: u8,
+    /// `CAPS` has been queried for this WAL's provider.
+    caps_known: u8,
+    /// The provider left a partial frame at the tail; see the module
+    /// note above. Latched; only re-opening the WAL clears it.
+    broken: u8,
+    caps: u32,
+    frame_len: u32,
+    written: u32,
+    ticket: [u8; 8],
+    frame: [u8; APPEND_SCRATCH],
+}
+
+impl WalAppender {
+    pub const fn new() -> Self {
+        Self {
+            phase: PHASE_IDLE,
+            caps_known: 0,
+            broken: 0,
+            caps: 0,
+            frame_len: 0,
+            written: 0,
+            ticket: [0u8; 8],
+            frame: [0u8; APPEND_SCRATCH],
         }
-        Err(_) => return Err(WalAppendError::SeekFailed(-22)),
-    };
-    if size > i32::MAX as u32 {
-        return Err(WalAppendError::SeekFailed(-22));
-    }
-    let seek_rc = fs_seek(syscalls, fd, size as i32);
-    if seek_rc < 0 {
-        return Err(WalAppendError::SeekFailed(seek_rc));
     }
 
-    let crc = crc32(payload);
-    scratch[0..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-    scratch[4..8].copy_from_slice(&crc.to_le_bytes());
-    scratch[8..frame_len].copy_from_slice(payload);
-
-    // A provider over a real device can answer E_AGAIN here too. It
-    // surfaces as an append failure, which the caller must treat as
-    // "not durable" and refuse the operation — never as "written".
-    // Refusing is safe but pessimistic: the write would likely have
-    // completed on a later step. Turning that into a retry needs the
-    // append itself to span steps, which is what the provider's
-    // `FS_WRITE_ASYNC` / `FS_FSYNC_SUBMIT` / `FS_FSYNC_POLL` pair
-    // exists for — tracked as RFC 0005 P4.6.
-    let wrote = (syscalls.provider_call)(fd, FS_WRITE, scratch.as_mut_ptr(), frame_len);
-    if wrote < 0 {
-        return Err(WalAppendError::WriteFailed(wrote));
-    }
-    if (wrote as usize) != frame_len {
-        return Err(WalAppendError::ShortWrite {
-            wrote,
-            wanted: frame_len,
-        });
+    /// True while a staged frame is neither durable nor failed. The
+    /// caller must not consume new work, reuse the frame buffer, or
+    /// acknowledge anything while this holds.
+    pub fn busy(&self) -> bool {
+        self.phase != PHASE_IDLE
     }
 
-    let fsync_rc = (syscalls.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
-    if fsync_rc < 0 {
-        return Err(WalAppendError::FsyncFailed(fsync_rc));
+    /// True once a partial frame has been left at the tail. Every
+    /// further append is refused.
+    pub fn broken(&self) -> bool {
+        self.broken != 0
     }
-    Ok(())
+
+    /// Re-arm after the WAL has been re-opened at a known-good tail.
+    pub fn reset(&mut self) {
+        self.phase = PHASE_IDLE;
+        self.broken = 0;
+        self.frame_len = 0;
+        self.written = 0;
+    }
+
+    /// Stage one record. Returns the first `poll` outcome, so a
+    /// provider that completes synchronously needs no second step.
+    ///
+    /// # Safety
+    /// `syscalls` must point at a live `SyscallTable` and `fd` at a
+    /// WAL opened for writing.
+    pub unsafe fn begin(
+        &mut self,
+        syscalls: &SyscallTable,
+        fd: i32,
+        payload: &[u8],
+    ) -> AppendState {
+        if self.broken != 0 {
+            return AppendState::Failed(WalAppendError::Broken);
+        }
+        if self.phase != PHASE_IDLE {
+            return AppendState::Failed(WalAppendError::Busy);
+        }
+        if payload.is_empty() {
+            return AppendState::Failed(WalAppendError::EmptyPayload);
+        }
+        if payload.len() > MAX_WAL_REC {
+            return AppendState::Failed(WalAppendError::PayloadTooLarge);
+        }
+        let frame_len = 8 + payload.len();
+        let crc = crc32(payload);
+        self.frame[0..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        self.frame[4..8].copy_from_slice(&crc.to_le_bytes());
+        self.frame[8..frame_len].copy_from_slice(payload);
+        self.frame_len = frame_len as u32;
+        self.written = 0;
+        self.phase = PHASE_SEEK;
+        self.poll(syscalls, fd)
+    }
+
+    /// Drive the staged frame one step further.
+    ///
+    /// # Safety
+    /// Same constraints as `begin`, with the same `fd`.
+    pub unsafe fn poll(&mut self, syscalls: &SyscallTable, fd: i32) -> AppendState {
+        loop {
+            match self.phase {
+                PHASE_IDLE => return AppendState::Idle,
+                PHASE_SEEK => {
+                    // FS_SEEK is SEEK_SET-only, so the tail comes from
+                    // a stat. Re-stating per append also keeps the WAL
+                    // correct if anything else moved the descriptor.
+                    let size = match wal_size(syscalls, fd) {
+                        Ok(s) => s,
+                        Err(WalReplayError::StatFailed(E_AGAIN)) => return AppendState::Pending,
+                        Err(WalReplayError::StatFailed(rc)) => {
+                            return self.fail(WalAppendError::SeekFailed(rc))
+                        }
+                        Err(_) => return self.fail(WalAppendError::SeekFailed(-22)),
+                    };
+                    if size > i32::MAX as u32 {
+                        return self.fail(WalAppendError::SeekFailed(-22));
+                    }
+                    let rc = fs_seek(syscalls, fd, size as i32);
+                    if rc == E_AGAIN {
+                        return AppendState::Pending;
+                    }
+                    if rc < 0 {
+                        return self.fail(WalAppendError::SeekFailed(rc));
+                    }
+                    self.phase = PHASE_WRITE;
+                }
+                PHASE_WRITE => {
+                    let off = self.written as usize;
+                    let want = self.frame_len as usize - off;
+                    let opcode = if self.async_tier(syscalls, fd) {
+                        FS_WRITE_ASYNC
+                    } else {
+                        FS_WRITE
+                    };
+                    let rc = (syscalls.provider_call)(
+                        fd,
+                        opcode,
+                        self.frame.as_mut_ptr().add(off),
+                        want,
+                    );
+                    if rc == E_AGAIN {
+                        return AppendState::Pending;
+                    }
+                    if rc < 0 {
+                        return self.fail(WalAppendError::WriteFailed(rc));
+                    }
+                    if rc == 0 {
+                        // No progress and no error: the provider is
+                        // refusing without saying why. Treat as a
+                        // short write rather than spinning.
+                        return self.fail(WalAppendError::ShortWrite {
+                            wrote: 0,
+                            wanted: want,
+                        });
+                    }
+                    self.written = self.written.wrapping_add(rc as u32);
+                    if (self.written as usize) < self.frame_len as usize {
+                        // Partial frame: the rest lands on a later
+                        // step, from the position the write left.
+                        return AppendState::Pending;
+                    }
+                    self.phase = if self.async_tier(syscalls, fd) {
+                        PHASE_SUBMIT
+                    } else {
+                        PHASE_FSYNC
+                    };
+                }
+                PHASE_SUBMIT => {
+                    let rc = (syscalls.provider_call)(
+                        fd,
+                        FS_FSYNC_SUBMIT,
+                        self.ticket.as_mut_ptr(),
+                        self.ticket.len(),
+                    );
+                    if rc == E_AGAIN {
+                        return AppendState::Pending;
+                    }
+                    if rc < 0 {
+                        return self.fail(WalAppendError::FsyncFailed(rc));
+                    }
+                    self.phase = PHASE_POLL;
+                }
+                PHASE_POLL => {
+                    let rc = (syscalls.provider_call)(
+                        fd,
+                        FS_FSYNC_POLL,
+                        self.ticket.as_mut_ptr(),
+                        self.ticket.len(),
+                    );
+                    if rc < 0 {
+                        return self.fail(WalAppendError::FsyncFailed(rc));
+                    }
+                    if rc != 0 {
+                        return AppendState::Pending;
+                    }
+                    return self.finish();
+                }
+                _ => {
+                    let rc = (syscalls.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
+                    if rc == E_AGAIN {
+                        return AppendState::Pending;
+                    }
+                    if rc < 0 {
+                        return self.fail(WalAppendError::FsyncFailed(rc));
+                    }
+                    return self.finish();
+                }
+            }
+        }
+    }
+
+    /// Query the provider's capability bitmap once per WAL. A provider
+    /// that does not answer keeps the synchronous tier.
+    unsafe fn async_tier(&mut self, syscalls: &SyscallTable, fd: i32) -> bool {
+        if self.caps_known == 0 {
+            let mut out = [0u8; 4];
+            let rc = (syscalls.provider_call)(fd, FS_CAPS, out.as_mut_ptr(), out.len());
+            // Only a real answer is recorded. A provider still attaching its
+            // volume refuses the query, and latching that refusal would hold
+            // this appender on the blocking fence tier for good — on a
+            // provider that implements the pipelined one.
+            if rc >= 4 {
+                self.caps = u32::from_le_bytes(out);
+                self.caps_known = 1;
+            }
+        }
+        self.caps & CAP_FSYNC_ASYNC != 0
+    }
+
+    /// The payload of the most recently staged frame. Valid from
+    /// `begin` until the next `begin`, so a caller that stages a
+    /// record and resolves it on a later step needs no copy of its
+    /// own.
+    pub fn payload(&self) -> &[u8] {
+        let end = (self.frame_len as usize).min(self.frame.len());
+        if end < 8 {
+            return &[];
+        }
+        &self.frame[8..end]
+    }
+
+    fn finish(&mut self) -> AppendState {
+        self.phase = PHASE_IDLE;
+        self.written = 0;
+        AppendState::Durable
+    }
+
+    fn fail(&mut self, err: WalAppendError) -> AppendState {
+        // Frame bytes reached the file: the tail is either a partial
+        // record, or a whole record whose fence failed. Neither can
+        // carry a further append — a later frame written past a
+        // partial one is unreachable on replay, and a later fsync
+        // would silently publish the record this one refused.
+        if self.written > 0 || self.phase > PHASE_WRITE {
+            self.broken = 1;
+        }
+        self.phase = PHASE_IDLE;
+        self.written = 0;
+        AppendState::Failed(err)
+    }
+}
+
+impl Default for WalAppender {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Replay the WAL: seek to 0, then for each record call `cb` with
@@ -307,20 +597,87 @@ pub unsafe fn wal_close(syscalls: &SyscallTable, fd: i32) -> i32 {
     (syscalls.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0)
 }
 
-/// Rotate a WAL: close the fd, unlink the file, recreate it empty.
-/// For WALs whose records are DELIVERY buffers (safe to discard once
-/// every logged entry has been acknowledged durable downstream), this
+/// Outcome of a rotation attempt.
+pub enum RotateOutcome {
+    /// The log was replaced by a fresh empty one. The old fd is
+    /// closed; this is the fd to use from here.
+    Rotated(i32),
+    /// The provider cannot replace a name atomically, so the log was
+    /// left alone and the caller's existing fd is still valid.
+    /// Rotation only bounds replay work — a longer log is a cost,
+    /// losing one is not — so declining is the safe direction.
+    Skipped,
+}
+
+/// Rotate a WAL by atomic replacement: stage an empty log beside it,
+/// fence it, then rename it over the live path.
+///
+/// For WALs whose records are DELIVERY buffers — safe to discard once
+/// every logged entry has been acknowledged durable downstream — this
 /// bounds replay work at the last unacknowledged tail instead of the
-/// full history. Returns the fresh fd or a negative errno.
-pub unsafe fn wal_rotate(syscalls: &SyscallTable, fd: i32, path: &[u8]) -> Result<i32, i32> {
-    let _ = wal_close(syscalls, fd);
-    let rc = (syscalls.provider_call)(-1, FS_UNLINK, path.as_ptr() as *mut u8, path.len());
-    if rc < 0 {
-        // Unlink failing is not fatal — recreate truncates logically
-        // on replay only if the create below also fails.
-        let _ = rc;
+/// full history.
+///
+/// The replacement has to be atomic. Unlinking and recreating leaves a
+/// window with no log at all, and a crash inside it loses every record
+/// the caller still expected to replay; the FS contract has no
+/// truncate, so there is no in-place way to empty a file either.
+/// `RENAME` publishes the new name and its parents durably, which
+/// makes the crash-visible outcomes exactly two: the old log, or the
+/// new empty one.
+///
+/// `Err` means the log was replaced but could not be reopened — the
+/// caller holds no usable WAL and must fail closed.
+pub unsafe fn wal_rotate(
+    syscalls: &SyscallTable,
+    fd: i32,
+    path: &[u8],
+) -> Result<RotateOutcome, i32> {
+    // Per-call, and nothing is recorded: an unanswered query skips this
+    // rotation and the next one asks again.
+    if super::fs_names::caps(syscalls.provider_call).unwrap_or(0) & super::fs_names::CAP_RENAME == 0
+    {
+        return Ok(RotateOutcome::Skipped);
     }
-    wal_open_or_create(syscalls, path).map_err(|_| -1)
+    let mut staging = [0u8; ROTATE_PATH_BUF];
+    const SUFFIX: &[u8] = b".rot";
+    if path.len() + SUFFIX.len() > staging.len() {
+        return Ok(RotateOutcome::Skipped);
+    }
+    staging[..path.len()].copy_from_slice(path);
+    staging[path.len()..path.len() + SUFFIX.len()].copy_from_slice(SUFFIX);
+    let slen = path.len() + SUFFIX.len();
+    let stage = &staging[..slen];
+
+    // A crashed attempt can leave staging behind, and `OPEN_CREATE`
+    // does not truncate — a surviving file would be renamed into place
+    // still carrying its records.
+    let _ = super::fs_names::unlink(syscalls.provider_call, stage);
+    let sfd = (syscalls.provider_call)(-1, FS_OPEN_CREATE, stage.as_ptr() as *mut u8, slen);
+    if sfd < 0 {
+        return Ok(RotateOutcome::Skipped);
+    }
+    let fenced = (syscalls.provider_call)(sfd, FS_FSYNC, core::ptr::null_mut(), 0) >= 0;
+    let _ = wal_close(syscalls, sfd);
+    if !fenced || !super::fs_names::rename(syscalls.provider_call, stage, path) {
+        let _ = super::fs_names::unlink(syscalls.provider_call, stage);
+        return Ok(RotateOutcome::Skipped);
+    }
+    // The old log is unreachable from here; only now is the caller's
+    // fd spent.
+    let _ = wal_close(syscalls, fd);
+    match wal_open_or_create(syscalls, path) {
+        Ok(new_fd) => Ok(RotateOutcome::Rotated(new_fd)),
+        Err(_) => Err(-1),
+    }
+}
+
+/// Room for a WAL path plus the rotation suffix.
+const ROTATE_PATH_BUF: usize = 288;
+
+/// True when `path` still resolves. Distinguishes "already gone" from
+/// "could not remove" without depending on a provider's errno mapping.
+unsafe fn name_present(syscalls: &SyscallTable, path: &[u8]) -> bool {
+    super::fs_names::name_present(syscalls.provider_call, path)
 }
 
 // ── CRC32 (IEEE 802.3 polynomial, table-based, no_std) ────────────

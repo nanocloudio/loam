@@ -46,6 +46,13 @@ pub const OP_UNBIND: u8 = 3;
 pub const OP_LOOKUP: u8 = 4;
 pub const OP_LIST: u8 = 5;
 pub const OP_REFERENCED: u8 = 6;
+pub const OP_GC_RESERVE: u8 = 7;
+pub const OP_GC_RELEASE: u8 = 8;
+
+/// Refusal bytes a public PIC answers with. Named here so the response
+/// splitter can recognise them as complete one-byte records.
+pub const NAK_GENERIC: u8 = 0xFF;
+pub const NAK_RESERVED_BYTE: u8 = 0xFD;
 
 /// Max paths per OP_LIST response page.
 pub const MAX_LIST_PAGE: usize = 16;
@@ -584,6 +591,90 @@ pub fn decode_list_resp(
 // unreferenced; flag=0 + next_cursor≠0 → undecided, continue the
 // snapshot scan from next_cursor.
 
+// ── GC reservation (control op: fence a descriptor's deletion) ────
+//
+//   GcReserveReq   [op=7][oid_len:u16][oid]
+//   GcReserveResp  [op=7][flag:u8]     1 = reserved, 0 = refused
+//   GcReleaseReq   [op=8][oid_len:u16][oid]
+//   GcReleaseResp  [op=8]
+//
+// A lifecycle sweep proves an object id unbound and then deletes what
+// backs it. Between those two points an ordinary BIND can commit, and
+// the sweep would then delete something reachable. A reservation
+// closes that window: while an id is reserved the namespace refuses to
+// admit a BIND naming it, so absence stays proven up to the deletion.
+// The refusal is transient and distinct, so a client retries rather
+// than failing.
+//
+// Reservations are arena-only and never logged: a crash clears every
+// one of them, which is the correct restart state — an unfinished
+// sweep leaves either the descriptor (collected on a later pass) or a
+// refused bind the client re-issues.
+
+pub fn encode_gc_reserve_req(
+    dst: &mut [u8],
+    release: bool,
+    object_id: &[u8],
+) -> Result<usize, WireError> {
+    if object_id.len() > MAX_STRING {
+        return Err(WireError::StringTooLong {
+            len: object_id.len(),
+            max: MAX_STRING,
+        });
+    }
+    let needed = 3 + object_id.len();
+    if dst.len() < needed {
+        return Err(WireError::BufferTooSmall {
+            needed,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = if release {
+        OP_GC_RELEASE
+    } else {
+        OP_GC_RESERVE
+    };
+    dst[1..3].copy_from_slice(&(object_id.len() as u16).to_le_bytes());
+    dst[3..needed].copy_from_slice(object_id);
+    Ok(needed)
+}
+
+pub fn decode_gc_reserve_req(src: &[u8]) -> Result<&[u8], WireError> {
+    if src.len() < 3 {
+        return Err(WireError::Truncated);
+    }
+    if src[0] != OP_GC_RESERVE && src[0] != OP_GC_RELEASE {
+        return Err(WireError::BadOpcode { observed: src[0] });
+    }
+    let len = u16::from_le_bytes([src[1], src[2]]) as usize;
+    if src.len() < 3 + len {
+        return Err(WireError::Truncated);
+    }
+    Ok(&src[3..3 + len])
+}
+
+pub fn encode_gc_reserve_resp(dst: &mut [u8], reserved: bool) -> Result<usize, WireError> {
+    if dst.len() < 2 {
+        return Err(WireError::BufferTooSmall {
+            needed: 2,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = OP_GC_RESERVE;
+    dst[1] = u8::from(reserved);
+    Ok(2)
+}
+
+pub fn decode_gc_reserve_resp(src: &[u8]) -> Result<bool, WireError> {
+    if src.len() < 2 {
+        return Err(WireError::Truncated);
+    }
+    if src[0] != OP_GC_RESERVE {
+        return Err(WireError::BadOpcode { observed: src[0] });
+    }
+    Ok(src[1] != 0)
+}
+
 pub fn encode_referenced_req(
     dst: &mut [u8],
     cursor: u32,
@@ -681,6 +772,70 @@ pub fn peek_opcode(src: &[u8]) -> Option<u8> {
 /// `None` means "wait for more bytes". An unrecognised opcode is `Err`,
 /// so a caller can resync rather than stall forever on a stream it
 /// cannot parse.
+/// Length of the response record at the head of `src`, `None` when
+/// more bytes are needed to tell.
+///
+/// A response channel is a byte stream like any other: a producer that
+/// answers several records before its consumer drains has its answers
+/// coalesce into one read, and a consumer that treats one read as one
+/// response silently drops every answer after the first — then
+/// mis-attributes the rest, because its pending queue has shifted by
+/// one. Every response shape here is self-delimiting from its opcode
+/// byte, which is what makes splitting possible without tracking what
+/// was asked.
+pub fn response_record_len(src: &[u8]) -> Result<Option<usize>, WireError> {
+    let opcode = match src.first() {
+        Some(b) => *b,
+        None => return Ok(None),
+    };
+    // `None` means "not yet", never "shorter than it is": callers take
+    // the returned length as a whole record without re-checking, the
+    // same contract `request_record_len` holds.
+    let complete = |needed: usize| {
+        if src.len() < needed {
+            Ok(None)
+        } else {
+            Ok(Some(needed))
+        }
+    };
+    match opcode {
+        // Bare acks: the applied opcode echoed back, or a refusal.
+        OP_BIND | OP_RENAME | OP_UNBIND | OP_GC_RELEASE | NAK_GENERIC | NAK_RESERVED_BYTE => {
+            complete(1)
+        }
+        // [op][flag]
+        OP_GC_RESERVE => complete(2),
+        // [op][status], and when FOUND: [oid_len][oid][rev:u64][kind]
+        OP_LOOKUP => match src.get(1) {
+            None => Ok(None),
+            Some(&LOOKUP_NOT_FOUND) => complete(2),
+            Some(_) => match src.get(2) {
+                None => Ok(None),
+                Some(&oid_len) => complete(3 + oid_len as usize + 9),
+            },
+        },
+        // [op][referenced][cursor:u32]
+        OP_REFERENCED => complete(6),
+        // [op][next_cursor:u32][count][ (len:u16)(path) × count ]
+        OP_LIST => {
+            let count = match src.get(5) {
+                Some(c) => *c as usize,
+                None => return Ok(None),
+            };
+            let mut at = 6usize;
+            for _ in 0..count {
+                if src.len() < at + 2 {
+                    return Ok(None);
+                }
+                let plen = u16::from_le_bytes([src[at], src[at + 1]]) as usize;
+                at += 2 + plen;
+            }
+            complete(at)
+        }
+        observed => Err(WireError::BadOpcode { observed }),
+    }
+}
+
 pub fn request_record_len(src: &[u8]) -> Result<Option<usize>, WireError> {
     let opcode = match src.first() {
         Some(b) => *b,
@@ -709,6 +864,8 @@ pub fn request_record_len(src: &[u8]) -> Result<Option<usize>, WireError> {
         OP_LIST => (8, [1, 0, 0]),
         // [op][cursor:u32][oid_len:u16]
         OP_REFERENCED => (7, [5, 0, 0]),
+        // [op][oid_len:u16]
+        OP_GC_RESERVE | OP_GC_RELEASE => (3, [1, 0, 0]),
         observed => return Err(WireError::BadOpcode { observed }),
     };
     if src.len() < header {

@@ -24,6 +24,7 @@
 #   e.g. tools/e2e/metadata_soak.sh 600 2 8     # 10 min, ~4000/s offered
 set -uo pipefail
 cd "$(dirname "$0")/../.."
+. tools/e2e/graph_run.sh
 
 DURATION="${1:-300}"
 INJECT_PERIOD="${2:-2}"
@@ -39,9 +40,11 @@ mkdir -p target
 rm -rf wal "$PROPOSER_WAL" "$LOG"
 
 # `total: 0` runs until stopped, which is what a soak wants.
+PORT=$(free_port)
 sed -e "s|inject_period: .*|inject_period: $INJECT_PERIOD|" \
     -e "s|batch_per_step: .*|batch_per_step: $BATCH|" \
     -e "s|wal_path: .*|wal_path: \"$PROPOSER_WAL\"|" \
+    -e "s|listen_port: .*|listen_port: $PORT|" \
     "$GRAPH" > "$RENDERED"
 
 echo "[soak] ${DURATION}s at batch $BATCH every $INJECT_PERIOD ticks"
@@ -62,13 +65,7 @@ runner=$!
 # compiled config, not the YAML. Killing only the wrapper leaves that
 # child running: it keeps stepping a graph, competing for the machine
 # with whatever runs next, and the symptom lands on the innocent test.
-reap() {
-  kill "$runner" 2>/dev/null || true
-  wait "$runner" 2>/dev/null || true
-  pkill -f "loam_metadata_soak" 2>/dev/null || true
-  sleep 1
-  pkill -9 -f "loam_metadata_soak" 2>/dev/null || true
-}
+reap() { reap_graph "loam_metadata_soak" "$runner"; }
 trap reap EXIT
 
 fail=0
@@ -125,6 +122,12 @@ fi
 
 # Faults end a run rather than degrade it, so they are checked whatever
 # the counters say.
+reason=$(graph_fault_reason "$LOG")
+if [ -n "$reason" ]; then
+  echo "[soak] FAILED: $reason — see $LOG" >&2
+  exit 1
+fi
+
 if grep -qiE 'panic|module fault|step deadline|FATAL' "$LOG" 2>/dev/null; then
   echo "[soak] FAILED: fault reported during the run" >&2
   grep -iE 'panic|module fault|step deadline|FATAL' "$LOG" | head -5 >&2

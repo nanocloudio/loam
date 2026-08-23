@@ -29,6 +29,10 @@ const READ_BUF: usize = super::body_wire::MAX_BODY + 128;
 const PENDING_CAP: usize = 64;
 const PUTFILE_CAP: usize = 16;
 const SCRATCH: usize = super::body_wire::MAX_BODY + 128;
+/// Reassembly capacity for `ns_responses`. Sized to hold a full step's
+/// budget of the largest response plus one more read, so refilling
+/// never starves the step.
+const NS_ASM: usize = 4096 * (MAX_OPS_PER_STEP as usize + 1);
 const NS_PATH_BUF: usize = 256;
 const NS_ROOT_BUF: usize = 128;
 
@@ -115,6 +119,24 @@ pub struct ModuleState {
     /// obj_resp (1-byte acks from object_index; -1 if unwired).
     pub obj_resp_chan: i32,
     pub scratch: [u8; SCRATCH],
+    /// The admin response owed on `admin_out`, held in `scratch`.
+    /// `resp_len` is its length and `resp_sent` how much the channel
+    /// has taken; both zero means nothing is owed.
+    ///
+    /// Every response is staged here rather than in a second buffer:
+    /// an admin response carries body bytes and runs to `SCRATCH`, so
+    /// a copy would double the largest allocation in the router. The
+    /// discipline matches the arena PICs — an answer the channel
+    /// refuses is retained, and no new request or downstream response
+    /// is taken while one is owed, because both would overwrite it.
+    pub resp_len: u32,
+    pub resp_sent: u32,
+    /// Reassembly for the `ns_responses` byte stream. A downstream PIC
+    /// that answers several records before this router drains has its
+    /// answers coalesce into one read, and a read can end mid-record;
+    /// both are the stream behaving normally.
+    pub ns_asm: [u8; NS_ASM],
+    pub ns_asm_len: usize,
     // Per-downstream pending FIFOs (head, tail, ring storage).
     pub ns_head: u32,
     pub ns_tail: u32,
@@ -130,16 +152,32 @@ pub struct ModuleState {
     /// commit, then the commit chains into the standard object +
     /// bind stages via a PendingPutFile slot.
     pub spf: [StreamedPutFile; SPF_CAP],
-    /// Orphan-body GC (active when `gc_interval` != 0): each
-    /// interval, SCAN one page of body_store's digest inventory;
-    /// for each digest ask the namespace whether `sha256:<hex>` is
-    /// bound anywhere (OP_REFERENCED); unreferenced blobs are
-    /// DELETEd. Never runs while a PutFile is in flight — the
-    /// window between a body landing and its bind committing must
-    /// not be collectable. Raw PutBody users must bind before the
-    /// next GC pass or their blob is fair game.
+    /// Lifecycle GC (active when `gc_interval` != 0). Alternating
+    /// sweeps over the two things a composed PUT_FILE leaves behind:
+    /// body blobs and object descriptors. Each interval takes one
+    /// bounded inventory page — body_store's digests, or
+    /// object_index's content-derived descriptor ids — and for each
+    /// entry reserves the id at the namespace, asks whether it is
+    /// bound anywhere (OP_REFERENCED), and deletes what backs it only
+    /// while the reservation still stands. Never runs while a PutFile
+    /// is in flight: the window between a body landing and its bind
+    /// committing must not be collectable. Raw PutBody users must bind
+    /// before the next GC pass or their blob is fair game.
     pub gc_interval: u32,
     pub gc_cursor: u32,
+    /// Which inventory the current pass is walking: `GC_PHASE_BODY` or
+    /// `GC_PHASE_OBJECT`.
+    pub gc_phase: u8,
+    /// Descriptor-inventory paging cursor, separate from the body one.
+    pub gc_obj_cursor: u32,
+    /// The current entry holds a namespace deletion reservation.
+    pub gc_reserved: u8,
+    /// The current page wrapped its inventory, so the phase alternates
+    /// once the page's entries are done. Flipping at scan time instead
+    /// would change what the page's own entries are allowed to delete.
+    pub gc_wrapped: u8,
+    /// Descriptors deleted by the sweep.
+    pub gc_obj_deleted: u32,
     pub gc_inflight: u8,
     pub gc_digests: [[u8; 32]; super::body_wire::MAX_SCAN_DIGESTS],
     pub gc_q_len: u8,
@@ -153,6 +191,12 @@ pub struct ModuleState {
     pub gc_kept: u32,
     pub ticks: u32,
     pub forwarded: u32,
+    /// Answers the channel has ACCEPTED, counted where they land
+    /// rather than where they are built. A response staged and then
+    /// refused is not an answer the requester received, and counting
+    /// it as one is what would make the conservation claim — every
+    /// request answered exactly once — true by arithmetic instead of
+    /// by behaviour.
     pub replied: u32,
     pub apply_errors: u32,
 }
@@ -162,6 +206,14 @@ pub struct ModuleState {
 const GC_OP_SCAN: u8 = 0xF0;
 const GC_OP_CHECK: u8 = 0xF1;
 const GC_OP_DELETE: u8 = 0xF2;
+const GC_OP_OBJ_SCAN: u8 = 0xF3;
+const GC_OP_RESERVE: u8 = 0xF4;
+const GC_OP_OBJ_REMOVE: u8 = 0xF5;
+const GC_OP_RELEASE: u8 = 0xF6;
+
+/// Which inventory a GC pass is walking.
+pub const GC_PHASE_BODY: u8 = 0;
+pub const GC_PHASE_OBJECT: u8 = 1;
 
 /// Host/test helper + server config: enable the orphan GC.
 pub unsafe fn set_gc_interval(state_ptr: *mut u8, interval: u32) {
@@ -355,6 +407,55 @@ unsafe fn free_putfile_slot(s: &mut ModuleState, idx: u16) {
     }
 }
 
+/// Take ownership of the response now in `scratch` and offer it.
+unsafe fn reply_staged(s: &mut ModuleState, syscalls: &super::SyscallTable, n: usize) {
+    if n == 0 || n > s.scratch.len() {
+        s.apply_errors = s.apply_errors.wrapping_add(1);
+        return;
+    }
+    s.resp_len = n as u32;
+    s.resp_sent = 0;
+    let _ = flush_reply(s, syscalls);
+}
+
+/// Stage a response built outside `scratch`, then offer it.
+unsafe fn reply_bytes(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) {
+    if bytes.is_empty() || bytes.len() > s.scratch.len() {
+        s.apply_errors = s.apply_errors.wrapping_add(1);
+        return;
+    }
+    s.scratch[..bytes.len()].copy_from_slice(bytes);
+    reply_staged(s, syscalls, bytes.len());
+}
+
+/// Offer the owed response. True once every byte has been accepted,
+/// and when nothing is owed, so a caller can gate on it directly.
+unsafe fn flush_reply(s: &mut ModuleState, syscalls: &super::SyscallTable) -> bool {
+    if s.resp_len == 0 {
+        return true;
+    }
+    if s.admin_out_chan < 0 {
+        return false;
+    }
+    let at = s.resp_sent as usize;
+    let rc = (syscalls.channel_write)(
+        s.admin_out_chan,
+        s.scratch.as_ptr().add(at),
+        s.resp_len as usize - at,
+    );
+    if rc <= 0 {
+        return false;
+    }
+    s.resp_sent = (s.resp_sent + rc as u32).min(s.resp_len);
+    if s.resp_sent < s.resp_len {
+        return false;
+    }
+    s.resp_len = 0;
+    s.resp_sent = 0;
+    s.replied = s.replied.wrapping_add(1);
+    true
+}
+
 pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     if state_ptr.is_null() {
         return -1;
@@ -366,6 +467,13 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         Some(t) => t,
         None => return -1,
     };
+
+    // An owed answer owns the step until the channel takes it. It
+    // lives in `scratch`, which the next request or downstream
+    // response would overwrite.
+    if !flush_reply(s, syscalls) {
+        return 0;
+    }
 
     // ── 0. Orphan GC: kick one inventory SCAN when due, idle,
     //      and no composed write is mid-flight. ──
@@ -382,6 +490,11 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     // ── 1. Drain inbound admin requests, forward downstream. ──
     let mut handled: u32 = 0;
     while handled < MAX_OPS_PER_STEP {
+        // An answer still owed means `admin_out` is not draining, and
+        // `scratch` holds it — the next request would overwrite it.
+        if s.resp_len != 0 {
+            break;
+        }
         let mut buf = [0u8; READ_BUF];
         let n = (syscalls.channel_read)(s.admin_in_chan, buf.as_mut_ptr(), READ_BUF);
         if n <= 0 {
@@ -424,14 +537,49 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     //      stage gets a multi-byte LookupResp, DeleteFile's unbind
     //      gets a 1-byte ack. Head-of-FIFO tells us which.
     if s.ns_resp_chan >= 0 {
-        let mut drained: u32 = 0;
-        while drained < MAX_OPS_PER_STEP {
-            let mut ack_buf = [0u8; 4096];
-            let n = (syscalls.channel_read)(s.ns_resp_chan, ack_buf.as_mut_ptr(), ack_buf.len());
+        // Refill first, then take whole records off the front. One read
+        // is not one response.
+        loop {
+            let space = NS_ASM.saturating_sub(s.ns_asm_len);
+            if space < 4096 {
+                break;
+            }
+            let n = (syscalls.channel_read)(
+                s.ns_resp_chan,
+                s.ns_asm.as_mut_ptr().add(s.ns_asm_len),
+                4096,
+            );
             if n <= 0 {
                 break;
             }
-            let ns_resp = &ack_buf[..n as usize];
+            s.ns_asm_len = (s.ns_asm_len + (n as usize).min(space)).min(NS_ASM);
+        }
+        let mut drained: u32 = 0;
+        let mut ns_off: usize = 0;
+        while drained < MAX_OPS_PER_STEP {
+            // Same buffer, same rule: a downstream response would
+            // overwrite the answer still owed upstream.
+            if s.resp_len != 0 {
+                break;
+            }
+            let rec_len = match super::ns_wire::response_record_len(&s.ns_asm[ns_off..s.ns_asm_len])
+            {
+                Ok(Some(len)) => len,
+                // Nothing, or an incomplete tail: keep it and wait.
+                Ok(_) => break,
+                Err(_) => {
+                    // An undecodable response byte desyncs the stream;
+                    // there is no framing to resynchronise against, so
+                    // drop what is buffered rather than mis-attribute
+                    // every answer after it.
+                    s.apply_errors = s.apply_errors.wrapping_add(1);
+                    s.ns_asm_len = 0;
+                    ns_off = 0;
+                    break;
+                }
+            };
+            let ns_resp = &*(&s.ns_asm[ns_off..ns_off + rec_len] as *const [u8]);
+            ns_off += rec_len;
             let entry = match dequeue_pending(s, Stream::Namespace) {
                 Some(e) => e,
                 None => {
@@ -453,6 +601,12 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                 GC_OP_CHECK => {
                     gc_apply_check(s, syscalls, ns_resp);
                 }
+                GC_OP_RESERVE => {
+                    gc_apply_reserve(s, syscalls, ns_resp);
+                }
+                GC_OP_RELEASE => {
+                    gc_next(s, syscalls);
+                }
                 super::admin::OP_DELETE_FILE => {
                     let status = if ns_resp[0] == super::ns_wire::OP_UNBIND {
                         super::admin::STATUS_OK
@@ -464,9 +618,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                         entry.correlation_id,
                         status,
                     ) {
-                        let _ =
-                            (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), resp_n);
-                        s.replied = s.replied.wrapping_add(1);
+                        reply_staged(s, syscalls, resp_n);
                     }
                 }
                 super::admin::OP_PUT_FILE => {
@@ -497,11 +649,21 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                             continue;
                         }
                     };
-                    let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), resp_n);
-                    s.replied = s.replied.wrapping_add(1);
+                    reply_staged(s, syscalls, resp_n);
                 }
             }
             drained = drained.wrapping_add(1);
+        }
+        // Keep whatever the step budget did not reach. Records left
+        // here are pending work, not discarded work.
+        if ns_off > 0 {
+            let remaining = s.ns_asm_len - ns_off;
+            let mut i = 0usize;
+            while i < remaining {
+                s.ns_asm[i] = s.ns_asm[ns_off + i];
+                i += 1;
+            }
+            s.ns_asm_len = remaining;
         }
     }
 
@@ -509,6 +671,11 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     if s.body_resp_chan >= 0 {
         let mut drained: u32 = 0;
         while drained < MAX_OPS_PER_STEP {
+            // Same buffer, same rule: a downstream response would
+            // overwrite the answer still owed upstream.
+            if s.resp_len != 0 {
+                break;
+            }
             let mut resp_buf = [0u8; READ_BUF];
             let n =
                 (syscalls.channel_read)(s.body_resp_chan, resp_buf.as_mut_ptr(), resp_buf.len());
@@ -542,8 +709,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                         entry.correlation_id,
                         status,
                     ) {
-                        let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), n);
-                        s.replied = s.replied.wrapping_add(1);
+                        reply_staged(s, syscalls, n);
                     }
                     if status != super::admin::STATUS_OK {
                         free_spf(s, entry.putfile_idx);
@@ -572,8 +738,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                         status,
                         size,
                     ) {
-                        let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), n);
-                        s.replied = s.replied.wrapping_add(1);
+                        reply_staged(s, syscalls, n);
                     }
                 }
                 super::admin::OP_READ_FILE_RANGE => {
@@ -591,11 +756,19 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     if s.obj_resp_chan >= 0 {
         let mut drained: u32 = 0;
         while drained < MAX_OPS_PER_STEP {
-            let mut ack_buf = [0u8; 8];
+            // Same buffer, same rule: a downstream response would
+            // overwrite the answer still owed upstream.
+            if s.resp_len != 0 {
+                break;
+            }
+            // Sized for a descriptor inventory page, not just the
+            // 1-byte apply ack.
+            let mut ack_buf = [0u8; 8 + super::obj_wire::MAX_OBJ_SCAN * 32];
             let n = (syscalls.channel_read)(s.obj_resp_chan, ack_buf.as_mut_ptr(), ack_buf.len());
             if n <= 0 {
                 break;
             }
+            let obj_resp = &ack_buf[..n as usize];
             let ack_byte = ack_buf[0];
             let entry = match dequeue_pending(s, Stream::Object) {
                 Some(e) => e,
@@ -605,7 +778,11 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                     continue;
                 }
             };
-            handle_putfile_object_response(s, syscalls, entry, ack_byte);
+            match entry.admin_op {
+                GC_OP_OBJ_SCAN => gc_apply_obj_scan(s, syscalls, obj_resp),
+                GC_OP_OBJ_REMOVE => gc_apply_obj_remove(s, syscalls, ack_byte),
+                _ => handle_putfile_object_response(s, syscalls, entry, ack_byte),
+            }
             drained = drained.wrapping_add(1);
         }
     }
@@ -801,8 +978,7 @@ unsafe fn emit_admin_status_nak(
         super::admin::encode_admin_put_body_keyed_ack(&mut s.scratch, cid, super::admin::STATUS_NAK)
     };
     if let Ok(n) = n {
-        let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), n);
-        s.replied = s.replied.wrapping_add(1);
+        reply_staged(s, syscalls, n);
     }
 }
 
@@ -887,8 +1063,7 @@ unsafe fn emit_body_admin_response(
                     }
                 }
             };
-            let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), resp_n);
-            s.replied = s.replied.wrapping_add(1);
+            reply_staged(s, syscalls, resp_n);
         }
         super::admin::OP_PUT_BODY_KEYED => {
             let status = if op == super::body_wire::OP_PUT_KEYED {
@@ -907,8 +1082,7 @@ unsafe fn emit_body_admin_response(
                     return;
                 }
             };
-            let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), resp_n);
-            s.replied = s.replied.wrapping_add(1);
+            reply_staged(s, syscalls, resp_n);
         }
         super::admin::OP_DELETE_BODY => {
             let (status, existed) = if op == super::body_wire::OP_DELETE {
@@ -931,8 +1105,7 @@ unsafe fn emit_body_admin_response(
                     return;
                 }
             };
-            let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), resp_n);
-            s.replied = s.replied.wrapping_add(1);
+            reply_staged(s, syscalls, resp_n);
         }
         super::admin::OP_GET_BODY => {
             let resp_n = if op == super::body_wire::OP_GET {
@@ -984,8 +1157,7 @@ unsafe fn emit_body_admin_response(
                     }
                 }
             };
-            let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), resp_n);
-            s.replied = s.replied.wrapping_add(1);
+            reply_staged(s, syscalls, resp_n);
         }
         super::admin::OP_GET_FILE => {
             // GetFile's body stage: the resolved digest's bytes.
@@ -1043,8 +1215,7 @@ unsafe fn emit_body_admin_response(
                     }
                 }
             };
-            let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), resp_n);
-            s.replied = s.replied.wrapping_add(1);
+            reply_staged(s, syscalls, resp_n);
         }
         _ => {
             s.apply_errors = s.apply_errors.wrapping_add(1);
@@ -1063,8 +1234,7 @@ unsafe fn emit_get_file_status(
     if let Ok(n) =
         super::admin::encode_admin_get_file_ack(&mut s.scratch, correlation_id, status, None)
     {
-        let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), n);
-        s.replied = s.replied.wrapping_add(1);
+        reply_staged(s, syscalls, n);
     }
 }
 
@@ -1221,7 +1391,7 @@ unsafe fn handle_admin_delete_file(
                 req.correlation_id,
                 super::admin::STATUS_NAK,
             ) {
-                let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), rn);
+                reply_staged(s, syscalls, rn);
             }
             return;
         }
@@ -1238,7 +1408,7 @@ unsafe fn handle_admin_delete_file(
             req.correlation_id,
             super::admin::STATUS_NAK,
         ) {
-            let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), rn);
+            reply_staged(s, syscalls, rn);
         }
         s.apply_errors = s.apply_errors.wrapping_add(1);
         return;
@@ -1251,7 +1421,7 @@ unsafe fn handle_admin_delete_file(
             req.correlation_id,
             super::admin::STATUS_NAK,
         ) {
-            let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), rn);
+            reply_staged(s, syscalls, rn);
         }
         s.apply_errors = s.apply_errors.wrapping_add(1);
         return;
@@ -1318,7 +1488,7 @@ unsafe fn emit_list_files_nak(
         0,
         &[],
     ) {
-        let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), n);
+        reply_staged(s, syscalls, n);
     }
 }
 
@@ -1367,8 +1537,7 @@ unsafe fn handle_listfiles_response(
             }
         }
     };
-    let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), resp_n);
-    s.replied = s.replied.wrapping_add(1);
+    reply_staged(s, syscalls, resp_n);
 }
 
 // ── Orphan-body GC ────────────────────────────────────────────────
@@ -1411,8 +1580,30 @@ unsafe fn gc_unenqueue_tail(s: &mut ModuleState, stream: Stream) {
     *tail = prev;
 }
 
-/// Ask body_store for one inventory page.
+/// Ask the current phase's inventory for one page.
 unsafe fn gc_kick(s: &mut ModuleState, syscalls: &super::SyscallTable) {
+    if s.gc_phase == GC_PHASE_OBJECT {
+        let req_n = match super::obj_wire::encode_scan_req(
+            &mut s.scratch,
+            s.gc_obj_cursor,
+            super::obj_wire::MAX_OBJ_SCAN as u8,
+        ) {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        if gc_forward(
+            s,
+            syscalls,
+            Stream::Object,
+            s.obj_req_chan,
+            GC_OP_OBJ_SCAN,
+            req_n,
+        ) {
+            s.gc_inflight = 1;
+            s.gc_scans = s.gc_scans.wrapping_add(1);
+        }
+        return;
+    }
     let req_n = match super::body_wire::encode_scan_req(
         &mut s.scratch,
         s.gc_cursor,
@@ -1431,6 +1622,193 @@ unsafe fn gc_kick(s: &mut ModuleState, syscalls: &super::SyscallTable) {
     ) {
         s.gc_inflight = 1;
         s.gc_scans = s.gc_scans.wrapping_add(1);
+    }
+}
+
+/// Alternate to the other inventory once this one has wrapped, so
+/// neither sweep can starve the other. The descriptor sweep needs an
+/// object_index to ask.
+unsafe fn gc_advance_phase(s: &mut ModuleState) {
+    s.gc_phase = if s.gc_phase == GC_PHASE_BODY && s.obj_req_chan >= 0 {
+        GC_PHASE_OBJECT
+    } else {
+        GC_PHASE_BODY
+    };
+}
+
+/// Build the content-derived object id `sha256:<hex>` for a digest.
+fn gc_object_id(digest: &[u8; 32]) -> [u8; 7 + 64] {
+    let mut oid = [0u8; 7 + 64];
+    oid[..7].copy_from_slice(b"sha256:");
+    super::body_wire::hex_lower_into(digest, &mut oid[7..]);
+    oid
+}
+
+/// One page of descriptor ids came back. Same queue as the body
+/// sweep: the per-entry pipeline below does not care which inventory
+/// produced the digest, only which phase decides what gets deleted.
+unsafe fn gc_apply_obj_scan(s: &mut ModuleState, syscalls: &super::SyscallTable, resp: &[u8]) {
+    s.gc_inflight = 0;
+    let mut digests = [[0u8; super::obj_wire::DIGEST_LEN]; super::obj_wire::MAX_OBJ_SCAN];
+    match super::obj_wire::decode_scan_resp(resp, &mut digests) {
+        Ok((next, count)) => {
+            s.gc_obj_cursor = next;
+            s.gc_wrapped = u8::from(next == 0);
+            if count > 0 {
+                for (i, d) in digests.iter().take(count).enumerate() {
+                    s.gc_digests[i] = *d;
+                }
+                s.gc_q_len = count as u8;
+                s.gc_q_pos = 0;
+                gc_begin_current(s, syscalls);
+            } else if core::mem::replace(&mut s.gc_wrapped, 0) != 0 {
+                gc_advance_phase(s);
+            }
+        }
+        Err(_) => {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            s.gc_obj_cursor = 0;
+            gc_advance_phase(s);
+        }
+    }
+}
+
+/// Take the namespace deletion reservation for the current entry. The
+/// reservation is taken BEFORE the absence proof so the whole
+/// cursor-paged proof runs inside the fence: no BIND naming this id
+/// can be admitted between the proof and the deletions it licenses.
+unsafe fn gc_begin_current(s: &mut ModuleState, syscalls: &super::SyscallTable) {
+    // A composed write in flight owns the window between its body
+    // landing and its bind committing. Its bind would be refused by
+    // our own reservation, so do not take one.
+    if s.putfiles.iter().any(|p| p.in_use != 0) {
+        s.gc_kept = s.gc_kept.wrapping_add(1);
+        gc_skip_current(s, syscalls);
+        return;
+    }
+    let oid = gc_object_id(&s.gc_digests[s.gc_q_pos as usize]);
+    let req_n = match super::ns_wire::encode_gc_reserve_req(&mut s.scratch, false, &oid) {
+        Ok(n) => n,
+        Err(_) => {
+            gc_skip_current(s, syscalls);
+            return;
+        }
+    };
+    if !gc_forward(
+        s,
+        syscalls,
+        Stream::Namespace,
+        s.ns_req_chan,
+        GC_OP_RESERVE,
+        req_n,
+    ) {
+        gc_skip_current(s, syscalls);
+    }
+}
+
+unsafe fn gc_apply_reserve(s: &mut ModuleState, syscalls: &super::SyscallTable, ns_resp: &[u8]) {
+    // A refused reservation means the fence is unavailable, so nothing
+    // may be deleted this pass.
+    match super::ns_wire::decode_gc_reserve_resp(ns_resp) {
+        Ok(true) => {
+            s.gc_reserved = 1;
+            s.gc_check_cursor = 0;
+            gc_check_current(s, syscalls);
+        }
+        _ => {
+            s.gc_kept = s.gc_kept.wrapping_add(1);
+            gc_skip_current(s, syscalls);
+        }
+    }
+}
+
+/// Release the reservation, then move on. Every path that leaves an
+/// entry goes through here so a reservation cannot outlive its sweep.
+unsafe fn gc_release_current(s: &mut ModuleState, syscalls: &super::SyscallTable) {
+    if s.gc_reserved == 0 {
+        gc_next(s, syscalls);
+        return;
+    }
+    s.gc_reserved = 0;
+    let oid = gc_object_id(&s.gc_digests[s.gc_q_pos as usize]);
+    let req_n = match super::ns_wire::encode_gc_reserve_req(&mut s.scratch, true, &oid) {
+        Ok(n) => n,
+        Err(_) => {
+            gc_next(s, syscalls);
+            return;
+        }
+    };
+    if !gc_forward(
+        s,
+        syscalls,
+        Stream::Namespace,
+        s.ns_req_chan,
+        GC_OP_RELEASE,
+        req_n,
+    ) {
+        gc_next(s, syscalls);
+    }
+}
+
+/// Leave the current entry alone without having reserved it.
+unsafe fn gc_skip_current(s: &mut ModuleState, syscalls: &super::SyscallTable) {
+    s.gc_reserved = 0;
+    gc_next(s, syscalls);
+}
+
+/// Delete the object descriptor for the current entry. Runs under the
+/// reservation in both phases: the descriptor is the reachable half of
+/// the pair, so it goes first and a crash between the two deletions
+/// leaves only an orphan body for a later body pass.
+unsafe fn gc_delete_descriptor(s: &mut ModuleState, syscalls: &super::SyscallTable) {
+    if s.obj_req_chan < 0 {
+        gc_delete_body(s, syscalls);
+        return;
+    }
+    let oid = gc_object_id(&s.gc_digests[s.gc_q_pos as usize]);
+    let req_n = match super::obj_wire::encode_remove(&mut s.scratch, &oid) {
+        Ok(n) => n,
+        Err(_) => {
+            gc_release_current(s, syscalls);
+            return;
+        }
+    };
+    if !gc_forward(
+        s,
+        syscalls,
+        Stream::Object,
+        s.obj_req_chan,
+        GC_OP_OBJ_REMOVE,
+        req_n,
+    ) {
+        gc_release_current(s, syscalls);
+    }
+}
+
+unsafe fn gc_delete_body(s: &mut ModuleState, syscalls: &super::SyscallTable) {
+    // The descriptor sweep enumerates descriptors, not bodies: a body
+    // for the same digest is the body sweep's to collect.
+    if s.gc_phase == GC_PHASE_OBJECT {
+        gc_release_current(s, syscalls);
+        return;
+    }
+    let digest = s.gc_digests[s.gc_q_pos as usize];
+    let req_n = match super::body_wire::encode_delete_req(&mut s.scratch, &digest) {
+        Ok(n) => n,
+        Err(_) => {
+            gc_release_current(s, syscalls);
+            return;
+        }
+    };
+    if !gc_forward(
+        s,
+        syscalls,
+        Stream::Body,
+        s.body_req_chan,
+        GC_OP_DELETE,
+        req_n,
+    ) {
+        gc_release_current(s, syscalls);
     }
 }
 
@@ -1457,15 +1835,21 @@ unsafe fn gc_apply_scan(s: &mut ModuleState, syscalls: &super::SyscallTable, res
                     kept += 1;
                 }
             }
+            s.gc_wrapped = u8::from(next == 0);
             if kept > 0 {
                 s.gc_q_len = kept as u8;
                 s.gc_q_pos = 0;
-                gc_check_current(s, syscalls);
+                gc_begin_current(s, syscalls);
+            } else if core::mem::replace(&mut s.gc_wrapped, 0) != 0 {
+                // An empty final page still ends the pass, so the
+                // other inventory gets its turn.
+                gc_advance_phase(s);
             }
         }
         Err(_) => {
             s.apply_errors = s.apply_errors.wrapping_add(1);
             s.gc_cursor = 0;
+            gc_advance_phase(s);
         }
     }
 }
@@ -1481,7 +1865,7 @@ unsafe fn gc_check_current(s: &mut ModuleState, syscalls: &super::SyscallTable) 
     {
         Ok(n) => n,
         Err(_) => {
-            gc_next(s, syscalls);
+            gc_release_current(s, syscalls);
             return;
         }
     };
@@ -1493,7 +1877,7 @@ unsafe fn gc_check_current(s: &mut ModuleState, syscalls: &super::SyscallTable) 
         GC_OP_CHECK,
         req_n,
     ) {
-        gc_next(s, syscalls);
+        gc_release_current(s, syscalls);
     }
 }
 
@@ -1514,26 +1898,34 @@ unsafe fn gc_apply_check(s: &mut ModuleState, syscalls: &super::SyscallTable, ns
     // composed write may have started since the scan.
     if referenced || s.putfiles.iter().any(|p| p.in_use != 0) {
         s.gc_kept = s.gc_kept.wrapping_add(1);
-        gc_next(s, syscalls);
+        gc_release_current(s, syscalls);
         return;
     }
-    let digest = s.gc_digests[s.gc_q_pos as usize];
-    let req_n = match super::body_wire::encode_delete_req(&mut s.scratch, &digest) {
-        Ok(n) => n,
-        Err(_) => {
-            gc_next(s, syscalls);
-            return;
+    // Absence is proven and the reservation still stands, so it stays
+    // proven through both deletions.
+    gc_delete_descriptor(s, syscalls);
+}
+
+unsafe fn gc_apply_obj_remove(s: &mut ModuleState, syscalls: &super::SyscallTable, ack: u8) {
+    // The body is deleted only on a DEFINITE answer about the
+    // descriptor: removed, or absent. A generic failure means the
+    // index could not say — a WAL or I/O error is indistinguishable
+    // from absence at that point — and deleting the body under it
+    // would strand a descriptor pointing at bytes that are gone.
+    // Retain both and let a later pass re-prove it.
+    match ack {
+        super::obj_wire::OP_OBJ_REMOVE => {
+            s.gc_obj_deleted = s.gc_obj_deleted.wrapping_add(1);
+            gc_delete_body(s, syscalls);
         }
-    };
-    if !gc_forward(
-        s,
-        syscalls,
-        Stream::Body,
-        s.body_req_chan,
-        GC_OP_DELETE,
-        req_n,
-    ) {
-        gc_next(s, syscalls);
+        // Absent is the normal case for a body whose composed write
+        // never reached its object stage.
+        super::obj_wire::ACK_ABSENT => gc_delete_body(s, syscalls),
+        _ => {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            s.gc_kept = s.gc_kept.wrapping_add(1);
+            gc_release_current(s, syscalls);
+        }
     }
 }
 
@@ -1543,17 +1935,20 @@ unsafe fn gc_apply_delete(s: &mut ModuleState, syscalls: &super::SyscallTable, r
     } else {
         s.apply_errors = s.apply_errors.wrapping_add(1);
     }
-    gc_next(s, syscalls);
+    gc_release_current(s, syscalls);
 }
 
 unsafe fn gc_next(s: &mut ModuleState, syscalls: &super::SyscallTable) {
     s.gc_check_cursor = 0;
     s.gc_q_pos = s.gc_q_pos.wrapping_add(1);
     if s.gc_q_pos < s.gc_q_len {
-        gc_check_current(s, syscalls);
+        gc_begin_current(s, syscalls);
     } else {
         s.gc_q_len = 0;
         s.gc_q_pos = 0;
+        if core::mem::replace(&mut s.gc_wrapped, 0) != 0 {
+            gc_advance_phase(s);
+        }
     }
 }
 
@@ -1579,7 +1974,7 @@ unsafe fn handle_put_file_open(s: &mut ModuleState, syscalls: &super::SyscallTab
         if let Ok(n) =
             super::admin::encode_put_file_open_ack(&mut s.scratch, cid, super::admin::STATUS_NAK, 0)
         {
-            let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), n);
+            reply_staged(s, syscalls, n);
         }
     };
     if s.body_req_chan < 0
@@ -1659,7 +2054,7 @@ unsafe fn handle_spf_open_response(
                 super::admin::STATUS_NAK,
                 0,
             ) {
-                let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), n);
+                reply_staged(s, syscalls, n);
             }
             return;
         }
@@ -1674,8 +2069,7 @@ unsafe fn handle_spf_open_response(
         super::admin::STATUS_OK,
         idx as u8,
     ) {
-        let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), n);
-        s.replied = s.replied.wrapping_add(1);
+        reply_staged(s, syscalls, n);
     }
 }
 
@@ -1692,7 +2086,7 @@ unsafe fn handle_put_file_chunk(s: &mut ModuleState, syscalls: &super::SyscallTa
         if let Ok(n) =
             super::admin::encode_put_file_chunk_ack(&mut s.scratch, cid, super::admin::STATUS_NAK)
         {
-            let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), n);
+            reply_staged(s, syscalls, n);
         }
     };
     if idx >= SPF_CAP || s.spf[idx].in_use == 0 || s.spf[idx].wid_valid == 0 {
@@ -1879,8 +2273,7 @@ unsafe fn emit_pathread_nak(
         super::admin::encode_read_file_range_ack(&mut s.scratch, cid, status, None)
     };
     if let Ok(n) = n {
-        let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), n);
-        s.replied = s.replied.wrapping_add(1);
+        reply_staged(s, syscalls, n);
     }
 }
 
@@ -2071,8 +2464,7 @@ unsafe fn handle_range_body_response(
         emit_pathread_nak(s, syscalls, entry.admin_op, entry.correlation_id, status);
         return;
     };
-    let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), resp_n);
-    s.replied = s.replied.wrapping_add(1);
+    reply_staged(s, syscalls, resp_n);
 }
 
 // ── AdminPutFile state machine ────────────────────────────────────
@@ -2376,8 +2768,7 @@ unsafe fn handle_putfile_bind_response(
             }
         }
     };
-    let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), resp_n);
-    s.replied = s.replied.wrapping_add(1);
+    reply_staged(s, syscalls, resp_n);
     free_putfile_slot(s, slot_idx);
 }
 
@@ -2395,8 +2786,7 @@ unsafe fn emit_putfile_nak(
     )
     .is_ok()
     {
-        let _ = (syscalls.channel_write)(s.admin_out_chan, buf.as_ptr(), 6);
-        s.replied = s.replied.wrapping_add(1);
+        reply_bytes(s, syscalls, &buf);
     }
 }
 
@@ -2405,8 +2795,7 @@ unsafe fn emit_bind_nak(s: &mut ModuleState, syscalls: &super::SyscallTable, cor
     if super::admin::encode_admin_bind_ack(&mut buf, correlation_id, super::admin::STATUS_NAK)
         .is_ok()
     {
-        let _ = (syscalls.channel_write)(s.admin_out_chan, buf.as_ptr(), 6);
-        s.replied = s.replied.wrapping_add(1);
+        reply_bytes(s, syscalls, &buf);
     }
 }
 
@@ -2424,8 +2813,7 @@ unsafe fn emit_put_body_nak(
     )
     .is_ok()
     {
-        let _ = (syscalls.channel_write)(s.admin_out_chan, buf.as_ptr(), 6);
-        s.replied = s.replied.wrapping_add(1);
+        reply_bytes(s, syscalls, &buf);
     }
 }
 
@@ -2443,8 +2831,7 @@ unsafe fn emit_get_body_nak(
     )
     .is_ok()
     {
-        let _ = (syscalls.channel_write)(s.admin_out_chan, buf.as_ptr(), 6);
-        s.replied = s.replied.wrapping_add(1);
+        reply_bytes(s, syscalls, &buf);
     }
 }
 

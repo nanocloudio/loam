@@ -127,6 +127,23 @@ impl BindingSlot {
         self.occupied && self.namespace_hash == namespace_hash && self.path_hash == path_hash
     }
 
+    /// True when this slot already points at exactly `object_id` with
+    /// exactly `kind`. Compares the inline bytes when the slot kept
+    /// them (an oversize ObjectId is not inlined) and the hash
+    /// otherwise, so a duplicate is never mistaken for a conflict and
+    /// a conflict is never mistaken for a duplicate on a hash
+    /// collision alone.
+    pub fn binds_same(&self, object_id_hash: u64, object_id: &[u8], kind: u8) -> bool {
+        if self.kind != kind || self.object_id_hash != object_id_hash {
+            return false;
+        }
+        let inline = self.object_id();
+        if inline.is_empty() {
+            return true;
+        }
+        inline == object_id
+    }
+
     /// Borrow the inline ObjectId bytes (empty slice if length == 0).
     pub fn object_id(&self) -> &[u8] {
         let len = self.object_id_len as usize;
@@ -238,10 +255,20 @@ impl<const N: usize> PicNamespaceState<N> {
         // producers that advance a pointer (key → new content digest)
         // pass a monotone revision per write; replays of older binds
         // (e.g. WAL/commit-stream replay) land on the AlreadyBound arm
-        // and cannot regress the pointer. Same-revision re-binds are
-        // idempotent duplicates — also rejected, arena unchanged.
+        // and cannot regress the pointer.
+        //
+        // A re-bind at the SAME revision to the SAME object is the
+        // same write arriving twice — a composed PUT_FILE retried
+        // after a crash between the bind and its reply, or a
+        // commit-stream duplicate. It succeeds without mutating:
+        // refusing it would make retry of an interrupted write
+        // indistinguishable from a genuine conflict. Same revision,
+        // DIFFERENT object is a genuine conflict and is refused.
         for s in self.slots.iter_mut() {
             if s.occupied && s.matches(ns_h, p_h) {
+                if revision == s.revision && s.binds_same(oid_h, object_id, kind) {
+                    return Ok(ApplyOk::Bound { revision });
+                }
                 if revision > s.revision {
                     s.object_id_hash = oid_h;
                     s.revision = revision;

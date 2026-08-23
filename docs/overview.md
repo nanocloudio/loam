@@ -24,6 +24,9 @@ changes.
 - [native_fluxor.md](native_fluxor.md) — how loam sits on fluxor:
   surface visibility, the step contract, the WAL write path, and the
   operational rules bare-metal bring-up imposes
+- [durability.md](durability.md) — what survives a power cut: which
+  log is authoritative, how an artefact reaches its name, the composed
+  write's crash model, and the replication contract
 - [specification.md](specification.md) — the invariants loam holds
   itself to, stated against the vocabulary in the tree
 
