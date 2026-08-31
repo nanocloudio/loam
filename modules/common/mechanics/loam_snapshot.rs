@@ -7,8 +7,17 @@
 //
 //   header  [magic u32 "LSNP"][count u32][generation u64]
 //   record  [ns_hash u64][path_hash u64][revision u64][kind u8]
-//           [oid_len u8][oid 96][root_len u8][root 64]
-//           [path_len u8][path 160]                       = 348 B
+//           [oid_len u8][oid MAX_OID][root_len u8][root MAX_ROOT]
+//           [path_len u16][path MAX_PATH]
+//
+// The three key ceilings come from `loam_limits.rs`, so REC_SIZE is
+// per capacity profile (349 B embedded, 1213 B host) rather than a
+// number stated here. A snapshot is therefore a node-local artefact
+// of one profile: a file written by the other profile fails the
+// `size == SNAP_HDR + count * REC_SIZE` validity check on open and
+// is treated as the invalid generation, which is the same path a
+// torn write takes. That is deliberate — silently reinterpreting
+// another profile's records would mispair keys with revisions.
 //
 // Crash safety via ALTERNATING GENERATIONS: compaction writes to
 // whichever of `<wal>.snapA` / `<wal>.snapB` holds the OLDER
@@ -39,10 +48,12 @@ const FS_UNLINK: u32 = 0x090A;
 
 pub const SNAP_MAGIC: u32 = u32::from_le_bytes(*b"LSNP");
 pub const SNAP_HDR: usize = 16;
-pub const REC_SIZE: usize = 8 + 8 + 8 + 1 + 1 + 96 + 1 + 64 + 1 + 160; // 348
-pub const MAX_OID: usize = 96;
-pub const MAX_ROOT: usize = 64;
-pub const MAX_PATH: usize = 160;
+/// Key ceilings, from the single register in `loam_limits.rs`.
+pub use super::limits::{MAX_OBJECT_ID as MAX_OID, MAX_PATH, MAX_ROOT};
+
+/// Derived, not chosen: the fixed record width that makes the file
+/// binary-searchable. Moves when any ceiling above moves.
+pub const REC_SIZE: usize = 8 + 8 + 8 + 1 + 1 + MAX_OID + 1 + MAX_ROOT + 2 + MAX_PATH;
 
 /// `kind` value marking a tombstone in ARENA slots (never written
 /// to a snapshot — compaction drops the record entirely).
@@ -59,7 +70,7 @@ pub struct SnapRecord {
     pub oid: [u8; MAX_OID],
     pub root_len: u8,
     pub root: [u8; MAX_ROOT],
-    pub path_len: u8,
+    pub path_len: u16,
     pub path: [u8; MAX_PATH],
 }
 
@@ -97,8 +108,8 @@ impl SnapRecord {
         out[o] = self.root_len;
         out[o + 1..o + 1 + MAX_ROOT].copy_from_slice(&self.root);
         o += 1 + MAX_ROOT;
-        out[o] = self.path_len;
-        out[o + 1..o + 1 + MAX_PATH].copy_from_slice(&self.path);
+        out[o..o + 2].copy_from_slice(&self.path_len.to_le_bytes());
+        out[o + 2..o + 2 + MAX_PATH].copy_from_slice(&self.path);
         true
     }
 
@@ -117,8 +128,8 @@ impl SnapRecord {
         r.root_len = src[o];
         r.root.copy_from_slice(&src[o + 1..o + 1 + MAX_ROOT]);
         o += 1 + MAX_ROOT;
-        r.path_len = src[o];
-        r.path.copy_from_slice(&src[o + 1..o + 1 + MAX_PATH]);
+        r.path_len = u16::from_le_bytes(src[o..o + 2].try_into().ok()?);
+        r.path.copy_from_slice(&src[o + 2..o + 2 + MAX_PATH]);
         Some(r)
     }
 }

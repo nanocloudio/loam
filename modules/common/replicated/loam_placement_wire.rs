@@ -12,15 +12,33 @@
 // Layouts (multi-byte ints LE):
 //
 //   FleetEpoch   [op:u8=0x60][epoch:u64][count:u8][members:count u8]
+//                                                  [domains:count u8]
+//                                                  [states:count u8]
 //                  // `count` ≤ MAX_FLEET. Each `member` byte is a
 //                  // fleet index (0..MAX_FLEET); duplicates are
-//                  // a producer bug.
+//                  // a producer bug. Each `domain` byte names the
+//                  // FAILURE DOMAIN of the member at the same
+//                  // position — a rack, a chassis, a power feed,
+//                  // whatever actually fails together.
 //
 //   FleetUpdate  [op:u8=0x61][count:u8][members:count u8]
+//                                      [domains:count u8]
+//                                      [states:count u8]
 //                  // control-channel input. Replaces the entire
 //                  // member list atomically; the router bumps
 //                  // epoch and re-emits FleetEpoch on its next
 //                  // step. count == 0 is a "no targets" state.
+//
+// Why domains ride the snapshot rather than a side channel: placement
+// is a PURE FUNCTION of (digest, fleet), computed locally by every
+// consumer with no round trip. Topology is an input to that function,
+// so it has to travel with the rest of the input or consumers would
+// compute different answers from the same epoch. All-zero domains
+// means one domain — the honest default for a fleet nobody has
+// described. `states` is `MEMBER_ACTIVE` / `MEMBER_DRAINING`; all
+// zero means fully active, and a short list leaves the remainder
+// active, because wrongly believing a member is draining would stop
+// placing on a perfectly good node.
 //
 // The wire intentionally does NOT carry per-member health bits in
 // v1 — the publish-on-change model means a member that goes dark
@@ -53,14 +71,24 @@ pub enum WireError {
 
 // ── FleetEpoch (router → consumers) ────────────────────────────────
 
-pub fn encode_fleet_epoch(dst: &mut [u8], epoch: u64, members: &[u8]) -> Result<usize, WireError> {
+/// Encode a fleet snapshot. `domains` is positionally aligned with
+/// `members`; pass `&[]` for a fleet whose topology nobody has
+/// described, which places every member in domain 0.
+pub fn encode_fleet_epoch(
+    dst: &mut [u8],
+    epoch: u64,
+    members: &[u8],
+    domains: &[u8],
+    states: &[u8],
+) -> Result<usize, WireError> {
     if members.len() > MAX_FLEET {
         return Err(WireError::FleetTooLarge {
             count: members.len(),
             max: MAX_FLEET,
         });
     }
-    let needed = 1 + 8 + 1 + members.len();
+    let n = members.len();
+    let needed = 1 + 8 + 1 + n + n + n;
     if dst.len() < needed {
         return Err(WireError::BufferTooSmall {
             needed,
@@ -69,8 +97,15 @@ pub fn encode_fleet_epoch(dst: &mut [u8], epoch: u64, members: &[u8]) -> Result<
     }
     dst[0] = OP_FLEET_EPOCH;
     dst[1..9].copy_from_slice(&epoch.to_le_bytes());
-    dst[9] = members.len() as u8;
-    dst[10..10 + members.len()].copy_from_slice(members);
+    dst[9] = n as u8;
+    dst[10..10 + n].copy_from_slice(members);
+    // A short `domains` leaves the remainder in domain 0 — partial
+    // topology beats none, and assuming an undescribed member is
+    // isolated is the dangerous direction.
+    for i in 0..n {
+        dst[10 + n + i] = domains.get(i).copied().unwrap_or(0);
+        dst[10 + n + n + i] = states.get(i).copied().unwrap_or(0);
+    }
     Ok(needed)
 }
 
@@ -78,6 +113,8 @@ pub fn encode_fleet_epoch(dst: &mut [u8], epoch: u64, members: &[u8]) -> Result<
 pub struct DecodedFleetEpoch<'a> {
     pub epoch: u64,
     pub members: &'a [u8],
+    pub domains: &'a [u8],
+    pub states: &'a [u8],
 }
 
 pub fn decode_fleet_epoch(src: &[u8]) -> Result<DecodedFleetEpoch<'_>, WireError> {
@@ -95,25 +132,33 @@ pub fn decode_fleet_epoch(src: &[u8]) -> Result<DecodedFleetEpoch<'_>, WireError
             max: MAX_FLEET,
         });
     }
-    if 10 + count > src.len() {
+    if 10 + count * 3 > src.len() {
         return Err(WireError::Truncated);
     }
     Ok(DecodedFleetEpoch {
         epoch,
         members: &src[10..10 + count],
+        domains: &src[10 + count..10 + count * 2],
+        states: &src[10 + count * 2..10 + count * 3],
     })
 }
 
 // ── FleetUpdate (control → router) ─────────────────────────────────
 
-pub fn encode_fleet_update(dst: &mut [u8], members: &[u8]) -> Result<usize, WireError> {
+pub fn encode_fleet_update(
+    dst: &mut [u8],
+    members: &[u8],
+    domains: &[u8],
+    states: &[u8],
+) -> Result<usize, WireError> {
     if members.len() > MAX_FLEET {
         return Err(WireError::FleetTooLarge {
             count: members.len(),
             max: MAX_FLEET,
         });
     }
-    let needed = 1 + 1 + members.len();
+    let n = members.len();
+    let needed = 1 + 1 + n + n + n;
     if dst.len() < needed {
         return Err(WireError::BufferTooSmall {
             needed,
@@ -121,14 +166,20 @@ pub fn encode_fleet_update(dst: &mut [u8], members: &[u8]) -> Result<usize, Wire
         });
     }
     dst[0] = OP_FLEET_UPDATE;
-    dst[1] = members.len() as u8;
-    dst[2..2 + members.len()].copy_from_slice(members);
+    dst[1] = n as u8;
+    dst[2..2 + n].copy_from_slice(members);
+    for i in 0..n {
+        dst[2 + n + i] = domains.get(i).copied().unwrap_or(0);
+        dst[2 + n + n + i] = states.get(i).copied().unwrap_or(0);
+    }
     Ok(needed)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodedFleetUpdate<'a> {
     pub members: &'a [u8],
+    pub domains: &'a [u8],
+    pub states: &'a [u8],
 }
 
 pub fn decode_fleet_update(src: &[u8]) -> Result<DecodedFleetUpdate<'_>, WireError> {
@@ -145,11 +196,13 @@ pub fn decode_fleet_update(src: &[u8]) -> Result<DecodedFleetUpdate<'_>, WireErr
             max: MAX_FLEET,
         });
     }
-    if 2 + count > src.len() {
+    if 2 + count * 3 > src.len() {
         return Err(WireError::Truncated);
     }
     Ok(DecodedFleetUpdate {
         members: &src[2..2 + count],
+        domains: &src[2 + count..2 + count * 2],
+        states: &src[2 + count * 2..2 + count * 3],
     })
 }
 

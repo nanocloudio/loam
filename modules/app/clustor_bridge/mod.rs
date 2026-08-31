@@ -28,6 +28,9 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 #[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[path = "../../common/mechanics/loam_limits.rs"]
+mod limits;
+
 #[path = "../../common/mechanics/reply_out.rs"]
 mod reply_out;
 
@@ -42,7 +45,6 @@ mod wire;
 #[path = "../../../target/fluxor/clustor-common/replica_facade.rs"]
 mod facade;
 
-const MAX_OPS_PER_STEP: u32 = 4;
 const BUF: usize = 4400;
 
 define_params! {
@@ -192,7 +194,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
             let mut n_ops = 0u32;
             let mut off = 0usize;
-            while n_ops < MAX_OPS_PER_STEP {
+            while n_ops < limits::OPS_PER_STEP {
                 if s.out_owed.owed() {
                     break;
                 }

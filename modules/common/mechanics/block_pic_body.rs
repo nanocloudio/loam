@@ -12,15 +12,11 @@
 // budget is much smaller than the per-binding/per-object PICs.
 // ModuleState size: VolumeSlot(~48B) × 64 + 4 KiB scratch ≈ 7 KiB.
 // Capacity profile — see namespace_pic_body.rs.
-#[cfg(target_os = "none")]
-const ARENA_CAPACITY: usize = 64;
-#[cfg(not(target_os = "none"))]
-const ARENA_CAPACITY: usize = 1024;
-const MAX_OPS_PER_STEP: u32 = 4;
+const ARENA_CAPACITY: usize = super::limits::BLOCK_SLOTS;
 const READ_BUF: usize = 256;
 /// Reassembly capacity for `requests`. Sized to hold a full step's
 /// budget plus one more read, so refilling never starves the step.
-const REQ_ASM: usize = READ_BUF * (MAX_OPS_PER_STEP as usize + 1);
+const REQ_ASM: usize = READ_BUF * (super::limits::OPS_PER_STEP as usize + 1);
 
 /// Inline WAL-path buffer size; see `namespace_pic_body.rs`.
 pub const WAL_PATH_BUF: usize = 256;
@@ -126,43 +122,15 @@ pub unsafe fn open_and_replay_wal(state_ptr: *mut u8, wal_path: &[u8]) -> i32 {
 
 /// See `namespace_pic_body::decode_wal_path_params`.
 pub unsafe fn decode_wal_path_params(state_ptr: *mut u8, params: *const u8, params_len: usize) {
-    if state_ptr.is_null() || params.is_null() || params_len == 0 {
+    if state_ptr.is_null() {
         return;
     }
     let s = &mut *(state_ptr as *mut ModuleState);
-    let is_tlv = params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
-    if is_tlv {
-        let mut off = 4usize;
-        while off + 2 <= params_len {
-            let tag = *params.add(off);
-            let elen = *params.add(off + 1) as usize;
-            off += 2;
-            if tag == 0xFF {
-                break;
-            }
-            if tag == 1 && off + elen <= params_len {
-                let copy = elen.min(WAL_PATH_BUF);
-                let src = params.add(off);
-                let mut i = 0usize;
-                while i < copy {
-                    s.wal_path[i] = *src.add(i);
-                    i += 1;
-                }
-                s.wal_path_len = copy as u16;
-                return;
-            }
-            off += elen;
-        }
-        return;
+    // The TLV/raw ambiguity lives in one place — `wal_io` — so the
+    // four modules that take a WAL path cannot drift apart on it.
+    if let Some(n) = super::wal::decode_wal_path(params, params_len, &mut s.wal_path) {
+        s.wal_path_len = n as u16;
     }
-    let copy = params_len.min(WAL_PATH_BUF);
-    let src = params;
-    let mut i = 0usize;
-    while i < copy {
-        s.wal_path[i] = *src.add(i);
-        i += 1;
-    }
-    s.wal_path_len = copy as u16;
 }
 
 /// See `namespace_pic_body::open_wal_from_state`.
@@ -310,7 +278,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
 
     let mut handled: u32 = 0;
     let mut req_off: usize = 0;
-    while handled < MAX_OPS_PER_STEP {
+    while handled < super::limits::OPS_PER_STEP {
         // An answer still owed means the channel is not draining;
         // taking another record could not be answered either.
         if s.reply.owed() {

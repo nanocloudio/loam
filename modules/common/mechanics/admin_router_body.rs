@@ -3,7 +3,7 @@
 // channel formats, then routes the responses back to the admin
 // reply channel with the original correlation_id attached.
 //
-// Phase 4a + 4b + 4b.2 scope:
+// Op routing:
 //   AdminBind     → namespace_router (1-byte ack/nak)
 //   AdminPutBody  → body_store        (PutResp / NAK)
 //   AdminGetBody  → body_store        (GetResp / NAK)
@@ -22,19 +22,21 @@
 // not in that prelude.
 use core::convert::TryInto;
 
-const MAX_OPS_PER_STEP: u32 = 4;
 // Buffers derive from the body wire cap so a max-size body can't
 // truncate on the way through the admin surface.
 const READ_BUF: usize = super::body_wire::MAX_BODY + 128;
-const PENDING_CAP: usize = 64;
-const PUTFILE_CAP: usize = 16;
 const SCRATCH: usize = super::body_wire::MAX_BODY + 128;
 /// Reassembly capacity for `ns_responses`. Sized to hold a full step's
 /// budget of the largest response plus one more read, so refilling
 /// never starves the step.
-const NS_ASM: usize = 4096 * (MAX_OPS_PER_STEP as usize + 1);
-const NS_PATH_BUF: usize = 256;
-const NS_ROOT_BUF: usize = 128;
+const NS_ASM: usize = 4096 * (super::limits::OPS_PER_STEP as usize + 1);
+/// Inline key buffers for the composed PUT_FILE state machine.
+/// Derived from the key ceilings, NOT chosen independently: a
+/// second, smaller ceiling here would refuse (or worse, truncate) a
+/// key the namespace surface accepted, which is the same
+/// accepted-but-unusable failure the ceilings exist to prevent.
+const NS_PATH_BUF: usize = super::limits::MAX_PATH;
+const NS_ROOT_BUF: usize = super::limits::MAX_ROOT;
 
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
@@ -53,8 +55,6 @@ pub struct PendingDownstream {
     pub aux_off: u64,
     pub aux_len: u32,
 }
-
-pub const SPF_CAP: usize = 4;
 
 /// A streamed put-file between OPEN and COMMIT.
 #[derive(Clone, Copy)]
@@ -140,18 +140,18 @@ pub struct ModuleState {
     // Per-downstream pending FIFOs (head, tail, ring storage).
     pub ns_head: u32,
     pub ns_tail: u32,
-    pub ns_pending: [PendingDownstream; PENDING_CAP],
+    pub ns_pending: [PendingDownstream; super::limits::ADMIN_PENDING],
     pub body_head: u32,
     pub body_tail: u32,
-    pub body_pending: [PendingDownstream; PENDING_CAP],
+    pub body_pending: [PendingDownstream; super::limits::ADMIN_PENDING],
     pub obj_head: u32,
     pub obj_tail: u32,
-    pub obj_pending: [PendingDownstream; PENDING_CAP],
-    pub putfiles: [PendingPutFile; PUTFILE_CAP],
+    pub obj_pending: [PendingDownstream; super::limits::ADMIN_PENDING],
+    pub putfiles: [PendingPutFile; super::limits::ADMIN_PUTFILE],
     /// In-flight STREAMED put-files (large bodies): open → chunks →
     /// commit, then the commit chains into the standard object +
     /// bind stages via a PendingPutFile slot.
-    pub spf: [StreamedPutFile; SPF_CAP],
+    pub spf: [StreamedPutFile; super::limits::ADMIN_STREAMED_PUTFILE],
     /// Lifecycle GC (active when `gc_interval` != 0). Alternating
     /// sweeps over the two things a composed PUT_FILE leaves behind:
     /// body blobs and object descriptors. Each interval takes one
@@ -221,8 +221,10 @@ pub unsafe fn set_gc_interval(state_ptr: *mut u8, interval: u32) {
     s.gc_interval = interval;
 }
 
-/// Phase 4a entry point (namespace-only). Kept so the existing
-/// 3-test bind harness keeps working.
+/// Namespace-only constructor: wires the admin pair and the
+/// namespace pair, leaving the body and object pairs unbound. Enough
+/// for `AdminBind`; any op that needs bytes NAKs without a body
+/// channel.
 pub unsafe fn module_new_impl(
     admin_in_chan: i32,
     admin_out_chan: i32,
@@ -247,7 +249,9 @@ pub unsafe fn module_new_impl(
     )
 }
 
-/// Phase 4b entry point: namespace + body_store wired.
+/// Namespace + body constructor: wires everything except the object
+/// pair. Enough for `AdminBind` and the direct body ops; the
+/// composed `AdminPutFile` needs the object channels too.
 pub unsafe fn module_new_full_impl(
     admin_in_chan: i32,
     admin_out_chan: i32,
@@ -274,10 +278,9 @@ pub unsafe fn module_new_full_impl(
     )
 }
 
-/// Phase 4b.2 entry point: all four downstream PIC channel pairs
-/// wired (namespace, body_store, object_index). Required for the
-/// composed AdminPutFile op; AdminBind / AdminPutBody /
-/// AdminGetBody still work with the previous entry points.
+/// Full constructor: all three downstream PIC channel pairs wired
+/// (namespace, body_store, object_index). Required for the composed
+/// `AdminPutFile` op, which touches all three in sequence.
 pub unsafe fn module_new_with_objects_impl(
     admin_in_chan: i32,
     admin_out_chan: i32,
@@ -358,7 +361,7 @@ unsafe fn enqueue_pending(
         Stream::Body => (&mut s.body_head, &mut s.body_tail, &mut s.body_pending),
         Stream::Object => (&mut s.obj_head, &mut s.obj_tail, &mut s.obj_pending),
     };
-    let next = (tail.wrapping_add(1)) % PENDING_CAP as u32;
+    let next = (tail.wrapping_add(1)) % super::limits::ADMIN_PENDING as u32;
     if next == *head {
         return false;
     }
@@ -385,7 +388,7 @@ unsafe fn dequeue_pending(s: &mut ModuleState, stream: Stream) -> Option<Pending
     }
     let entry = ring[*head as usize];
     ring[*head as usize].in_use = 0;
-    *head = (head.wrapping_add(1)) % PENDING_CAP as u32;
+    *head = (head.wrapping_add(1)) % super::limits::ADMIN_PENDING as u32;
     Some(entry)
 }
 
@@ -489,7 +492,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
 
     // ── 1. Drain inbound admin requests, forward downstream. ──
     let mut handled: u32 = 0;
-    while handled < MAX_OPS_PER_STEP {
+    while handled < super::limits::OPS_PER_STEP {
         // An answer still owed means `admin_out` is not draining, and
         // `scratch` holds it — the next request would overwrite it.
         if s.resp_len != 0 {
@@ -556,7 +559,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         }
         let mut drained: u32 = 0;
         let mut ns_off: usize = 0;
-        while drained < MAX_OPS_PER_STEP {
+        while drained < super::limits::OPS_PER_STEP {
             // Same buffer, same rule: a downstream response would
             // overwrite the answer still owed upstream.
             if s.resp_len != 0 {
@@ -670,7 +673,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     // ── 3. Drain downstream body_store responses, emit replies. ──
     if s.body_resp_chan >= 0 {
         let mut drained: u32 = 0;
-        while drained < MAX_OPS_PER_STEP {
+        while drained < super::limits::OPS_PER_STEP {
             // Same buffer, same rule: a downstream response would
             // overwrite the answer still owed upstream.
             if s.resp_len != 0 {
@@ -755,7 +758,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     // ── 4. Drain downstream object_index acks, advance PutFile state. ──
     if s.obj_resp_chan >= 0 {
         let mut drained: u32 = 0;
-        while drained < MAX_OPS_PER_STEP {
+        while drained < super::limits::OPS_PER_STEP {
             // Same buffer, same rule: a downstream response would
             // overwrite the answer still owed upstream.
             if s.resp_len != 0 {
@@ -1575,7 +1578,8 @@ unsafe fn gc_unenqueue_tail(s: &mut ModuleState, stream: Stream) {
     if *head == *tail {
         return;
     }
-    let prev = (tail.wrapping_add(PENDING_CAP as u32 - 1)) % PENDING_CAP as u32;
+    let prev = (tail.wrapping_add(super::limits::ADMIN_PENDING as u32 - 1))
+        % super::limits::ADMIN_PENDING as u32;
     ring[prev as usize].in_use = 0;
     *tail = prev;
 }
@@ -1955,7 +1959,7 @@ unsafe fn gc_next(s: &mut ModuleState, syscalls: &super::SyscallTable) {
 // ── Streamed AdminPutFile + path reads ────────────────────────────
 
 unsafe fn free_spf(s: &mut ModuleState, idx: u16) {
-    if (idx as usize) < SPF_CAP {
+    if (idx as usize) < super::limits::ADMIN_STREAMED_PUTFILE {
         s.spf[idx as usize].in_use = 0;
     }
 }
@@ -1970,12 +1974,13 @@ unsafe fn handle_put_file_open(s: &mut ModuleState, syscalls: &super::SyscallTab
             return;
         }
     };
-    let nak = |s: &mut ModuleState, syscalls: &super::SyscallTable, cid: u32| unsafe {
-        if let Ok(n) =
-            super::admin::encode_put_file_open_ack(&mut s.scratch, cid, super::admin::STATUS_NAK, 0)
-        {
+    let refuse = |s: &mut ModuleState, syscalls: &super::SyscallTable, cid: u32, status: u8| unsafe {
+        if let Ok(n) = super::admin::encode_put_file_open_ack(&mut s.scratch, cid, status, 0) {
             reply_staged(s, syscalls, n);
         }
+    };
+    let nak = |s: &mut ModuleState, syscalls: &super::SyscallTable, cid: u32| {
+        refuse(s, syscalls, cid, super::admin::STATUS_NAK)
     };
     if s.body_req_chan < 0
         || req.namespace_root.len() > NS_ROOT_BUF
@@ -1985,10 +1990,12 @@ unsafe fn handle_put_file_open(s: &mut ModuleState, syscalls: &super::SyscallTab
         nak(s, syscalls, req.correlation_id);
         return;
     }
-    let idx = match (0..SPF_CAP).find(|&i| s.spf[i].in_use == 0) {
+    let idx = match (0..super::limits::ADMIN_STREAMED_PUTFILE).find(|&i| s.spf[i].in_use == 0) {
         Some(i) => i,
         None => {
-            nak(s, syscalls, req.correlation_id);
+            // Every streaming slot is taken. Well-formed, just not
+            // now — the caller should back off, not give up.
+            refuse(s, syscalls, req.correlation_id, super::admin::STATUS_BUSY);
             return;
         }
     };
@@ -2059,7 +2066,7 @@ unsafe fn handle_spf_open_response(
             return;
         }
     };
-    if (idx as usize) < SPF_CAP {
+    if (idx as usize) < super::limits::ADMIN_STREAMED_PUTFILE {
         s.spf[idx as usize].wid = wid;
         s.spf[idx as usize].wid_valid = 1;
     }
@@ -2089,7 +2096,10 @@ unsafe fn handle_put_file_chunk(s: &mut ModuleState, syscalls: &super::SyscallTa
             reply_staged(s, syscalls, n);
         }
     };
-    if idx >= SPF_CAP || s.spf[idx].in_use == 0 || s.spf[idx].wid_valid == 0 {
+    if idx >= super::limits::ADMIN_STREAMED_PUTFILE
+        || s.spf[idx].in_use == 0
+        || s.spf[idx].wid_valid == 0
+    {
         nak(s, syscalls);
         return;
     }
@@ -2133,7 +2143,10 @@ unsafe fn handle_put_file_commit(
         }
     };
     let idx = pfid as usize;
-    if idx >= SPF_CAP || s.spf[idx].in_use == 0 || s.spf[idx].wid_valid == 0 {
+    if idx >= super::limits::ADMIN_STREAMED_PUTFILE
+        || s.spf[idx].in_use == 0
+        || s.spf[idx].wid_valid == 0
+    {
         emit_putfile_nak(s, syscalls, cid);
         return;
     }
@@ -2177,7 +2190,7 @@ unsafe fn handle_spf_commit_response(
     body_resp: &[u8],
 ) {
     let idx = entry.putfile_idx;
-    let spf = if (idx as usize) < SPF_CAP {
+    let spf = if (idx as usize) < super::limits::ADMIN_STREAMED_PUTFILE {
         s.spf[idx as usize]
     } else {
         emit_putfile_nak(s, syscalls, entry.correlation_id);
@@ -2195,7 +2208,8 @@ unsafe fn handle_spf_commit_response(
     let slot_idx = match allocate_putfile_slot(s) {
         Some(i) => i,
         None => {
-            emit_putfile_nak(s, syscalls, entry.correlation_id);
+            // Full, not wrong — see `emit_putfile_busy`.
+            emit_putfile_busy(s, syscalls, entry.correlation_id);
             return;
         }
     };
@@ -2318,7 +2332,10 @@ unsafe fn dispatch_pathread_lookup(
 
 /// Stamp aux (off, len) onto the just-enqueued namespace pending.
 unsafe fn set_ns_tail_aux(s: &mut ModuleState, off: u64, len: u32) {
-    let prev = (s.ns_tail.wrapping_add(PENDING_CAP as u32 - 1)) % PENDING_CAP as u32;
+    let prev = (s
+        .ns_tail
+        .wrapping_add(super::limits::ADMIN_PENDING as u32 - 1))
+        % super::limits::ADMIN_PENDING as u32;
     s.ns_pending[prev as usize].aux_off = off;
     s.ns_pending[prev as usize].aux_len = len;
 }
@@ -2490,7 +2507,7 @@ unsafe fn handle_admin_put_file(s: &mut ModuleState, syscalls: &super::SyscallTa
     let slot_idx = match allocate_putfile_slot(s) {
         Some(i) => i,
         None => {
-            emit_putfile_nak(s, syscalls, req.correlation_id);
+            emit_putfile_busy(s, syscalls, req.correlation_id);
             s.apply_errors = s.apply_errors.wrapping_add(1);
             return;
         }
@@ -2665,7 +2682,15 @@ unsafe fn handle_putfile_object_response(
     let slot_idx = entry.putfile_idx;
     if ack_byte != super::obj_wire::OP_OBJ_PUT {
         free_putfile_slot(s, slot_idx);
-        emit_putfile_nak(s, syscalls, entry.correlation_id);
+        // A quota refusal keeps its identity all the way out. The
+        // body is already stored and will be reclaimed by the orphan
+        // sweep like any unbound blob; what the client needs is to
+        // know that waiting will not help.
+        if ack_byte == super::obj_wire::ACK_QUOTA {
+            emit_putfile_quota(s, syscalls, entry.correlation_id);
+        } else {
+            emit_putfile_nak(s, syscalls, entry.correlation_id);
+        }
         return;
     }
     {
@@ -2770,6 +2795,46 @@ unsafe fn handle_putfile_bind_response(
     };
     reply_staged(s, syscalls, resp_n);
     free_putfile_slot(s, slot_idx);
+}
+
+/// Refuse a composed write because the table is FULL, not because
+/// anything was wrong with it.
+///
+/// The distinction reaches the client: the gateway turns this into a
+/// 503 with a Retry-After, where a generic NAK becomes a 500. An S3
+/// client backs off on the first and gives up on the second, so
+/// collapsing them costs real availability under exactly the load
+/// that produces them.
+unsafe fn emit_putfile_busy(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    correlation_id: u32,
+) {
+    emit_putfile_status(s, syscalls, correlation_id, super::admin::STATUS_BUSY)
+}
+
+/// Refuse a composed write because the tenant's quota would be
+/// crossed. Unlike BUSY, waiting will not help — the remedy is the
+/// tenant's or the operator's, and the status has to say so or a
+/// client retries forever against a ceiling.
+unsafe fn emit_putfile_quota(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    correlation_id: u32,
+) {
+    emit_putfile_status(s, syscalls, correlation_id, super::admin::STATUS_QUOTA)
+}
+
+unsafe fn emit_putfile_status(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    correlation_id: u32,
+    status: u8,
+) {
+    let mut buf = [0u8; 6];
+    if super::admin::encode_admin_put_file_ack(&mut buf, correlation_id, status, None).is_ok() {
+        let _ = (syscalls.channel_write)(s.admin_out_chan, buf.as_ptr(), buf.len());
+    }
 }
 
 unsafe fn emit_putfile_nak(

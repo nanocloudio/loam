@@ -26,25 +26,16 @@ loam/
 │   │   ├── loam_throughput_counter/  # counts resolved records per window
 │   │   ├── metadata_e2e_probe/   # single-shot metadata round trip
 │   │   ├── body_e2e_probe/       # single-shot body round trip
-│   │   ├── cache_manager/        # reserved name, stub body
-│   │   ├── io_scheduler/         # reserved name, stub body
+
 │   │   └── telemetry_agg/        # reserved name, stub body
 │   └── common/               # shared no_std source, split by storage tier
 │       ├── mechanics/        #   single-node fence classes; fluxor-only
 │       └── replicated/       #   quorum fence classes; may reach clustor
-├── src/                      # vocabulary only — no runtime
+├── src/                      # config vocabulary only — no runtime
 │   ├── lib.rs
-│   ├── core/                 # Config, Error, RuntimePlan
-│   ├── namespace.rs          # PathKey, NamespaceKind
-│   ├── object.rs             # ObjectId, ObjectDescriptor, ObjectPlacement
-│   ├── block.rs              # BlockClass, BlockVolume
+│   ├── core/                 # Config, Error
 │   ├── fluxor.rs             # FluxorTarget, FluxorGraphProfile
-│   ├── placement.rs          # NodeClass, StorageRole, PlacementPlan
-│   ├── raft.rs               # ClustorBinding descriptor
-│   ├── module_bindings.rs    # module → surface visibility table
-│   ├── storage/              # WritePlan, SurfaceDescriptor, AchievableFence
-│   ├── control/              # Tenant, RoutingEpoch
-│   └── ops/                  # HealthReport
+│   └── storage/              # AchievableFence
 ├── config/loam.toml          # the config `loam validate` / `loam plan` parse
 ├── tools/loam-cli/           # host crate: the loam CLI + loam-server daemon
 ├── tools/loam-client/        # host crate: client library for the admin surface
@@ -53,24 +44,21 @@ loam/
                               #   dependency's modules + source artefacts
 ```
 
-## Vocabulary, not runtime
+## Config vocabulary, not runtime
 
-`src/` holds types only. Anything that mutates state lives in a
-PIC. The vocabulary covers:
+`src/` holds the types `config/loam.toml` is written in, and
+nothing else. Anything that mutates state lives in a PIC:
 
-- **Identity** (`ObjectId`, `PathKey`, `BlockVolume`, `BlockClass`)
-- **Descriptor records** (`ObjectDescriptor`, `ObjectPlacement`,
-  `NamespaceBinding`, `NamespaceEntry`)
-- **Surface metadata** (`StorageSurface`, `AchievableFence`,
-  `WritePlan`, `SurfaceDescriptor`, `ModuleBinding`,
-  `MODULE_BINDINGS`)
-- **Target/profile enums** (`FluxorTarget`, `FluxorGraphProfile`,
-  `NodeClass`, `StorageRole`, `PlacementPlan`, `ClustorBinding`,
-  `ConsistencyMode`)
-- **Configuration + project errors** (`Config`, `RuntimePlan`,
-  `Error`, `Result`)
-- **Surface-agnostic records** (`Tenant`, `RoutingEpoch`,
-  `HealthReport`)
+- **Configuration + project errors** (`Config`, `Error`, `Result`)
+- **Target/profile enums** (`FluxorTarget`, `FluxorGraphProfile`)
+- **Declared fence intent** (`AchievableFence`)
+
+There is deliberately no module→surface table here. A module's
+surface is what its `manifest.toml` declares and its fence is what
+its dispatch returns, so a table in `src/` would be a second copy
+of both, free to drift from the thing it describes while still
+compiling. `loam surfaces --modules modules` reads the manifests
+instead.
 
 Fence + storage-handle types come from `fluxor-contracts` and are
 re-exported through the `prelude`.
@@ -101,13 +89,23 @@ the contracts are in [`durability.md`](durability.md).
 overwrite), the streaming form for anything past the 60 KiB
 single-shot cap (`PUT_FILE_OPEN` / `_CHUNK` / `_COMMIT` and
 `READ_FILE_RANGE`), and the raw body ops (`PUT_BODY`, `GET_BODY`,
-`PUT_BODY_KEYED`, `DELETE_BODY`). The router demuxes each to the
-right downstream PIC, runs a 3-stage state machine for the composed
+`PUT_BODY_KEYED`, `DELETE_BODY`), preceded where required by `AUTH`.
+The router demuxes each to the right downstream PIC, runs a 3-stage state machine for the composed
 `PUT_FILE`, and hosts the lifecycle sweep that reclaims orphaned body
 blobs and unbound object descriptors. The composed write's crash
 model — idempotent retry, unreachable intermediate state, and
 conservative reclamation, with the fault matrix behind it — is in
 [`durability.md`](durability.md).
+
+`AUTH` is connection-scoped, not per-request. The admin surface can
+bind, read and delete anything in any namespace, so the boundary
+that matters is who is on the far end of the socket, established
+once rather than re-argued per op. A unix socket is protected by its
+filesystem permissions; a TCP listener is not, so `loam-server`
+REFUSES `--admin-listen` without `--admin-token` rather than serving
+an anonymous surface off-box. The token is the one field an
+unauthenticated peer can make the server hold, which is why
+`MAX_TOKEN` is bounded low.
 
 For multi-client production deployments the `loam-server` binary in
 [`tools/loam-cli/`](../tools/loam-cli/) hosts the full graph and

@@ -43,6 +43,15 @@ pub mod sha256 {
     pub use super::sha256_impl::Sha256;
 }
 
+#[path = "../../../modules/common/mechanics/loam_change_wire.rs"]
+mod change_wire;
+
+#[path = "../../../modules/common/mechanics/loam_hash.rs"]
+mod hash;
+
+#[path = "../../../modules/common/mechanics/loam_limits.rs"]
+mod limits;
+
 #[path = "../../../modules/common/mechanics/reply_out.rs"]
 mod reply_out;
 
@@ -86,6 +95,20 @@ pub mod ns_body;
 
 // Object body wrapping (same pattern as pic.rs).
 pub mod obj_scope {
+    pub mod hash {
+        #[allow(
+            unused_imports,
+            reason = "shared #[path]-included surface; each scope uses a subset"
+        )]
+        pub use super::super::hash::*;
+    }
+    pub mod limits {
+        #[allow(
+            unused_imports,
+            reason = "shared #[path]-included surface; each scope uses a subset"
+        )]
+        pub use super::super::limits::*;
+    }
     pub mod reply_out {
         pub use super::super::reply_out::*;
     }
@@ -95,6 +118,20 @@ pub mod obj_scope {
         pub use super::super::obj_wire::*;
     }
     pub mod state {
+        pub mod limits {
+            #[allow(
+                unused_imports,
+                reason = "shared #[path]-included surface; each scope uses a subset"
+            )]
+            pub use super::super::limits::*;
+        }
+        pub mod hash {
+            #[allow(
+                unused_imports,
+                reason = "shared #[path]-included surface; each scope uses a subset"
+            )]
+            pub use super::super::hash::*;
+        }
         // Notional dir: tools/loam-cli/src/runtime/obj_scope/state/
         // — 6 levels up to workspace root.
         #[path = "../../../../../../modules/common/mechanics/object_pic_state.rs"]
@@ -115,6 +152,20 @@ pub use obj_scope::body as obj_body;
 
 // Body store body wrapping.
 pub mod body_store_scope {
+    pub mod hash {
+        #[allow(
+            unused_imports,
+            reason = "shared #[path]-included surface; each scope uses a subset"
+        )]
+        pub use super::super::hash::*;
+    }
+    pub mod limits {
+        #[allow(
+            unused_imports,
+            reason = "shared #[path]-included surface; each scope uses a subset"
+        )]
+        pub use super::super::limits::*;
+    }
     pub mod fs_names {
         pub use super::super::fs_names::*;
     }
@@ -139,12 +190,29 @@ pub mod body_store_scope {
 }
 pub use body_store_scope::body as body_store_body;
 
+#[path = "../../../modules/common/replicated/fanout_engine.rs"]
+mod fanout_engine;
+
 #[path = "../../../modules/common/replicated/loam_placement_wire.rs"]
 pub mod placement_wire;
 
 // body_fanout_router wrapping: needs `super::{SyscallTable,
 // body_wire, placement_wire, placement}`.
 pub mod fanout_scope {
+    pub mod limits {
+        #[allow(
+            unused_imports,
+            reason = "shared #[path]-included surface; each scope uses a subset"
+        )]
+        pub use super::super::limits::*;
+    }
+    pub mod fanout_engine {
+        #[allow(
+            unused_imports,
+            reason = "shared #[path]-included surface; each scope uses a subset"
+        )]
+        pub use super::super::fanout_engine::*;
+    }
     pub use super::abi::SyscallTable;
     pub mod body_wire {
         pub use super::super::body_wire::*;
@@ -167,6 +235,20 @@ pub use fanout_scope::body as fanout_body;
 // `super::admin` (admin wire), `super::ns_wire`, `super::body_wire`,
 // `super::obj_wire`, `super::SyscallTable`.
 pub mod admin_scope {
+    pub mod fanout_engine {
+        #[allow(
+            unused_imports,
+            reason = "shared #[path]-included surface; each scope uses a subset"
+        )]
+        pub use super::super::fanout_engine::*;
+    }
+    pub mod limits {
+        #[allow(
+            unused_imports,
+            reason = "shared #[path]-included surface; each scope uses a subset"
+        )]
+        pub use super::super::limits::*;
+    }
     pub use super::abi::SyscallTable;
     pub mod admin {
         pub use super::super::admin_wire::*;

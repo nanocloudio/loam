@@ -55,6 +55,8 @@ mode                = "strict"
 scripts = [
   "tools/ci/shadow_guard.sh",
   "tools/ci/tier_guard.sh",
+  "tools/ci/limit_guard.sh",
+  "tools/ci/profile_matrix.sh",
   "tools/e2e/s3_driven.sh",
   "tools/e2e/metadata_load.sh",
   "tools/e2e/composed_node.sh",

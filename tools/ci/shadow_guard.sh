@@ -4,7 +4,7 @@
 # the primary repo has zero files there — `cargo test --tests` (the
 # pic_* PIC harness suites) would pass vacuously and the s3_driven e2e
 # would have no graph to boot. Hard-fail instead. Wired as
-# `[ci.test] scripts` in fluxor.toml (CI phase 3.5).
+# `[ci.test] scripts` in fluxor.toml.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 fail=0

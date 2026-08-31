@@ -21,8 +21,6 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use loam::core::config::Config;
-use loam::core::runtime::RuntimePlan;
-use loam::module_bindings::{ModuleVisibility, MODULE_BINDINGS};
 use serde::Serialize;
 use std::io::Read;
 use std::path::PathBuf;
@@ -57,8 +55,12 @@ enum Commands {
         #[arg(short, long, default_value = "config/loam.toml")]
         config: PathBuf,
     },
-    /// Print the public surface module bindings.
-    Surfaces,
+    /// Print each module's declared storage surface, read from the
+    /// manifests themselves.
+    Surfaces {
+        #[arg(short, long, default_value = "modules")]
+        modules: PathBuf,
+    },
     /// Bind a namespace path to an ObjectId. Spins up
     /// namespace_router with `wal_path` for the apply.
     Bind {
@@ -151,7 +153,7 @@ fn run(cmd: Commands) -> Result<()> {
     match cmd {
         Commands::Validate { config } => cmd_validate(config),
         Commands::Plan { config } => cmd_plan(config),
-        Commands::Surfaces => cmd_surfaces(),
+        Commands::Surfaces { modules } => cmd_surfaces(modules),
         Commands::Bind {
             wal,
             namespace,
@@ -206,37 +208,92 @@ fn cmd_validate(config: PathBuf) -> Result<()> {
 }
 
 fn cmd_plan(config: PathBuf) -> Result<()> {
+    // What the config actually says, rather than a `RuntimePlan`
+    // wrapper whose placement was a hardcoded constant regardless of
+    // input — it reported `node_class: Host, roles: [All]` for every
+    // config ever passed to it, which is not a plan.
     let cfg = Config::load_from_path(&config)?;
-    let plan = RuntimePlan::from_config(&cfg);
     emit_ok(&serde_json::json!({
-        "node_id": plan.node_id,
-        "node_class": format!("{:?}", plan.placement.node_class),
-        "roles": plan.placement.roles.iter().map(|r| format!("{r:?}")).collect::<Vec<_>>(),
-        "colocate_metadata_and_data": plan.placement.colocate_metadata_and_data,
+        "node_id": cfg.storage.node_id,
+        "node_class": format!("{:?}", cfg.fluxor.target),
+        "module_profile": format!("{:?}", cfg.fluxor.module_profile),
+        "default_fence": cfg.storage.default_fence,
+        "namespace_shards": cfg.storage.namespace_shards,
+        "object_shards": cfg.storage.object_shards,
     }))
 }
 
-fn cmd_surfaces() -> Result<()> {
-    let bindings: Vec<_> = MODULE_BINDINGS
-        .iter()
-        .map(|b| match b.visibility {
-            ModuleVisibility::PublicSurface {
-                surface,
-                achievable,
-            } => serde_json::json!({
-                "module": b.module,
-                "visibility": "public",
-                "surface": surface.content_type(),
-                "achievable_fence": achievable,
-            }),
-            ModuleVisibility::Internal { rationale } => serde_json::json!({
-                "module": b.module,
-                "visibility": "internal",
-                "rationale": rationale,
-            }),
-        })
+/// Read every module's declared surface from `modules/app/*/manifest.toml`.
+///
+/// Read from the manifests rather than from a table in this crate. A
+/// hand-maintained table is free to name a module that does not exist
+/// or assert a fence stronger than the manifest claims, and nothing
+/// catches it. The manifest is the artefact fluxor's config gate
+/// validates and the loader acts on, so it is the only honest source.
+/// A module with no `provides` key is internal, and says so by omission
+/// rather than by a second table agreeing with the first.
+fn cmd_surfaces(modules: PathBuf) -> Result<()> {
+    let app = modules.join("app");
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&app)
+        .map_err(|e| anyhow!("reading {}: {e}", app.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
         .collect();
+    dirs.sort();
+
+    let mut bindings = Vec::new();
+    for dir in dirs {
+        let manifest = dir.join("manifest.toml");
+        let Ok(text) = std::fs::read_to_string(&manifest) else {
+            continue;
+        };
+        let name = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        match parse_provides(&text) {
+            Some(surfaces) => bindings.push(serde_json::json!({
+                "module": name,
+                "visibility": "public",
+                "surfaces": surfaces,
+            })),
+            None => bindings.push(serde_json::json!({
+                "module": name,
+                "visibility": "internal",
+            })),
+        }
+    }
     emit_ok(&serde_json::json!({ "bindings": bindings }))
+}
+
+/// Pull `provides = ["a", "b"]` out of a manifest. Deliberately a
+/// line scan rather than a toml dependency: the CLI needs one key
+/// from a file fluxor already validates, and a parser here would be a
+/// second opinion about a schema loam does not own.
+fn parse_provides(text: &str) -> Option<Vec<String>> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("provides") else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim();
+        let inner = rest.strip_prefix('[')?.strip_suffix(']')?;
+        let out: Vec<String> = inner
+            .split(',')
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        return (!out.is_empty()).then_some(out);
+    }
+    None
 }
 
 // ── PIC-driven commands ─────────────────────────────────────────

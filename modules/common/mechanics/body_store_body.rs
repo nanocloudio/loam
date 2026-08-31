@@ -19,15 +19,11 @@
 // content path, read to EOF, digest-verified, and the slot is
 // rehydrated. Content addressing makes the verification exact.
 
-const MAX_OPS_PER_STEP: u32 = 4;
 const READ_BUF: usize = super::wire::MAX_BODY + 64;
 const SCRATCH_OUT: usize = super::wire::MAX_BODY + 64;
 
 // Capacity profile — see namespace_pic_body.rs.
-#[cfg(target_os = "none")]
-pub const BODY_SLOTS: usize = 64;
-#[cfg(not(target_os = "none"))]
-pub const BODY_SLOTS: usize = 8192;
+pub use super::limits::BODY_SLOTS;
 pub const ROOT_DIR_BUF: usize = 192;
 
 // fluxor `fs` opcodes — duplicated to avoid pulling in another
@@ -85,7 +81,7 @@ pub struct DiskSlot {
 /// `<root>/.wip_<wid>` with an incremental hash; COMMIT verifies the
 /// declared digest, then publishes under the provider's
 /// [`PublishTier`] — see `handle_wcommit`.
-pub const WRITE_SESSIONS: usize = 4;
+pub use super::limits::WRITE_SESSIONS;
 /// Sessions untouched this many ticks are reaped (client died
 /// mid-stream) — temp file unlinked, slot freed.
 const SESSION_REAP_TICKS: u32 = 120_000;
@@ -199,7 +195,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     }
 
     let mut handled: u32 = 0;
-    while handled < MAX_OPS_PER_STEP {
+    while handled < super::limits::OPS_PER_STEP {
         if s.resp_len != 0 {
             break;
         }
@@ -923,13 +919,7 @@ unsafe fn handle_scan(s: &mut ModuleState, bytes: &[u8]) {
     s.scans = s.scans.wrapping_add(1);
 }
 
-fn hex_val(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        _ => None,
-    }
-}
+pub use super::hash::hex_val;
 
 /// Parse a `.wip_<n>` temporary filename back into its session id.
 fn wip_id_from_name(name: &[u8]) -> Option<usize> {

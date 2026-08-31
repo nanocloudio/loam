@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Loam Authors <eng@nanocloud.local>"]
-description = "Host dev CLI for Loam — links the loam library directly. The fluxor-native client over an admin channel is a follow-up (see .context/migration/PHASE_4_CLI_MIGRATION.md)."
+description = "Host CLI and server daemon for Loam; links the loam library directly."
 
 [[bin]]
 name = "loam"
@@ -14,10 +14,17 @@ path = "src/main.rs"
 name = "loam-server"
 path = "src/server.rs"
 
+[[bin]]
+name = "loam-nbd"
+path = "src/nbd_main.rs"
+
 [lints]
 workspace = true
 
 [dependencies]
+# Not dev-only any more: `loam-nbd` is a shipped binary built on the
+# client crate, which is exactly the consumer the client exists for.
+loam-client = { path = "../loam-client" }
 tempfile = "3.23.0"
 anyhow = "1.0.95"
 clap = { version = "4.5.20", features = ["derive"] }
@@ -27,4 +34,3 @@ loam = { path = "../.." }
 
 [dev-dependencies]
 tempfile = "3.23.0"
-loam-client = { path = "../loam-client" }

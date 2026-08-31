@@ -16,7 +16,8 @@
 //
 // Params (TLV):
 //   1  inject_period   ticks between batches (default 1 = every tick)
-//   2  batch_per_step  records per batch, capped by MAX_OPS_PER_STEP
+//   2  batch_per_step  records per batch, capped by
+//                     LOAD_GEN_OPS_PER_STEP
 //   3  total           records to offer, 0 = unbounded (default 0)
 //   4  warmup_ticks    ticks to wait before the first batch
 //   5  report_ticks    ticks between report lines (default 1000)
@@ -34,6 +35,13 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 #[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[path = "../../common/replicated/load_helpers.rs"]
+mod load_helpers;
+use load_helpers::{copy_tag, write_hex_u32};
+
+#[path = "../../common/mechanics/loam_limits.rs"]
+mod limits;
+
 #[path = "../../common/mechanics/loam_wire.rs"]
 mod wire;
 
@@ -43,7 +51,13 @@ mod decision;
 
 /// Ceiling on records emitted in one step, whatever `batch_per_step`
 /// asks for. The step stays bounded so the scheduler keeps its budget.
-const MAX_OPS_PER_STEP: u32 = 8;
+///
+/// Deliberately NOT `limits::OPS_PER_STEP`: this module's job is to
+/// outrun the plane it measures, so pacing it with the plane would
+/// make the generator the thing under test. Fixed at 8 on every
+/// profile for the same reason — a load figure that moved with the
+/// profile would not be comparable across them.
+const LOAD_GEN_OPS_PER_STEP: u32 = 8;
 
 const NAMESPACE_ROOT: &[u8] = b"acme";
 
@@ -183,28 +197,7 @@ unsafe fn emit_report(s: &ModuleState, syscalls: &SyscallTable) {
     dev_log(syscalls, 3, line.as_ptr(), pos);
 }
 
-fn copy_tag(dst: &mut [u8], tag: &[u8]) -> usize {
-    let mut i = 0usize;
-    while i < tag.len() && i < dst.len() {
-        dst[i] = tag[i];
-        i += 1;
-    }
-    i
-}
 
-fn write_hex_u32(dst: &mut [u8], value: u32) -> usize {
-    if dst.len() < 8 {
-        return 0;
-    }
-    let mut n = value;
-    let mut i = 8usize;
-    while i > 0 {
-        i -= 1;
-        dst[i] = HEX[(n & 0xF) as usize];
-        n >>= 4;
-    }
-    8
-}
 
 /// Write `value` as `width` lowercase hex digits ending at `end`.
 fn write_hex(dst: &mut [u8], end: usize, width: usize, value: u32) {
@@ -254,8 +247,8 @@ pub extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
         }
 
         let mut budget = s.batch_per_step;
-        if budget > MAX_OPS_PER_STEP {
-            budget = MAX_OPS_PER_STEP;
+        if budget > LOAD_GEN_OPS_PER_STEP {
+            budget = LOAD_GEN_OPS_PER_STEP;
         }
 
         let mut done: u32 = 0;

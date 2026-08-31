@@ -39,20 +39,17 @@
 //          under-replication is found and healed without waiting
 //          for a client read.
 //
-// Bounded step contract: at most MAX_OPS_PER_STEP upstream
-// requests + MAX_OPS_PER_STEP responses-per-target are handled
+// Bounded step contract: at most OPS_PER_STEP upstream
+// requests + OPS_PER_STEP responses-per-target are handled
 // per `module_step` call. Per-request join state lives in a fixed-
-// size JOIN_CAP table; join slots carry a generation stamp so a
+// size super::limits::ROUTER_JOINS table; join slots carry a generation stamp so a
 // late response for a freed-and-reused slot is dropped instead of
 // misattributed.
 
-const MAX_OPS_PER_STEP: u32 = 4;
 // Buffers derive from the wire cap so a max-size body can't be
 // truncated on the way through the router (body_store idiom).
 const READ_BUF: usize = super::body_wire::MAX_BODY + 64;
 const SCRATCH: usize = super::body_wire::MAX_BODY + 64;
-const PENDING_CAP: usize = 64;
-const JOIN_CAP: usize = 32;
 const DEFAULT_REPLICA_COUNT: u8 = 1;
 
 const KIND_CLIENT: u8 = 0;
@@ -76,14 +73,6 @@ use super::placement_wire::MAX_FLEET;
 /// Per-target FIFO entry: which join slot (and which incarnation of
 /// it) this downstream response is expected to satisfy. Channels
 /// are FIFO so the per-target dequeue head matches response order.
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-pub struct PendingTarget {
-    pub in_use: u8,
-    pub join_idx: u16,
-    pub join_gen: u16,
-}
-
 /// Aggregated per-upstream-request state.
 ///
 /// PUT: `need` replicas fanned, `ack`/`fail` counted, first OK
@@ -119,6 +108,13 @@ pub struct JoinSlot {
     /// PUT: digest from the first replica OK. GET/HEAD: the
     /// requested digest (needed to re-encode fallback requests).
     pub digest: [u8; super::body_wire::DIGEST_LEN],
+    /// The blob this join is about is KEYED — a block extent or an
+    /// EC shard — so `digest` above is its KEY, not a content hash,
+    /// and a repair must re-PUT it under that key.
+    ///
+    /// Carried through probe → fetch → repair because the repair is
+    /// where it matters and the scan is where it is known.
+    pub keyed: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -156,10 +152,12 @@ pub struct ModuleState {
     /// Per-target FIFO ring (channels are FIFO; entry order = response
     /// order). `head/tail/pending` are parallel arrays indexed by
     /// target slot.
-    pub per_target_head: [u32; MAX_FLEET],
-    pub per_target_tail: [u32; MAX_FLEET],
-    pub per_target_pending: [[PendingTarget; PENDING_CAP]; MAX_FLEET],
-    pub joins: [JoinSlot; JOIN_CAP],
+    /// Per-member dispatch FIFOs — the shared engine
+    /// (`replicated/fanout_engine.rs`). Both routers fan one upstream
+    /// request to several members and rejoin by arrival order; that
+    /// queue is the seam where they genuinely agree.
+    pub queues: super::fanout_engine::TargetQueues<MAX_FLEET, { super::limits::ROUTER_PENDING }>,
+    pub joins: [JoinSlot; super::limits::ROUTER_JOINS],
     pub join_gen: u16,
     /// Upstream chunked streams fanned to the replica set:
     /// stream sid ↔ per-member store wids. All-must-succeed at
@@ -342,6 +340,7 @@ unsafe fn alloc_join(s: &mut ModuleState) -> Option<u16> {
                 repair_targets: [0u8; MAX_FLEET],
                 targets: [0u8; MAX_FLEET],
                 digest: [0u8; super::body_wire::DIGEST_LEN],
+                keyed: 0,
             };
             return Some(i as u16);
         }
@@ -353,51 +352,6 @@ unsafe fn free_join(s: &mut ModuleState, idx: u16) {
     if (idx as usize) < s.joins.len() {
         s.joins[idx as usize].in_use = 0;
     }
-}
-
-unsafe fn enqueue_target(
-    s: &mut ModuleState,
-    target_slot: u8,
-    join_idx: u16,
-    join_gen: u16,
-) -> bool {
-    let t = target_slot as usize;
-    let next = (s.per_target_tail[t].wrapping_add(1)) % PENDING_CAP as u32;
-    if next == s.per_target_head[t] {
-        return false;
-    }
-    s.per_target_pending[t][s.per_target_tail[t] as usize] = PendingTarget {
-        in_use: 1,
-        join_idx,
-        join_gen,
-    };
-    s.per_target_tail[t] = next;
-    true
-}
-
-/// Undo the most recent `enqueue_target` for this target (the
-/// downstream write failed, so no response will ever arrive).
-/// Steps the TAIL back — popping the head would evict someone
-/// else's in-flight entry and desync the whole FIFO.
-unsafe fn unenqueue_tail(s: &mut ModuleState, target_slot: u8) {
-    let t = target_slot as usize;
-    if s.per_target_head[t] == s.per_target_tail[t] {
-        return;
-    }
-    let prev = (s.per_target_tail[t].wrapping_add(PENDING_CAP as u32 - 1)) % PENDING_CAP as u32;
-    s.per_target_pending[t][prev as usize].in_use = 0;
-    s.per_target_tail[t] = prev;
-}
-
-unsafe fn dequeue_target(s: &mut ModuleState, target_slot: u8) -> Option<PendingTarget> {
-    let t = target_slot as usize;
-    if s.per_target_head[t] == s.per_target_tail[t] {
-        return None;
-    }
-    let entry = s.per_target_pending[t][s.per_target_head[t] as usize];
-    s.per_target_pending[t][s.per_target_head[t] as usize].in_use = 0;
-    s.per_target_head[t] = (s.per_target_head[t].wrapping_add(1)) % PENDING_CAP as u32;
-    Some(entry)
 }
 
 pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
@@ -415,7 +369,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     // ── 1. Drain FleetEpoch updates. ────────────────────────────
     if s.fleet_in_chan >= 0 {
         let mut handled: u32 = 0;
-        while handled < MAX_OPS_PER_STEP {
+        while handled < super::limits::OPS_PER_STEP {
             let mut buf = [0u8; 64];
             let n = (syscalls.channel_read)(s.fleet_in_chan, buf.as_mut_ptr(), buf.len());
             if n <= 0 {
@@ -447,7 +401,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
 
     // ── 3. Drain upstream body requests, fan out / route. ───────
     let mut handled: u32 = 0;
-    while handled < MAX_OPS_PER_STEP {
+    while handled < super::limits::OPS_PER_STEP {
         let mut buf = [0u8; READ_BUF];
         let n = (syscalls.channel_read)(s.admin_in_chan, buf.as_mut_ptr(), buf.len());
         if n <= 0 {
@@ -486,17 +440,17 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
             continue;
         }
         let mut drained: u32 = 0;
-        while drained < MAX_OPS_PER_STEP {
+        while drained < super::limits::OPS_PER_STEP {
             let mut buf = [0u8; READ_BUF];
             let n = (syscalls.channel_read)(resp_chan, buf.as_mut_ptr(), buf.len());
             if n <= 0 {
                 break;
             }
             let resp = &buf[..n as usize];
-            match dequeue_target(s, t as u8) {
+            match s.queues.dequeue(t as u8) {
                 Some(pending) => {
                     let ji = pending.join_idx as usize;
-                    if ji >= JOIN_CAP
+                    if ji >= super::limits::ROUTER_JOINS
                         || s.joins[ji].in_use == 0
                         || s.joins[ji].gen != pending.join_gen
                     {
@@ -675,12 +629,12 @@ unsafe fn dispatch_to_target(
     if req_chan < 0 {
         return false;
     }
-    if !enqueue_target(s, member_id, join_idx, join_gen) {
+    if !s.queues.enqueue(member_id, join_idx, join_gen) {
         return false;
     }
     let wrote = (syscalls.channel_write)(req_chan, s.scratch.as_ptr(), req_n);
     if wrote < 0 || (wrote as usize) != req_n {
-        unenqueue_tail(s, member_id);
+        s.queues.unenqueue_tail(member_id);
         return false;
     }
     s.fanned_out = s.fanned_out.wrapping_add(1);
@@ -1158,7 +1112,8 @@ unsafe fn apply_join_response(
             let j = s.joins[join_idx as usize];
             free_join(s, join_idx);
             let members = j.repair_targets;
-            spawn_repair_puts(s, syscalls, &members[..j.repair_count as usize], resp);
+            let key = if j.keyed != 0 { Some(&j.digest) } else { None };
+            spawn_repair_puts(s, syscalls, &members[..j.repair_count as usize], resp, key);
         } else {
             s.joins[join_idx as usize].attempt = s.joins[join_idx as usize].attempt.wrapping_add(1);
             advance_read(s, syscalls, join_idx);
@@ -1329,7 +1284,23 @@ unsafe fn apply_join_response(
                             cnt += 1;
                         }
                     }
-                    spawn_repair_puts(s, syscalls, &members[..cnt], resp);
+                    // Read repair on the CLIENT path stays
+                    // content-addressed, and deliberately so: a GET
+                    // is `[op][32-byte name]` whether that name is a
+                    // content digest or an extent key, so the router
+                    // cannot tell them apart here. `j.keyed` is only
+                    // ever set by the scrub, which learns it from
+                    // `OP_SCAN`.
+                    //
+                    // The consequence is bounded and self-clearing: a
+                    // read-repair of a keyed blob writes one extra
+                    // copy under its content hash. That copy is NOT
+                    // keyed, so the orphan sweep reclaims it, and the
+                    // keyed blob itself is healed by the scrub, which
+                    // does know. A leak that collects itself beats a
+                    // guess about which kind of name this is.
+                    let key = if j.keyed != 0 { Some(&j.digest) } else { None };
+                    spawn_repair_puts(s, syscalls, &members[..cnt], resp, key);
                 }
             } else {
                 {
@@ -1396,14 +1367,30 @@ unsafe fn spawn_repair_puts(
     syscalls: &super::SyscallTable,
     members: &[u8],
     get_resp: &[u8],
+    keyed: Option<&[u8; super::body_wire::DIGEST_LEN]>,
 ) {
     let body = match super::body_wire::decode_get_resp(get_resp) {
         Ok(b) => b,
         Err(_) => return,
     };
-    let req_n = match super::body_wire::encode_put_req(&mut s.scratch, body) {
-        Ok(n) => n,
-        Err(_) => return,
+    // A keyed blob is re-PUT under its KEY. Re-putting it by content
+    // would store it under a name nothing looks it up by, which is a
+    // repair that silently does not repair — so the key travels with
+    // the join rather than being inferred here.
+    let req_n = match keyed {
+        Some(key) => match super::body_wire::encode_put_keyed_req(&mut s.scratch, key, body) {
+            Ok(n) => n,
+            Err(_) => return,
+        },
+        None => match super::body_wire::encode_put_req(&mut s.scratch, body) {
+            Ok(n) => n,
+            Err(_) => return,
+        },
+    };
+    let repair_op = if keyed.is_some() {
+        super::body_wire::OP_PUT_KEYED
+    } else {
+        super::body_wire::OP_PUT
     };
     for &member_id in members {
         let join_idx = match alloc_join(s) {
@@ -1416,7 +1403,7 @@ unsafe fn spawn_repair_puts(
         let gen = {
             let j = &mut s.joins[join_idx as usize];
             j.kind = KIND_REPAIR;
-            j.op = super::body_wire::OP_PUT;
+            j.op = repair_op;
             j.need = 1;
             j.gen
         };
@@ -1553,14 +1540,17 @@ unsafe fn scrub_apply_scan(
         scrub_next_target(s);
     }
     for (i, d) in digests.iter().take(count).enumerate() {
-        // Keyed blobs (extents, EC shards) are not this scrub's to
-        // heal: the repair re-put would store them under a CONTENT
-        // hash, not their key. Extent replica heal is the tracked
-        // follow-up; EC shard heal is the EC router's scrub.
-        if keyed[i] != 0 {
-            continue;
-        }
-        scrub_spawn_probe(s, syscalls, d);
+        // Keyed blobs — block extents and EC shards — are scrubbed
+        // like any other. `keyed` has to travel with the join for
+        // that to work: without it the repair re-PUT would store the
+        // blob under a content hash instead of its key, which is why
+        // the flag is carried rather than recomputed. It is also the
+        // difference between the block data path having
+        // replication-level repair and having none.
+        //
+        // Placement needs no special case: a keyed blob ranks by its
+        // KEY, and `rank_targets` hashes whatever it is given.
+        scrub_spawn_probe(s, syscalls, d, keyed[i] != 0);
     }
 }
 
@@ -1569,6 +1559,7 @@ unsafe fn scrub_spawn_probe(
     s: &mut ModuleState,
     syscalls: &super::SyscallTable,
     digest: &[u8; super::body_wire::DIGEST_LEN],
+    keyed: bool,
 ) {
     let mut targets_buf = [0u8; MAX_FLEET];
     let chosen = rank_targets(s, digest, &mut targets_buf);
@@ -1588,6 +1579,7 @@ unsafe fn scrub_spawn_probe(
         j.target_count = chosen as u8;
         j.targets[..chosen].copy_from_slice(&targets_buf[..chosen]);
         j.digest = *digest;
+        j.keyed = u8::from(keyed);
         j.gen
     };
     s.scratch[0] = super::body_wire::OP_HEAD;
@@ -1667,6 +1659,9 @@ unsafe fn scrub_spawn_fetch(s: &mut ModuleState, syscalls: &super::SyscallTable,
         j.op = super::body_wire::OP_GET;
         j.need = 1;
         j.digest = probe.digest;
+        // Carried onward: the repair at the end of this chain is
+        // where it decides between PUT and PUT_KEYED.
+        j.keyed = probe.keyed;
         let mut cnt = 0usize;
         for i in 0..probe.target_count {
             if probe.present_mask & (1u16 << i) != 0 {

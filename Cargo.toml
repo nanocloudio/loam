@@ -18,6 +18,14 @@ default-members = [".", "tools/loam-cli", "tools/loam-client"]
 version = "0.0.1"
 
 [workspace.lints.rust]
+# `loam_profile` is loam's capacity-profile selector — an explicit
+# input a build (or the fluxor pack step) sets, rather than the build
+# target standing in for the deployment. Declared here so rustc checks
+# the VALUES too: a `--cfg loam_profile="sever"` typo is then a build
+# warning instead of a silent fall-through to the target default.
+unexpected_cfgs = { level = "warn", check-cfg = [
+  'cfg(loam_profile, values("minimal", "embedded", "node", "server"))',
+] }
 
 [workspace.lints.clippy]
 # Loam's PIC discipline conflicts with these style lints by DESIGN:
@@ -40,12 +48,9 @@ workspace = true
 name = "loam"
 path = "src/lib.rs"
 
-# The host runtime previously here (`LoamInstance`,
-# `body_provider`, per-surface stores, in-process Clustor proxy)
-# was deleted in the fluxor-native sunset. All runtime logic now
-# lives in the PIC modules under `modules/`. The legacy host CLI
-# was replaced by `tools/loam-cli/` which drives PIC bodies
-# in-process.
+# This library is configuration vocabulary only — no runtime. Every
+# piece of runtime logic lives in the PIC modules under `modules/`,
+# and `tools/loam-cli/` drives those PIC bodies in-process.
 
 [features]
 default = ["std", "serde"]

@@ -20,6 +20,12 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 
 #[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[path = "../../common/mechanics/loam_limits.rs"]
+mod limits;
+
+#[path = "../../common/replicated/fanout_engine.rs"]
+mod fanout_engine;
+
 #[path = "../../common/replicated/loam_placement_wire.rs"]
 mod placement_wire;
 

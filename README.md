@@ -87,9 +87,9 @@ is for.
 
 | Module | Surface | What it does |
 |---|---|---|
-| `namespace_router` | `storage.namespace` | Path bindings — BIND / RENAME / UNBIND / LOOKUP / LIST, WAL-backed over a compacted snapshot file |
-| `object_index` | `storage.object` | Object descriptors — OBJ_PUT / UPDATE / REMOVE / GET, WAL-backed |
-| `block_allocator` | `storage.block` | Block volume metadata, WAL-backed |
+| `namespace_router` | `storage.namespace` | Path bindings — BIND / RENAME / UNBIND / LOOKUP / LIST, WAL-backed over a compacted snapshot file. The graph's one registered provider: it answers the canonical surface by dispatch, including `SUBSCRIBE` / `CHANGES`, which is what a level-triggered consumer reconciles against. `LIST` is served on the channel wire rather than by dispatch, being cursor-paged |
+| `object_index` | — (internal) | Object descriptors — OBJ_PUT / UPDATE / REMOVE / GET, WAL-backed. Declares no surface: descriptors are not object bytes |
+| `block_allocator` | — (internal) | Block volume metadata, WAL-backed. Declares no surface: volume accounting is not a block device, and `storage.block` is fluxor's `sd`/`nvme` |
 | `raft_metadata_client` | — (internal) | Proposes metadata decisions through a replica group; single and replicated modes |
 | `clustor_bridge` | — (internal) | Carries loam decision records across the replica group's channel envelope |
 | `body_store` | — (internal) | Content-addressed blobs on disk, with streamed writes and keyed extents |
@@ -103,9 +103,11 @@ is for.
 | `metadata_e2e_probe` | — (probe) | Single-shot metadata round trip |
 | `body_e2e_probe` | — (probe) | Single-shot body round trip |
 
-`cache_manager`, `io_scheduler` and `telemetry_agg` are reserved
-names carrying the stub step body — they hold their place in a graph
-and do nothing else.
+`telemetry_agg` is a reserved name carrying the stub step body — it
+holds its place in a graph and does nothing else, pending the
+metrics and readiness surface. `cache_manager` and `io_scheduler`
+were the same and were deleted: a name reserved for a year is a cost
+paid by every reader.
 
 ## CLI — two modes
 
@@ -117,7 +119,7 @@ build` leaves the binaries under `target/debug/`.
 ```sh
 loam validate --config config/loam.toml
 loam plan     --config config/loam.toml
-loam surfaces
+loam surfaces --modules modules   # reads modules/app/*/manifest.toml
 loam bind        --wal data/ns.wal acme /users/alice sha256:cafe
 loam read        --wal data/ns.wal acme /users/alice
 loam put-body    --body-root data/bodies - <my-file.bin

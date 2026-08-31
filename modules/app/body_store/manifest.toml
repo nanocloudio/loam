@@ -12,8 +12,8 @@ hardware_targets = ["bcm2712"]
 
 # Content-addressed object body store. Bodies are keyed by their
 # SHA-256 digest; the PIC exposes channel-based put/get/head/
-# delete (see modules/common/mechanics/loam_body_wire.rs). DISK-BACKED
-# (Phase 5): bodies live at <root_dir>/<hex(sha256)>, the in-arena
+# delete (see modules/common/mechanics/loam_body_wire.rs). DISK-BACKED:
+# bodies live at <root_dir>/<hex(sha256)>, the in-arena
 # slot table is a cache/index, GET falls back to disk with digest
 # verification (restart-safe), DELETE unlinks the file.
 
@@ -32,4 +32,4 @@ requires_contract = "fs"
 access = "write"
 
 [observability]
-exempt = "in-arena state counters (ops/errors/scrub tallies) readable by the host harness; typed MSG_METRIC_SAMPLE emission is tracked RFC 0004 polish"
+exempt = "in-arena state counters (ops/errors/scrub tallies) readable by the host harness; typed MSG_METRIC_SAMPLE emission is not wired yet"

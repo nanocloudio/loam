@@ -27,11 +27,11 @@
 # told. Run it above capacity deliberately to exercise that path; the
 # default stays under it so the gate also proves binds land.
 #
-# This gate also stands in for something no host test can reach. The
-# fault that held P1.1 up was a module that passed every host test and
-# faulted on the first record once loaded as a module — position-
-# dependent code the linker resolved to a fixed address. Only a real
-# graph runs a module the way a module is run.
+# This gate also stands in for something no host test can reach: a
+# module can pass every host test and fault on its first record once
+# loaded as a module, when position-dependent code leaves an address
+# the linker resolved for a different mapping. Only a real graph runs
+# a module the way a module is run.
 #
 # Usage: tools/e2e/composed_node.sh [total] [inject_period] [batch]
 set -euo pipefail

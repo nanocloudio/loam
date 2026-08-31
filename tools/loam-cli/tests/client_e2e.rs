@@ -214,3 +214,573 @@ fn block_volume_lifecycle() {
     let key0 = loam_client::extent_wire::derive_extent_key(&vol.desc.volume_id, 0);
     assert_eq!(c.get_body(&key0).expect("extent gone"), None);
 }
+
+// ── Admin authentication ──────────────────────────────────────────
+//
+// The admin surface can bind, read and delete anything in any
+// namespace. Until these tests existed it had no authentication of
+// any kind, which is precisely why `loam-client` had no TCP
+// transport: exposing that off-box would have been worse than having
+// no remote client at all. Both halves are checked here — that a
+// configured server refuses the unauthenticated, and that it still
+// serves the authenticated.
+
+fn spawn_server_with_token(
+    socket: &std::path::Path,
+    dir: &std::path::Path,
+    token_file: &std::path::Path,
+) -> ServerGuard {
+    let mut cmd = Command::new(server_bin());
+    cmd.args([
+        "--socket",
+        socket.to_str().unwrap(),
+        "--ns-wal",
+        dir.join("ns.wal").to_str().unwrap(),
+        "--obj-wal",
+        dir.join("obj.wal").to_str().unwrap(),
+        "--fleet",
+        &format!("dir:{}", dir.join("bodies").display()),
+        "--admin-token",
+        token_file.to_str().unwrap(),
+        "--tick-us",
+        "1000",
+    ]);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    let child = cmd.spawn().expect("spawn loam-server");
+    let started = Instant::now();
+    while !socket.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "loam-server didn't open its socket within 5s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    ServerGuard(child)
+}
+
+#[test]
+fn an_authenticated_client_is_served_normally() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("admin.sock");
+    let tokf = dir.path().join("token");
+    std::fs::write(&tokf, "s3cr3t-admin-token\n").unwrap();
+    let _g = spawn_server_with_token(&sock, dir.path(), &tokf);
+
+    let mut c = LoamClient::connect(&sock).expect("connect");
+    c.authenticate(b"s3cr3t-admin-token")
+        .expect("the configured token is accepted");
+
+    // Trailing whitespace in the file is trimmed, so the secret is
+    // what the operator typed, not what their editor added.
+    let digest = c
+        .put_file(b"tenant", b"/hello.txt", 1, b"hi")
+        .expect("an authenticated client can write");
+    assert_eq!(digest.len(), 32);
+    assert_eq!(
+        c.get_file(b"tenant", b"/hello.txt").unwrap().as_deref(),
+        Some(&b"hi"[..]),
+        "and read back"
+    );
+}
+
+#[test]
+fn an_unauthenticated_client_is_refused_and_disconnected() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("admin.sock");
+    let tokf = dir.path().join("token");
+    std::fs::write(&tokf, "s3cr3t-admin-token").unwrap();
+    let _g = spawn_server_with_token(&sock, dir.path(), &tokf);
+
+    // Skipping authenticate() entirely: the very first op is refused.
+    let mut c = LoamClient::connect(&sock).expect("connect");
+    let err = c
+        .put_file(b"tenant", b"/nope.txt", 1, b"x")
+        .expect_err("an unauthenticated write must not succeed");
+    // The server closes the connection rather than answering, so the
+    // client sees the close — which is the point: there is no second
+    // guess on this connection.
+    assert!(
+        matches!(err, ClientError::Io(_) | ClientError::Protocol(_)),
+        "expected a closed connection, got {err:?}"
+    );
+}
+
+#[test]
+fn a_wrong_token_is_refused_and_the_connection_is_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("admin.sock");
+    let tokf = dir.path().join("token");
+    std::fs::write(&tokf, "correct-horse").unwrap();
+    let _g = spawn_server_with_token(&sock, dir.path(), &tokf);
+
+    let mut c = LoamClient::connect(&sock).expect("connect");
+    let err = c
+        .authenticate(b"battery-staple")
+        .expect_err("a wrong token must be refused");
+    assert!(
+        matches!(err, ClientError::Unauthenticated),
+        "expected Unauthenticated, got {err:?}"
+    );
+
+    // The connection is spent: guessing is bounded to one attempt per
+    // connect, so a second try on this socket cannot succeed either.
+    assert!(
+        c.authenticate(b"correct-horse").is_err(),
+        "a refused connection is closed, not left open to guess again"
+    );
+
+    // A fresh connection with the right token works, which proves the
+    // refusal was about the token and not about the server.
+    let mut c2 = LoamClient::connect(&sock).expect("reconnect");
+    c2.authenticate(b"correct-horse")
+        .expect("the correct token authenticates on a new connection");
+}
+
+#[test]
+fn an_anonymous_server_still_serves_without_a_token() {
+    // No --admin-token: the surface is anonymous, as it was before
+    // D-3. This is the compatibility that matters — every existing
+    // graph and script keeps working — and the server says so on
+    // stderr rather than leaving it to be discovered.
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("admin.sock");
+    let _g = spawn_server(&sock, dir.path());
+    let mut c = LoamClient::connect(&sock).expect("connect");
+    c.put_file(b"tenant", b"/anon.txt", 1, b"ok")
+        .expect("an anonymous server serves an unauthenticated client");
+}
+
+#[test]
+fn the_token_comparison_is_length_safe() {
+    // `tokens_match` is the constant-time comparison the server uses.
+    // A prefix must not authenticate, an empty token must never
+    // match, and equal-length equality must still work.
+    use loam_client::admin_wire::tokens_match;
+    assert!(tokens_match(b"abc123", b"abc123"));
+    assert!(!tokens_match(b"abc", b"abc123"), "a prefix is not a match");
+    assert!(!tokens_match(b"abc123", b"abc"), "nor the other way");
+    assert!(!tokens_match(b"", b""), "an empty token never matches");
+    assert!(!tokens_match(b"", b"abc"));
+    assert!(!tokens_match(b"abc124", b"abc123"), "last byte differs");
+    assert!(!tokens_match(b"zbc123", b"abc123"), "first byte differs");
+}
+
+// ── Snapshots, clones and portable export ─────────────────────────
+
+#[test]
+fn a_snapshot_freezes_the_namespace_and_survives_source_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("admin.sock");
+    let _g = spawn_server(&sock, dir.path());
+    let mut c = LoamClient::connect(&sock).expect("connect");
+
+    c.put_file(b"live", b"/a.txt", 1, b"alpha").unwrap();
+    c.put_file(b"live", b"/b.txt", 1, b"bravo").unwrap();
+
+    let manifest = c.snapshot_create(b"live", b"snap1").expect("snapshot");
+    let (root, count) = loam_client::manifest_wire::peek(&manifest).unwrap();
+    assert_eq!(root, b"live", "the manifest records what it was taken from");
+    assert_eq!(count, 2);
+
+    // Move the live namespace on: overwrite one, delete the other.
+    c.put_file(b"live", b"/a.txt", 2, b"ALPHA-v2").unwrap();
+    assert!(c.delete_file(b"live", b"/b.txt").unwrap());
+
+    // The snapshot is unmoved — it is bindings onto the ORIGINAL
+    // content digests, and content-addressed bodies do not change
+    // under you.
+    assert_eq!(
+        c.get_file(b"snap1", b"/a.txt").unwrap().as_deref(),
+        Some(&b"alpha"[..]),
+        "the snapshot still holds the pre-overwrite bytes"
+    );
+    assert_eq!(
+        c.get_file(b"snap1", b"/b.txt").unwrap().as_deref(),
+        Some(&b"bravo"[..]),
+        "and the deleted file's body is still reachable through it — \
+         which is the whole point of pinning by binding"
+    );
+    // Meanwhile the live namespace moved.
+    assert_eq!(
+        c.get_file(b"live", b"/a.txt").unwrap().as_deref(),
+        Some(&b"ALPHA-v2"[..])
+    );
+    assert!(c.get_file(b"live", b"/b.txt").unwrap().is_none());
+}
+
+#[test]
+fn a_clone_moves_no_bytes_and_is_independently_writable() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("admin.sock");
+    let _g = spawn_server(&sock, dir.path());
+    let mut c = LoamClient::connect(&sock).expect("connect");
+
+    c.put_file(b"src", b"/one", 1, b"shared-content").unwrap();
+    c.put_file(b"src", b"/two", 1, b"also-shared").unwrap();
+    let manifest = c.snapshot_create(b"src", b"snapshot").unwrap();
+
+    // Restoring into a fresh root is a clone: metadata only.
+    let n = c.snapshot_restore(&manifest, b"clone").expect("restore");
+    assert_eq!(n, 2);
+    assert_eq!(
+        c.get_file(b"clone", b"/one").unwrap().as_deref(),
+        Some(&b"shared-content"[..])
+    );
+
+    // The clone is its own namespace: writing it does not touch the
+    // source, because a bind is a name and the bodies are immutable.
+    c.put_file(b"clone", b"/one", 2, b"diverged").unwrap();
+    assert_eq!(
+        c.get_file(b"clone", b"/one").unwrap().as_deref(),
+        Some(&b"diverged"[..])
+    );
+    assert_eq!(
+        c.get_file(b"src", b"/one").unwrap().as_deref(),
+        Some(&b"shared-content"[..]),
+        "the source is untouched by a write to its clone"
+    );
+}
+
+#[test]
+fn deleting_a_snapshot_drops_its_bindings_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("admin.sock");
+    let _g = spawn_server(&sock, dir.path());
+    let mut c = LoamClient::connect(&sock).expect("connect");
+
+    c.put_file(b"live", b"/keep", 1, b"still-referenced")
+        .unwrap();
+    let _ = c.snapshot_create(b"live", b"snap").unwrap();
+    assert_eq!(c.snapshot_delete(b"snap").unwrap(), 1);
+
+    assert!(
+        c.get_file(b"snap", b"/keep").unwrap().is_none(),
+        "the snapshot's bindings are gone"
+    );
+    assert_eq!(
+        c.get_file(b"live", b"/keep").unwrap().as_deref(),
+        Some(&b"still-referenced"[..]),
+        "but the body is untouched — it is still named by the live \
+         namespace, and reclaiming it is the orphan GC's business, \
+         by the same rule it already applies to everything else"
+    );
+}
+
+#[test]
+fn an_export_asks_only_for_the_digests_the_destination_lacks() {
+    // Deduplication across a transfer, for free: the names ARE
+    // content digests, so a receiver can answer "which of these do I
+    // not have?" without the sender describing anything.
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("admin.sock");
+    let _g = spawn_server(&sock, dir.path());
+    let mut c = LoamClient::connect(&sock).expect("connect");
+
+    c.put_file(b"src", b"/shared", 1, b"both-sides-have-this")
+        .unwrap();
+    c.put_file(b"src", b"/only-here", 1, b"unique-to-source")
+        .unwrap();
+    let manifest = c.snapshot_create(b"src", b"snap").unwrap();
+
+    // Everything in the manifest is present locally, so nothing is
+    // missing — the degenerate case, and the one that proves the
+    // check is real rather than always-true.
+    assert!(
+        c.manifest_missing_here(&manifest).unwrap().is_empty(),
+        "every body the manifest names is present here"
+    );
+
+    // A manifest naming a digest nothing stored: exactly one gap.
+    let refs: Vec<(&[u8], [u8; 32])> = vec![(&b"/absent"[..], [0xAB; 32])];
+    let mut synthetic = vec![0u8; loam_client::manifest_wire::encoded_len(b"src", &refs)];
+    let n = loam_client::manifest_wire::encode(&mut synthetic, b"src", &refs).unwrap();
+    synthetic.truncate(n);
+    assert_eq!(
+        c.manifest_missing_here(&synthetic).unwrap(),
+        vec![[0xAB; 32]],
+        "a digest the destination lacks is exactly what it asks for"
+    );
+}
+
+#[test]
+fn a_manifest_round_trips_and_refuses_a_corrupt_one() {
+    use loam_client::manifest_wire as mw;
+    let refs: Vec<(&[u8], [u8; 32])> =
+        vec![(&b"/a"[..], [1u8; 32]), (&b"/nested/b"[..], [2u8; 32])];
+    let mut buf = vec![0u8; mw::encoded_len(b"root", &refs)];
+    let n = mw::encode(&mut buf, b"root", &refs).unwrap();
+    assert_eq!(n, buf.len(), "encoded_len is exact, not an estimate");
+
+    let mut seen = Vec::new();
+    let count = mw::for_each(&buf, |k, d| seen.push((k.to_vec(), *d))).unwrap();
+    assert_eq!(count, 2);
+    assert_eq!(seen[0].0, b"/a");
+    assert_eq!(seen[1].1, [2u8; 32]);
+    assert_eq!(
+        seen.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        vec![b"/a".to_vec(), b"/nested/b".to_vec()],
+        "order is preserved, so two manifests of one snapshot compare byte-for-byte"
+    );
+
+    // A truncated manifest is refused, not silently short — the same
+    // rule the change stream holds itself to.
+    assert!(mw::for_each(&buf[..buf.len() - 4], |_, _| {}).is_err());
+    let mut bad = buf.clone();
+    bad[0] ^= 0xFF;
+    assert_eq!(mw::peek(&bad), Err(mw::ManifestError::BadMagic));
+}
+
+// ── Remote admin over TCP ─────────────────────────────────────────
+//
+// This is what a volume backend running off the storage node needs.
+// It exists only because D-3 landed first: the transport and the
+// authentication are the same feature, and shipping the transport
+// alone would have been the worse outcome the review named.
+
+fn spawn_server_tcp(
+    dir: &std::path::Path,
+    token_file: Option<&std::path::Path>,
+) -> (ServerGuard, String) {
+    spawn_server_tcp_at(dir, token_file, 0)
+}
+
+/// `slot` distinguishes servers that must run at the same time —
+/// an export needs two. Slot 0 belongs to `spawn_server_tcp`, so a
+/// test that spawns its own pair must start at 1: these binaries
+/// run their tests in PARALLEL, and two servers on one port means
+/// one test silently talking to the other's store.
+fn spawn_server_tcp_at(
+    dir: &std::path::Path,
+    token_file: Option<&std::path::Path>,
+    slot: u16,
+) -> (ServerGuard, String) {
+    // Port 0 would be ideal, but the address has to be known to
+    // connect; pick a high port derived from the pid so parallel
+    // test binaries do not collide.
+    let port = 20000 + (std::process::id() % 9000) as u16 + slot * 100;
+    let addr = format!("127.0.0.1:{port}");
+    let mut args: Vec<String> = vec![
+        "--admin-listen".into(),
+        addr.clone(),
+        "--ns-wal".into(),
+        dir.join("ns.wal").to_str().unwrap().into(),
+        "--obj-wal".into(),
+        dir.join("obj.wal").to_str().unwrap().into(),
+        "--fleet".into(),
+        format!("dir:{}", dir.join("bodies").display()),
+        "--tick-us".into(),
+        "1000".into(),
+    ];
+    if let Some(t) = token_file {
+        args.push("--admin-token".into());
+        args.push(t.to_str().unwrap().into());
+    }
+    let mut cmd = Command::new(server_bin());
+    cmd.args(&args);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    let child = cmd.spawn().expect("spawn loam-server");
+    let started = Instant::now();
+    while std::net::TcpStream::connect(&addr).is_err() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "loam-server didn't bind {addr} within 5s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    (ServerGuard(child), addr)
+}
+
+#[test]
+fn a_remote_client_works_over_tcp_once_authenticated() {
+    let dir = tempfile::tempdir().unwrap();
+    let tokf = dir.path().join("token");
+    std::fs::write(&tokf, "remote-secret").unwrap();
+    let (_g, addr) = spawn_server_tcp(dir.path(), Some(&tokf));
+
+    let mut c = LoamClient::connect_tcp(&addr).expect("tcp connect");
+    c.authenticate(b"remote-secret").expect("authenticate");
+    c.put_file(b"vol", b"/remote.txt", 1, b"written from off-box")
+        .expect("a remote authenticated client can write");
+    assert_eq!(
+        c.get_file(b"vol", b"/remote.txt").unwrap().as_deref(),
+        Some(&b"written from off-box"[..])
+    );
+}
+
+#[test]
+fn tcp_admin_without_a_token_refuses_to_start() {
+    // Not "starts and warns" — a misconfigured server that runs is
+    // an open admin surface. The refusal is at startup so it cannot
+    // be missed, and there is deliberately no --insecure override.
+    let dir = tempfile::tempdir().unwrap();
+    let port = 20000 + (std::process::id() % 9000) as u16 + 1;
+    let out = Command::new(server_bin())
+        .args([
+            "--admin-listen",
+            &format!("127.0.0.1:{port}"),
+            "--ns-wal",
+            dir.path().join("ns.wal").to_str().unwrap(),
+            "--obj-wal",
+            dir.path().join("obj.wal").to_str().unwrap(),
+            "--fleet",
+            &format!("dir:{}", dir.path().join("bodies").display()),
+        ])
+        .output()
+        .expect("run loam-server");
+    assert!(!out.status.success(), "the server must refuse to start");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("--admin-listen requires --admin-token"),
+        "the refusal must say why; got: {err}"
+    );
+}
+
+// ── Portable export between two clusters ──────────────────────────
+//
+// Two real servers, so the transfer is exercised rather than
+// asserted. The manifest is encryption-agnostic and its digests are
+// over plaintext, so it means the same thing on both
+// sides — which is what lets the whole export be ordinary reads and
+// writes rather than a protocol.
+
+#[test]
+fn a_snapshot_exports_to_a_second_cluster_sending_only_what_it_lacks() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+    // A TCP admin surface REFUSES to start without a token, so
+    // an export between two clusters is authenticated on both ends
+    // by construction. There is no unauthenticated path to take.
+    let stok = src_dir.path().join("tok");
+    let dtok = dst_dir.path().join("tok");
+    std::fs::write(&stok, "src-secret").unwrap();
+    std::fs::write(&dtok, "dst-secret").unwrap();
+    let (_gs, src_addr) = spawn_server_tcp_at(src_dir.path(), Some(&stok), 1);
+    let (_gd, dst_addr) = spawn_server_tcp_at(dst_dir.path(), Some(&dtok), 2);
+
+    let mut src = LoamClient::connect_tcp(&src_addr).expect("src connect");
+    src.authenticate(b"src-secret").unwrap();
+    let mut dst = LoamClient::connect_tcp(&dst_addr).expect("dst connect");
+    dst.authenticate(b"dst-secret").unwrap();
+
+    // Three objects, two of them with IDENTICAL content — content
+    // addressing should make that one body, on both sides.
+    src.put_file(b"vol", b"/a.txt", 1, b"alpha").unwrap();
+    src.put_file(b"vol", b"/b.txt", 1, b"beta").unwrap();
+    src.put_file(b"vol", b"/c.txt", 1, b"alpha").unwrap();
+
+    let manifest = src.snapshot_create(b"vol", b"snap-1").expect("snapshot");
+    let (root, count) = loam_client::manifest_wire::peek(&manifest).unwrap();
+    assert_eq!(root, b"vol");
+    assert_eq!(count, 3, "three keys");
+
+    // The destination holds nothing, so it needs both distinct
+    // bodies — two, not three, because /a.txt and /c.txt are one.
+    let missing = dst.manifest_missing_here(&manifest).unwrap();
+    assert_eq!(
+        missing.len(),
+        2,
+        "duplicate content is one body, so the transfer carries two"
+    );
+
+    let (sent, bound) =
+        loam_client::export_snapshot(&mut src, &mut dst, &manifest, b"restored").expect("export");
+    assert_eq!(sent, 2);
+    assert_eq!(bound, 3, "all three keys are bound at the destination");
+
+    for (key, want) in [
+        (&b"/a.txt"[..], &b"alpha"[..]),
+        (&b"/b.txt"[..], &b"beta"[..]),
+        (&b"/c.txt"[..], &b"alpha"[..]),
+    ] {
+        assert_eq!(
+            dst.get_file(b"restored", key).unwrap().as_deref(),
+            Some(want),
+            "{} did not arrive intact",
+            String::from_utf8_lossy(key)
+        );
+    }
+}
+
+#[test]
+fn re_exporting_the_same_snapshot_sends_nothing() {
+    // The receiver is asked what it LACKS, and lacking is decided by
+    // content digest — so a second export is metadata only. That is
+    // the property that makes an incremental backup cheap.
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+    let stok = src_dir.path().join("tok");
+    let dtok = dst_dir.path().join("tok");
+    std::fs::write(&stok, "s").unwrap();
+    std::fs::write(&dtok, "d").unwrap();
+    let (_gs, src_addr) = spawn_server_tcp_at(src_dir.path(), Some(&stok), 3);
+    let (_gd, dst_addr) = spawn_server_tcp_at(dst_dir.path(), Some(&dtok), 4);
+    let mut src = LoamClient::connect_tcp(&src_addr).unwrap();
+    src.authenticate(b"s").unwrap();
+    let mut dst = LoamClient::connect_tcp(&dst_addr).unwrap();
+    dst.authenticate(b"d").unwrap();
+
+    src.put_file(b"vol", b"/x", 1, b"payload").unwrap();
+    let manifest = src.snapshot_create(b"vol", b"snap").unwrap();
+
+    let (sent1, _) = loam_client::export_snapshot(&mut src, &mut dst, &manifest, b"r1").unwrap();
+    assert_eq!(sent1, 1);
+
+    // Same bytes, different destination root: the body is already
+    // there under its content digest, so nothing crosses the wire.
+    let (sent2, bound2) =
+        loam_client::export_snapshot(&mut src, &mut dst, &manifest, b"r2").unwrap();
+    assert_eq!(sent2, 0, "the destination already holds these bytes");
+    assert_eq!(bound2, 1);
+    assert_eq!(
+        dst.get_file(b"r2", b"/x").unwrap().as_deref(),
+        Some(&b"payload"[..])
+    );
+}
+
+#[test]
+fn an_export_whose_source_lost_a_body_fails_rather_than_arriving_short() {
+    // A snapshot at the destination that silently contains less than
+    // it claims is worse than a failed export: the failure is
+    // visible and retryable, the short snapshot is neither.
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+    let stok = src_dir.path().join("tok");
+    let dtok = dst_dir.path().join("tok");
+    std::fs::write(&stok, "s").unwrap();
+    std::fs::write(&dtok, "d").unwrap();
+    let (_gs, src_addr) = spawn_server_tcp_at(src_dir.path(), Some(&stok), 5);
+    let (_gd, dst_addr) = spawn_server_tcp_at(dst_dir.path(), Some(&dtok), 6);
+    let mut src = LoamClient::connect_tcp(&src_addr).unwrap();
+    src.authenticate(b"s").unwrap();
+    let mut dst = LoamClient::connect_tcp(&dst_addr).unwrap();
+    dst.authenticate(b"d").unwrap();
+
+    src.put_file(b"vol", b"/gone", 1, b"will be removed")
+        .unwrap();
+    let manifest = src.snapshot_create(b"vol", b"snap").unwrap();
+
+    // Forge a manifest naming a body no source holds. Same shape as
+    // a source that lost one.
+    let mut refs: Vec<(&[u8], [u8; 32])> = Vec::new();
+    let phantom = [0x5au8; 32];
+    refs.push((&b"/phantom"[..], phantom));
+    let mut forged = vec![0u8; loam_client::manifest_wire::encoded_len(b"vol", &refs)];
+    let n = loam_client::manifest_wire::encode(&mut forged, b"vol", &refs).unwrap();
+    forged.truncate(n);
+
+    let err = loam_client::export_snapshot(&mut src, &mut dst, &forged, b"r").unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("cannot be exported whole"),
+        "the failure must name the problem, got: {msg}"
+    );
+    assert!(
+        dst.get_file(b"r", b"/phantom").unwrap().is_none(),
+        "and nothing was bound at the destination"
+    );
+    let _ = manifest;
+}

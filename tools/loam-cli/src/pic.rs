@@ -45,6 +45,15 @@ pub mod sha256 {
 
 // Wire formats. Multiple PICs use different `wire` aliases; we
 // give body_store its own wrapper module via #[path] tricks.
+#[path = "../../../modules/common/mechanics/loam_change_wire.rs"]
+mod change_wire;
+
+#[path = "../../../modules/common/mechanics/loam_hash.rs"]
+mod hash;
+
+#[path = "../../../modules/common/mechanics/loam_limits.rs"]
+mod limits;
+
 #[path = "../../../modules/common/mechanics/reply_out.rs"]
 mod reply_out;
 
@@ -92,6 +101,20 @@ pub mod ns_body;
 pub mod obj_wire;
 
 pub mod obj_scope {
+    pub mod hash {
+        #[allow(
+            unused_imports,
+            reason = "shared #[path]-included surface; each scope uses a subset"
+        )]
+        pub use super::super::hash::*;
+    }
+    pub mod limits {
+        #[allow(
+            unused_imports,
+            reason = "shared #[path]-included surface; each scope uses a subset"
+        )]
+        pub use super::super::limits::*;
+    }
     pub mod reply_out {
         pub use super::super::reply_out::*;
     }
@@ -101,6 +124,20 @@ pub mod obj_scope {
         pub use super::super::obj_wire::*;
     }
     pub mod state {
+        pub mod hash {
+            #[allow(
+                unused_imports,
+                reason = "shared #[path]-included surface; each scope uses a subset"
+            )]
+            pub use super::super::hash::*;
+        }
+        pub mod limits {
+            #[allow(
+                unused_imports,
+                reason = "shared #[path]-included surface; each scope uses a subset"
+            )]
+            pub use super::super::limits::*;
+        }
         // Notional dir: tools/loam-cli/src/pic/obj_scope/state/.
         // Six levels up reaches the workspace root.
         #[path = "../../../../../../modules/common/mechanics/object_pic_state.rs"]
@@ -123,6 +160,20 @@ pub use obj_scope::body as obj_body;
 // `super::SyscallTable`. The `wire` name above is taken by
 // ns_wire; wrap body_store in a scope that re-aliases `wire`.
 pub mod body_store_scope {
+    pub mod hash {
+        #[allow(
+            unused_imports,
+            reason = "shared #[path]-included surface; each scope uses a subset"
+        )]
+        pub use super::super::hash::*;
+    }
+    pub mod limits {
+        #[allow(
+            unused_imports,
+            reason = "shared #[path]-included surface; each scope uses a subset"
+        )]
+        pub use super::super::limits::*;
+    }
     pub mod fs_names {
         pub use super::super::fs_names::*;
     }

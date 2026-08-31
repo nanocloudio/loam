@@ -35,9 +35,7 @@ use core::convert::TryInto;
 // Channel-wire operation set for the `storage.namespace` surface.
 // These are loam's channel encoding of the CANONICAL namespace ops
 // (fluxor `contracts/storage/namespace.rs`): OP_BIND ↔ BIND (0x1308,
-// the op that mints a name — added to the canonical surface by
-// rfc_storage_capability_symmetry phase 1; this wire predates it),
-// OP_RENAME ↔ RENAME, OP_UNBIND ↔ DELETE, OP_LOOKUP ↔ LOOKUP,
+// the op that mints a name), OP_RENAME ↔ RENAME, OP_UNBIND ↔ DELETE, OP_LOOKUP ↔ LOOKUP,
 // OP_LIST ↔ LIST. Same operations, channel-framed rather than
 // provider_call-dispatched; a future wire unification maps 1:1.
 pub const OP_BIND: u8 = 1;
@@ -76,7 +74,39 @@ pub enum WireError {
     StringTooLong { len: usize, max: usize },
 }
 
-pub const MAX_STRING: usize = 4096;
+/// Per-field key ceilings, from the single register in
+/// `loam_limits.rs`. These are the numbers the arena slot and the
+/// snapshot record are sized to, which is the whole point: the wire
+/// accepts exactly what the store can hold whole, so an accepted
+/// bind is always byte-comparable and always listable.
+#[allow(
+    unused_imports,
+    reason = "re-exported so a consumer can ask this wire what it accepts; \
+              the wire itself now delegates the check to loam_limits"
+)]
+pub use super::limits::{MAX_OBJECT_ID, MAX_PATH, MAX_ROOT};
+
+/// Widest key-shaped field on this wire, for buffer sizing only.
+/// Never use it as a per-field ceiling — that is what let a path
+/// four times longer than the arena slot be accepted and then
+/// silently dropped from every listing.
+pub const MAX_STRING: usize = super::limits::MAX_KEY_STRING;
+
+/// Refuse a key whose components exceed their ceilings. Called on
+/// BOTH sides: encode so a local producer fails loudly, decode so a
+/// remote frame cannot smuggle an oversize key past the ceiling.
+pub fn check_key(namespace_root: &[u8], path: &[u8], object_id: &[u8]) -> Result<(), WireError> {
+    // One implementation, in `loam_limits.rs` beside the ceilings it
+    // enforces. Two copies drifting would mean two wires disagreeing
+    // about what the store can hold — which is the class of bug this
+    // check exists to prevent.
+    super::limits::check_key(namespace_root, path, object_id).map_err(|e| {
+        WireError::StringTooLong {
+            len: e.len,
+            max: e.max,
+        }
+    })
+}
 
 // ── Bind ───────────────────────────────────────────────────────────
 
@@ -88,24 +118,7 @@ pub fn encode_bind(
     kind: u8,
     revision: u64,
 ) -> Result<usize, WireError> {
-    if namespace_root.len() > MAX_STRING {
-        return Err(WireError::StringTooLong {
-            len: namespace_root.len(),
-            max: MAX_STRING,
-        });
-    }
-    if path.len() > MAX_STRING {
-        return Err(WireError::StringTooLong {
-            len: path.len(),
-            max: MAX_STRING,
-        });
-    }
-    if object_id.len() > MAX_STRING {
-        return Err(WireError::StringTooLong {
-            len: object_id.len(),
-            max: MAX_STRING,
-        });
-    }
+    check_key(namespace_root, path, object_id)?;
     let header = 1 + 2 + 2 + 2 + 1 + 8;
     let needed = header + namespace_root.len() + path.len() + object_id.len();
     if dst.len() < needed {
@@ -161,6 +174,7 @@ pub fn decode_bind(src: &[u8]) -> Result<DecodedBind<'_>, WireError> {
     let ns = &src[header..header + ns_len];
     let path = &src[header + ns_len..header + ns_len + path_len];
     let oid = &src[header + ns_len + path_len..header + ns_len + path_len + oid_len];
+    check_key(ns, path, oid)?;
     Ok(DecodedBind {
         namespace_root: ns,
         path,
@@ -179,14 +193,8 @@ pub fn encode_rename(
     to: &[u8],
     new_revision: u64,
 ) -> Result<usize, WireError> {
-    for s in [namespace_root, from, to] {
-        if s.len() > MAX_STRING {
-            return Err(WireError::StringTooLong {
-                len: s.len(),
-                max: MAX_STRING,
-            });
-        }
-    }
+    check_key(namespace_root, from, &[])?;
+    check_key(namespace_root, to, &[])?;
     let header = 1 + 2 + 2 + 2 + 8;
     let needed = header + namespace_root.len() + from.len() + to.len();
     if dst.len() < needed {
@@ -251,14 +259,7 @@ pub fn encode_unbind(
     namespace_root: &[u8],
     path: &[u8],
 ) -> Result<usize, WireError> {
-    for s in [namespace_root, path] {
-        if s.len() > MAX_STRING {
-            return Err(WireError::StringTooLong {
-                len: s.len(),
-                max: MAX_STRING,
-            });
-        }
-    }
+    check_key(namespace_root, path, &[])?;
     let header = 1 + 2 + 2;
     let needed = header + namespace_root.len() + path.len();
     if dst.len() < needed {
@@ -316,14 +317,7 @@ pub fn encode_lookup_req(
     namespace_root: &[u8],
     path: &[u8],
 ) -> Result<usize, WireError> {
-    for s in [namespace_root, path] {
-        if s.len() > MAX_STRING {
-            return Err(WireError::StringTooLong {
-                len: s.len(),
-                max: MAX_STRING,
-            });
-        }
-    }
+    check_key(namespace_root, path, &[])?;
     let header = 1 + 2 + 2;
     let needed = header + namespace_root.len() + path.len();
     if dst.len() < needed {
@@ -465,12 +459,7 @@ pub fn encode_list_req(
     cursor: u32,
     max: u8,
 ) -> Result<usize, WireError> {
-    if namespace_root.len() > MAX_STRING {
-        return Err(WireError::StringTooLong {
-            len: namespace_root.len(),
-            max: MAX_STRING,
-        });
-    }
+    check_key(namespace_root, &[], &[])?;
     let header = 1 + 2 + 4 + 1;
     let needed = header + namespace_root.len();
     if dst.len() < needed {
@@ -616,12 +605,7 @@ pub fn encode_gc_reserve_req(
     release: bool,
     object_id: &[u8],
 ) -> Result<usize, WireError> {
-    if object_id.len() > MAX_STRING {
-        return Err(WireError::StringTooLong {
-            len: object_id.len(),
-            max: MAX_STRING,
-        });
-    }
+    check_key(&[], &[], object_id)?;
     let needed = 3 + object_id.len();
     if dst.len() < needed {
         return Err(WireError::BufferTooSmall {
@@ -680,12 +664,7 @@ pub fn encode_referenced_req(
     cursor: u32,
     object_id: &[u8],
 ) -> Result<usize, WireError> {
-    if object_id.len() > MAX_STRING {
-        return Err(WireError::StringTooLong {
-            len: object_id.len(),
-            max: MAX_STRING,
-        });
-    }
+    check_key(&[], &[], object_id)?;
     let header = 1 + 4 + 2;
     let needed = header + object_id.len();
     if dst.len() < needed {

@@ -16,6 +16,13 @@ pub struct VolumeSlot {
     pub class: u8,
     pub thin_provisioned: bool,
     pub occupied: bool,
+    /// The volume id, stored whole. Identity is these bytes; the
+    /// hash only narrows the scan. Same reason as the namespace and
+    /// object surfaces: FNV-1a is trivially collidable, so matching
+    /// on the hash alone would let a caller reach a volume that is
+    /// not theirs.
+    pub volume_id_bytes: [u8; super::limits::MAX_OBJECT_ID],
+    pub volume_id_len: u8,
 }
 
 impl VolumeSlot {
@@ -28,11 +35,20 @@ impl VolumeSlot {
             class: 0,
             thin_provisioned: false,
             occupied: false,
+            volume_id_bytes: [0u8; super::limits::MAX_OBJECT_ID],
+            volume_id_len: 0,
         }
     }
 
-    pub fn matches(&self, volume_id_hash: u64) -> bool {
-        self.occupied && self.volume_id_hash == volume_id_hash
+    /// The slot's stored volume id.
+    pub fn volume_id(&self) -> &[u8] {
+        &self.volume_id_bytes[..self.volume_id_len as usize]
+    }
+
+    /// Hash-narrowed, byte-decided identity. Never match on the hash
+    /// alone.
+    pub fn matches(&self, volume_id_hash: u64, volume_id: &[u8]) -> bool {
+        self.occupied && self.volume_id_hash == volume_id_hash && self.volume_id() == volume_id
     }
 
     pub fn logical_block_count(&self) -> u64 {
@@ -51,6 +67,9 @@ impl VolumeSlot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyError {
+    /// The volume id exceeded `loam_limits::MAX_OBJECT_ID`. Refused
+    /// at the wire first; this keeps a partial id unrepresentable.
+    IdTooLong,
     AlreadyPresent,
     NotPresent,
     OutOfCapacity,
@@ -65,17 +84,10 @@ pub enum ApplyOk {
     Released { count: u64 },
 }
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
-
-pub fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h = FNV_OFFSET;
-    for &b in bytes {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h
-}
+/// FNV-1a, from the one shared implementation. Three byte-identical
+/// copies of a hash that narrows every identity scan is a drift
+/// hazard, not a line count — see `loam_hash.rs`.
+pub use super::hash::fnv1a64;
 
 pub struct PicBlockState<const N: usize> {
     slots: [VolumeSlot; N],
@@ -111,7 +123,7 @@ impl<const N: usize> PicBlockState<N> {
     pub fn lookup(&self, volume_id: &[u8]) -> Option<&VolumeSlot> {
         let h = fnv1a64(volume_id);
         for s in &self.slots {
-            if s.matches(h) {
+            if s.matches(h, volume_id) {
                 return Some(s);
             }
         }
@@ -126,9 +138,12 @@ impl<const N: usize> PicBlockState<N> {
         block_size: u32,
         thin_provisioned: bool,
     ) -> Result<ApplyOk, ApplyError> {
+        if volume_id.len() > super::limits::MAX_OBJECT_ID {
+            return Err(ApplyError::IdTooLong);
+        }
         let h = fnv1a64(volume_id);
         for s in &self.slots {
-            if s.matches(h) {
+            if s.matches(h, volume_id) {
                 return Err(ApplyError::AlreadyPresent);
             }
         }
@@ -142,6 +157,12 @@ impl<const N: usize> PicBlockState<N> {
                     class,
                     thin_provisioned,
                     occupied: true,
+                    volume_id_bytes: {
+                        let mut v = [0u8; super::limits::MAX_OBJECT_ID];
+                        v[..volume_id.len()].copy_from_slice(volume_id);
+                        v
+                    },
+                    volume_id_len: volume_id.len() as u8,
                 };
                 return Ok(ApplyOk::Created);
             }
@@ -152,7 +173,7 @@ impl<const N: usize> PicBlockState<N> {
     pub fn allocate(&mut self, volume_id: &[u8], count: u64) -> Result<ApplyOk, ApplyError> {
         let h = fnv1a64(volume_id);
         for s in self.slots.iter_mut() {
-            if s.matches(h) {
+            if s.matches(h, volume_id) {
                 if count > s.free_blocks() {
                     return Err(ApplyError::AllocationExceedsVolume);
                 }
@@ -170,7 +191,7 @@ impl<const N: usize> PicBlockState<N> {
     pub fn release(&mut self, volume_id: &[u8], count: u64) -> Result<ApplyOk, ApplyError> {
         let h = fnv1a64(volume_id);
         for s in self.slots.iter_mut() {
-            if s.matches(h) {
+            if s.matches(h, volume_id) {
                 if count > s.allocated_blocks {
                     return Err(ApplyError::ReleaseExceedsAllocated);
                 }

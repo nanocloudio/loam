@@ -44,6 +44,10 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
     dead_code,
     reason = "shared PIC body; each module shim drives a subset"
 )]
+#[path = "../../common/replicated/load_helpers.rs"]
+mod load_helpers;
+use load_helpers::{copy_tag, write_hex_u32};
+
 #[path = "../../common/replicated/loam_decision_wire.rs"]
 mod wire;
 
@@ -264,27 +268,5 @@ unsafe fn emit_report(s: &ModuleState, syscalls: &SyscallTable) {
     dev_log(syscalls, 3, line.as_ptr(), pos);
 }
 
-fn copy_tag(dst: &mut [u8], tag: &[u8]) -> usize {
-    let mut i = 0usize;
-    while i < tag.len() && i < dst.len() {
-        dst[i] = tag[i];
-        i += 1;
-    }
-    i
-}
 
-fn write_hex_u32(dst: &mut [u8], value: u32) -> usize {
-    if dst.len() < 8 {
-        return 0;
-    }
-    let mut n = value;
-    let mut i = 8usize;
-    while i > 0 {
-        i -= 1;
-        dst[i] = HEX[(n & 0xF) as usize];
-        n >>= 4;
-    }
-    8
-}
 
-const HEX: [u8; 16] = *b"0123456789abcdef";

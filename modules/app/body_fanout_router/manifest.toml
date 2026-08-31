@@ -35,4 +35,4 @@ content_type = "OctetStream"
 # channel-port-lookup helper, same constraint as admin_router.
 
 [observability]
-exempt = "in-arena state counters (ops/errors/scrub tallies) readable by the host harness; typed MSG_METRIC_SAMPLE emission is tracked RFC 0004 polish"
+exempt = "in-arena state counters (ops/errors/scrub tallies) readable by the host harness; typed MSG_METRIC_SAMPLE emission is not wired yet"

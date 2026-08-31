@@ -81,7 +81,7 @@ fn cli_plan_reports_node_class() {
 #[test]
 fn cli_surfaces_lists_public_and_internal_modules() {
     let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let (json, _, status) = run(&["surfaces"]);
+    let (json, _, status) = run(&["surfaces", "--modules", "../../modules"]);
     assert!(status.success());
     let bindings = json["bindings"].as_array().expect("bindings array");
     let public: Vec<_> = bindings
@@ -92,8 +92,26 @@ fn cli_surfaces_lists_public_and_internal_modules() {
         .iter()
         .filter(|b| b["visibility"] == "internal")
         .collect();
-    assert_eq!(public.len(), 3, "three public surfaces expected");
+    assert_eq!(
+        public.len(),
+        1,
+        "one public surface: only namespace_router can answer the one it claims"
+    );
     assert!(!internal.is_empty(), "internal modules present");
+
+    // Read from the manifests, so EVERY module appears — the table
+    // this replaced covered 7 of 18 and had drifted from the rest.
+    assert_eq!(bindings.len(), 16, "every module in modules/app is listed");
+    let surfaces: Vec<&str> = public
+        .iter()
+        .flat_map(|b| b["surfaces"].as_array().unwrap())
+        .map(|s| s.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        surfaces,
+        vec!["storage.namespace"],
+        "the manifests declare exactly what loam can serve"
+    );
 }
 
 #[test]

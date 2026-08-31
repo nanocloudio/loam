@@ -1,12 +1,21 @@
 version = "0.1.0"
 hardware_targets = ["bcm2712"]
 
-# Canonical storage surface this module provides (fluxor
-# storage_capability_surface.md; declared per
-# rfc_storage_capability_symmetry §4/§6 phase 4). Consumers reach it
-# by naming the ports below — the documented channel-provider path.
-# Honest fence class: LocalDurable (WAL-backed volume metadata).
-provides = ["storage.block"]
+# Deliberately NO `provides` claim.
+#
+# That surface is not loam's. `storage.block` is RAW BLOCK I/O — fluxor's `sd`, `nvme`
+# and `flash_rp` providers offer it and `fat32` consumes it. What this
+# module does is volume ACCOUNTING: create a volume, track its
+# allocation high-water mark, release. That is metadata about block
+# storage, not a block device, and no consumer that resolved
+# `storage.block` by contract would find what it came for.
+#
+# Loam's actual block data path is the extent plane — fixed-size
+# extents as keyed bodies under derived keys
+# (`common/mechanics/loam_extent_wire.rs`), replicated by the fan-out
+# router like any other body. This module remains that plane's volume
+# registry. Honest fence class: LocalDurable (WAL-backed volume
+# metadata).
 
 [[ports]]
 name = "block_requests"
@@ -34,4 +43,4 @@ requires_contract = "fs"
 access = "write"
 
 [observability]
-exempt = "in-arena state counters (ops/errors/scrub tallies) readable by the host harness; typed MSG_METRIC_SAMPLE emission is tracked RFC 0004 polish"
+exempt = "in-arena state counters (ops/errors/scrub tallies) readable by the host harness; typed MSG_METRIC_SAMPLE emission is not wired yet"

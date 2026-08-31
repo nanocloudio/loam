@@ -20,9 +20,15 @@ Slot counts below are the bare-metal profile; see
 
 | Module | Surface | What it does |
 |---|---|---|
-| `namespace_router` | `storage.namespace` | Arena (256 binding slots) over a compacted snapshot file + WAL-backed durability via the fluxor `fs` contract. Registers as a provider: exports `module_provides_contract` + `module_provider_dispatch` |
-| `object_index` | `storage.object` | Whole-set arena (256 object slots) + WAL-backed durability |
-| `block_allocator` | `storage.block` | Whole-set arena (64 volume slots) + WAL-backed durability |
+| `namespace_router` | `storage.namespace` | Arena (256 binding slots) over a compacted snapshot file + WAL-backed durability via the fluxor `fs` contract. The graph's one registered provider: exports `module_provides_contract` + `module_provider_dispatch`, answering `LOOKUP`, `STAT`, `CLOSE`, `BIND`, `RENAME`, `DELETE`, `CAPS` and the change pair `SUBSCRIBE` / `CHANGES` that level-triggered consumers reconcile against. `LIST` alone is channel-only — a listing is cursor-paged and a `provider_call` returns one buffer |
+
+`object_index` (whole-set arena, 256 object slots) and
+`block_allocator` (64 volume slots) are WAL-backed and reachable by
+their ports, but declare NO canonical surface. Neither could honour
+one: `storage.object` is whole-blob byte access and descriptors are
+not object bytes; `storage.block` is raw block I/O and volume
+accounting is not a block device. Each `manifest.toml` records that
+in place, next to the claim it declines to make.
 
 ### Internal (no public surface)
 
@@ -36,7 +42,7 @@ Slot counts below are the bare-metal profile; see
 | `ec_body_router` | Erasure-coded fan-out, reconstructing reads, scrub with re-placement |
 | `placement_router` | Owns fleet membership + broadcasts a FleetEpoch snapshot on every change; consumers cache and compute placement locally via [`common/replicated/loam_placement.rs`](common/replicated/loam_placement.rs) |
 | `body_fanout_router` | Sits between `admin_router` and the `body_store` fleet; all-must-succeed PUT, ranked GET/HEAD fallback with read repair, full-set DELETE, background scrub |
-| `cache_manager`, `io_scheduler`, `telemetry_agg` | Reserved names carrying `stub_body.rs`'s ping/noop/ticks protocol — they hold their place in a graph and do nothing else |
+| `telemetry_agg` | An 11-line shim over `stub_body.rs`'s ping/noop/ticks protocol, and the one reserved name in the roster. It is held rather than dropped because the job behind it — metrics, health and readiness — is one a sustained soak cannot run without, so the name will be filled rather than retired. No other placeholder is kept: a reserved name is a cost paid by every reader, the roster, the docs and the tier guard |
 
 ### Replication topology
 
@@ -175,30 +181,51 @@ profile pre-touching anything.
 
 ## Arena sizing
 
-The arenas are **not caches** — they hold every record ever applied
-to that PIC instance. WAL replay reconstructs the full state on
-open. Sizing is therefore the per-instance live-record budget;
-multi-PIC deployments shard further by partition (see
-[`src/placement.rs`](../src/placement.rs)).
+An arena is the per-instance live-record budget: a flat, fixed-size
+array of slots, allocated with the PIC's `ModuleState` by the fluxor
+kernel via `heap_alloc`. Raising a cap raises that module's memory
+budget linearly.
 
-Caps are per capacity profile, selected by the build target:
-bare-metal PIC builds (`target_os = "none"`) keep the bounded
-embedded arena, host-runtime builds (the `loam-server` standalone
-service, host tests) get service-class capacity. The build target is
-the only selector — there is no per-silicon knob at the pack step —
-so a module loaded on the host profile carries the host caps.
+What an arena MEANS differs by surface, and the difference decides
+whether its cap is a ceiling:
 
-| Arena | Bare metal | Host |
-|---|---|---|
-| namespace bindings | 256 | 8192 |
-| object descriptors | 256 | 8192 |
-| block volumes | 64 | 1024 |
-| body slots | 64 | 8192 |
+- **Namespace** — a HOT CACHE over the durable snapshot, where the
+  snapshot tier is compiled in. The snapshot file and the WAL hold
+  the whole set, so a bind into a full arena retries once behind an
+  eviction of a snapshot-covered slot (never a locked one, whose
+  lock the snapshot record does not carry);
+  `ns_scales_past_arena_capacity_via_snapshot` drives 512 bindings
+  past capacity with live compaction and a restart. With no active
+  snapshot
+  to evict against — and on `minimal`, where the tier is compiled
+  out — the arena IS the set and a bind past it is refused, which is
+  the behaviour the composed-node e2e exercises under overload.
+- **Object descriptors and block volumes** — WHOLE-SET arenas. Every
+  live record is resident, so the cap is a true ceiling and a record
+  past it is refused.
+- **Body slots** — an index over the on-disk inventory, rehydrated
+  from the root directory by a cursor-0 `OP_SCAN`. It bounds
+  working-set lookup, not bodies held.
 
-Adjust per-PIC by changing `ARENA_CAPACITY` in the corresponding
-`common/mechanics/<surface>_pic_body.rs`. The PIC `ModuleState` struct is
-heap-allocated by the fluxor kernel via `heap_alloc`, so bumping
-the cap raises the per-module memory budget linearly.
+Caps are per capacity profile, selected by an explicit
+`--cfg loam_profile="…"` with the build target as the fallback
+(`target_os = "none"` → `embedded`, otherwise `node`):
+
+| Arena | `minimal` | `embedded` | `node` | `server` |
+|---|---|---|---|---|
+| namespace bindings | 64 | 256 | 8192 | 8192 |
+| object descriptors | 64 | 256 | 8192 | 8192 |
+| block volumes | 8 | 64 | 1024 | 1024 |
+| body slots | 16 | 64 | 8192 | 8192 |
+
+Every profiled constant lives in
+[`common/mechanics/loam_limits.rs`](common/mechanics/loam_limits.rs)
+and nowhere else — a PIC body takes its `ARENA_CAPACITY` from that
+file rather than declaring a number. `tools/ci/limit_guard.sh` fails
+the build on a `cfg(target_os)` capacity constant anywhere outside
+it, and on a ceiling with no row in
+[`docs/limit_register.md`](../docs/limit_register.md), which carries
+the reasoning behind each figure.
 
 ### Namespace scale: arena as hot cache
 
@@ -218,9 +245,11 @@ emit-tags are per-slot generation bytes so reused slots can't be
 mismarked); deletes TOMBSTONE (masking the on-disk record until
 compaction drops both, at the binding's revision so re-binds win
 normally); listings walk arena then snapshot without
-duplicates. Proven by a test pushing 8704 bindings through an
-8192 arena with live compaction, then restarting onto snapshot +
-tail.
+duplicates. Proven by `ns_scales_past_arena_capacity_via_snapshot`,
+which pushes 512 bindings past the arena capacity with live
+compaction interleaved, then restarts onto snapshot + tail. It is a
+no-op on `minimal`, where the tier is compiled out and a full arena
+is an honest refusal.
 
 OP_REFERENCED — the orphan GC's question — is CURSOR-PAGED so it
 stays bounded per step at snapshot scale: page 0 checks the

@@ -11,15 +11,11 @@
 // WAL replay. See `namespace_pic_body.rs` for the rationale.
 // ModuleState size: ObjectSlot(~48B) × 256 + 4 KiB scratch ≈ 16 KiB.
 // Capacity profile — see namespace_pic_body.rs.
-#[cfg(target_os = "none")]
-const ARENA_CAPACITY: usize = 256;
-#[cfg(not(target_os = "none"))]
-const ARENA_CAPACITY: usize = 8192;
-const MAX_OPS_PER_STEP: u32 = 4;
+const ARENA_CAPACITY: usize = super::limits::OBJECT_SLOTS;
 const READ_BUF: usize = 1024;
 /// Reassembly capacity for `requests`. Sized to hold a full step's
 /// budget plus one more read, so refilling never starves the step.
-const REQ_ASM: usize = READ_BUF * (MAX_OPS_PER_STEP as usize + 1);
+const REQ_ASM: usize = READ_BUF * (super::limits::OPS_PER_STEP as usize + 1);
 
 /// Inline WAL-path buffer size; see `namespace_pic_body.rs`.
 pub const WAL_PATH_BUF: usize = 256;
@@ -131,43 +127,15 @@ pub unsafe fn open_and_replay_wal(state_ptr: *mut u8, wal_path: &[u8]) -> i32 {
 
 /// See `namespace_pic_body::decode_wal_path_params`.
 pub unsafe fn decode_wal_path_params(state_ptr: *mut u8, params: *const u8, params_len: usize) {
-    if state_ptr.is_null() || params.is_null() || params_len == 0 {
+    if state_ptr.is_null() {
         return;
     }
     let s = &mut *(state_ptr as *mut ModuleState);
-    let is_tlv = params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
-    if is_tlv {
-        let mut off = 4usize;
-        while off + 2 <= params_len {
-            let tag = *params.add(off);
-            let elen = *params.add(off + 1) as usize;
-            off += 2;
-            if tag == 0xFF {
-                break;
-            }
-            if tag == 1 && off + elen <= params_len {
-                let copy = elen.min(WAL_PATH_BUF);
-                let src = params.add(off);
-                let mut i = 0usize;
-                while i < copy {
-                    s.wal_path[i] = *src.add(i);
-                    i += 1;
-                }
-                s.wal_path_len = copy as u16;
-                return;
-            }
-            off += elen;
-        }
-        return;
+    // The TLV/raw ambiguity lives in one place — `wal_io` — so the
+    // four modules that take a WAL path cannot drift apart on it.
+    if let Some(n) = super::wal::decode_wal_path(params, params_len, &mut s.wal_path) {
+        s.wal_path_len = n as u16;
     }
-    let copy = params_len.min(WAL_PATH_BUF);
-    let src = params;
-    let mut i = 0usize;
-    while i < copy {
-        s.wal_path[i] = *src.add(i);
-        i += 1;
-    }
-    s.wal_path_len = copy as u16;
 }
 
 /// See `namespace_pic_body::open_wal_from_state`.
@@ -271,9 +239,10 @@ unsafe fn resolve_staged(s: &mut ModuleState, syscalls: &super::SyscallTable, du
 }
 
 /// The one-byte answer a fault produces on `responses`.
-fn reply_for(fault: ApplyFault) -> u8 {
+pub(super) fn reply_for(fault: ApplyFault) -> u8 {
     match fault {
         ApplyFault::Absent => super::wire::ACK_ABSENT,
+        ApplyFault::Quota => super::wire::ACK_QUOTA,
         ApplyFault::Rejected => 0xFF,
     }
 }
@@ -332,7 +301,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
 
     let mut handled: u32 = 0;
     let mut req_off: usize = 0;
-    while handled < MAX_OPS_PER_STEP {
+    while handled < super::limits::OPS_PER_STEP {
         // An answer still owed for the previous record means the
         // channel is not draining. Taking another record would either
         // overwrite that answer or mutate the arena for a request that
@@ -526,6 +495,10 @@ unsafe fn handle_scan(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ApplyFault {
     Absent,
+    /// The root's quota would be crossed. Carried separately all the
+    /// way out so the gateway can answer 507 rather than a generic
+    /// failure — see `loam_object_wire::ACK_QUOTA`.
+    Quota,
     Rejected,
 }
 
@@ -547,7 +520,10 @@ pub(super) fn apply_to_arena(
                     p.replica_count,
                     p.erasure,
                 )
-                .map_err(|_| ApplyFault::Rejected)?;
+                .map_err(|e| match e {
+                    super::state::ApplyError::QuotaExceeded => ApplyFault::Quota,
+                    _ => ApplyFault::Rejected,
+                })?;
             Ok(super::wire::OP_OBJ_PUT)
         }
         super::wire::OP_OBJ_UPDATE => {

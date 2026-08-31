@@ -96,16 +96,20 @@ surface moves to a module that does fit.
 Everything else is internal and advertises nothing on the mesh —
 `body_store`, `body_fanout_router`, `ec_body_router`,
 `placement_router`, `raft_metadata_client`, `clustor_bridge`,
-`admin_router`, `block_log`, `io_scheduler`, `telemetry_agg`, and
-`cache_manager` with any page-backing concern. Fluxor's surface
-vocabulary deliberately gives append-log behaviour and page-backing
-no surface names of their own, so loam does not invent any.
+`admin_router`, `block_log`, `object_index`, `block_allocator` and
+`telemetry_agg`. Fluxor's surface vocabulary deliberately gives
+append-log behaviour and page-backing no surface names of their
+own, so loam does not invent any. Nor does it carry modules that
+exist only to reserve a name: page-backing and I/O admission have
+no module here, because neither has a consumer or a surface to
+answer.
 
 ## Clustor Binding
 
 Clustor is the only Raft substrate. Loam binds namespace, object
 metadata, and block maps to clustor replica groups through explicit
-descriptors (`ClustorBinding` in [`src/raft.rs`](../src/raft.rs)).
+descriptors carried on the decision wire
+([`modules/common/replicated/loam_decision_wire.rs`](../modules/common/replicated/loam_decision_wire.rs)).
 Loam consumes clustor's public API only; it does not depend on
 clustor internals.
 

@@ -33,6 +33,13 @@ pub const OP_OBJ_SCAN: u8 = 8;
 /// must retain on the second.
 pub const ACK_ABSENT: u8 = 0xFE;
 
+/// The write would cross the root's QUOTA. Distinct from the generic
+/// 0xFF refusal for the same reason `ACK_ABSENT` is: a caller has to
+/// be able to act. A quota is fixed by the tenant deleting their own
+/// data or an operator raising their ceiling; a generic rejection
+/// tells them neither.
+pub const ACK_QUOTA: u8 = 0xFD;
+
 /// Digest length of a content-derived object id.
 pub const DIGEST_LEN: usize = 32;
 /// Descriptor digests per inventory page. The page is what bounds the
@@ -47,7 +54,10 @@ pub const DATA_CLASS_REPLICATED: u8 = 1;
 pub const DATA_CLASS_ERASURE_CODED: u8 = 2;
 pub const DATA_CLASS_REMOTE_CACHED: u8 = 3;
 
-pub const MAX_STRING: usize = 4096;
+/// Key ceiling, from the single register in `loam_limits.rs`.
+/// Deriving it rather than declaring a number here is what keeps
+/// this wire from accepting an id the arena slot cannot store.
+pub const MAX_STRING: usize = super::limits::MAX_OBJECT_ID;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireError {

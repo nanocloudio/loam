@@ -12,7 +12,7 @@
 //
 // Anything else is dropped after a single-byte read (the module never
 // blocks on garbage). Step contract: bounded work per step (at most
-// `MAX_OPS_PER_STEP` opcodes), no blocking, no hidden threads, no
+// `STUB_OPS_PER_STEP` opcodes), no blocking, no hidden threads, no
 // allocation beyond the fixed-size `ModuleState`.
 //
 // This is the integration shape every Loam public-surface module
@@ -24,7 +24,11 @@ const OP_PING: u8 = 0x01;
 const OP_NOOP: u8 = 0x02;
 const OP_TICKS: u8 = 0x03;
 
-const MAX_OPS_PER_STEP: u32 = 4;
+// A literal, not the register: this body is the reserved-name stub
+// and does nothing per op, so its budget is not a tuning decision
+// and it has no reason to mount the limits module. Every module that
+// actually moves data reads `limits::OPS_PER_STEP`.
+const STUB_OPS_PER_STEP: u32 = 4;
 
 #[repr(C)]
 struct ModuleState {
@@ -89,10 +93,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             None => return -1,
         };
 
-        // Bounded work: handle at most MAX_OPS_PER_STEP opcodes per
+        // Bounded work: handle at most STUB_OPS_PER_STEP opcodes per
         // step. Stop early on an empty inbound channel or any error.
         let mut handled: u32 = 0;
-        while handled < MAX_OPS_PER_STEP {
+        while handled < STUB_OPS_PER_STEP {
             let mut op_buf: [u8; 1] = [0];
             let n = (syscalls.channel_read)(s.in_chan, op_buf.as_mut_ptr(), 1);
             if n <= 0 {

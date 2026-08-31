@@ -23,13 +23,11 @@
 // each logged Propose to the downstream commit path so the
 // producer doesn't have to retry.
 
-const MAX_OPS_PER_STEP: u32 = 4;
 const READ_BUF: usize = 4200; // header + MAX_INNER
 /// Reassembly capacity for `metadata_ops`. Holds one maximal record
 /// plus a read's worth of the next, so a record that straddles reads
 /// always has somewhere to land.
 const OPS_ASM: usize = READ_BUF * 2;
-const PENDING_CAP: usize = 256;
 
 pub const MODE_SINGLE_REPLICA: u8 = 0;
 pub const MODE_REPLICATED: u8 = 1;
@@ -148,7 +146,7 @@ pub struct ModuleState {
     pub committed: u32,
     pub aborted: u32,
     pub apply_errors: u32,
-    pub pending: [PendingEntry; PENDING_CAP],
+    pub pending: [PendingEntry; super::limits::PROPOSER_PENDING],
 }
 
 /// Channel-only init (no WAL, no Clustor commits channel). The
@@ -244,43 +242,15 @@ unsafe fn init_state(
 /// See `namespace_pic_body::decode_wal_path_params`. The proposer
 /// reuses the same dual-format (TLV with tag=1, or raw bytes).
 pub unsafe fn decode_wal_path_params(state_ptr: *mut u8, params: *const u8, params_len: usize) {
-    if state_ptr.is_null() || params.is_null() || params_len == 0 {
+    if state_ptr.is_null() {
         return;
     }
     let s = &mut *(state_ptr as *mut ModuleState);
-    let is_tlv = params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
-    if is_tlv {
-        let mut off = 4usize;
-        while off + 2 <= params_len {
-            let tag = *params.add(off);
-            let elen = *params.add(off + 1) as usize;
-            off += 2;
-            if tag == 0xFF {
-                break;
-            }
-            if tag == 1 && off + elen <= params_len {
-                let copy = elen.min(WAL_PATH_BUF);
-                let src = params.add(off);
-                let mut i = 0usize;
-                while i < copy {
-                    s.wal_path[i] = *src.add(i);
-                    i += 1;
-                }
-                s.wal_path_len = copy as u16;
-                return;
-            }
-            off += elen;
-        }
-        return;
+    // The TLV/raw ambiguity lives in one place — `wal_io` — so the
+    // four modules that take a WAL path cannot drift apart on it.
+    if let Some(n) = super::wal::decode_wal_path(params, params_len, &mut s.wal_path) {
+        s.wal_path_len = n as u16;
     }
-    let copy = params_len.min(WAL_PATH_BUF);
-    let src = params;
-    let mut i = 0usize;
-    while i < copy {
-        s.wal_path[i] = *src.add(i);
-        i += 1;
-    }
-    s.wal_path_len = copy as u16;
 }
 
 pub unsafe fn open_wal_from_state(state_ptr: *mut u8) -> i32 {
@@ -564,7 +534,7 @@ unsafe fn forward_to_clustor(s: &mut ModuleState, correlation_id: u32) -> bool {
 /// Take a durably-logged proposal into the pending table and start it
 /// downstream.
 ///
-/// A full table means the plane is already carrying `PENDING_CAP`
+/// A full table means the plane is already carrying `super::limits::PROPOSER_PENDING`
 /// proposals it has not resolved — upstream is offering faster than
 /// downstream is committing, which is exactly the state a producer has
 /// to see to back off.
@@ -706,7 +676,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
 
     let mut handled: u32 = 0;
     let mut ops_off: usize = 0;
-    while handled < MAX_OPS_PER_STEP {
+    while handled < super::limits::OPS_PER_STEP {
         let rec_len = match super::wire::record_len(&s.ops_asm[ops_off..s.ops_asm_len]) {
             // A whole record is present.
             Ok(Some(len)) => len,
@@ -936,7 +906,8 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         // been sent to Clustor yet — WAL-replayed proposals after a
         // restart land here. Forward-once (the flag), bounded per
         // tick; the slot frees when the Committed round-trips.
-        let mut to_fwd: [u32; MAX_OPS_PER_STEP as usize] = [0; MAX_OPS_PER_STEP as usize];
+        let mut to_fwd: [u32; super::limits::OPS_PER_STEP as usize] =
+            [0; super::limits::OPS_PER_STEP as usize];
         let mut to_fwd_n: usize = 0;
         for slot in s.pending.iter_mut() {
             if slot.in_use == 0 {
@@ -951,7 +922,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                     slot.forward_age = 0;
                 }
             }
-            if slot.forwarded == 0 && (to_fwd_n as u32) < MAX_OPS_PER_STEP {
+            if slot.forwarded == 0 && (to_fwd_n as u32) < super::limits::OPS_PER_STEP {
                 to_fwd[to_fwd_n] = slot.correlation_id;
                 to_fwd_n += 1;
             }
@@ -976,10 +947,11 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         // Snapshot the correlation ids first to avoid holding a
         // mutable borrow of `s.pending` across the emit call,
         // which itself touches `s.append_scratch`.
-        let mut to_retry: [u32; MAX_OPS_PER_STEP as usize] = [0; MAX_OPS_PER_STEP as usize];
+        let mut to_retry: [u32; super::limits::OPS_PER_STEP as usize] =
+            [0; super::limits::OPS_PER_STEP as usize];
         let mut to_retry_n: usize = 0;
         for slot in s.pending.iter() {
-            if slot.in_use != 0 && (to_retry_n as u32) < MAX_OPS_PER_STEP {
+            if slot.in_use != 0 && (to_retry_n as u32) < super::limits::OPS_PER_STEP {
                 to_retry[to_retry_n] = slot.correlation_id;
                 to_retry_n += 1;
             }

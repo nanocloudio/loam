@@ -17,6 +17,9 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 mod wire;
 
 #[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[path = "../../common/mechanics/loam_limits.rs"]
+mod limits;
+
 #[path = "../../common/mechanics/loam_wire.rs"]
 mod ns_wire;
 

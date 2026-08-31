@@ -12,20 +12,46 @@ repeat either.
 
 Each loam PIC is either **public** — it implements a fluxor storage
 surface and returns a real `Fence` — or **internal**, sitting behind
-a public module. The decision table is
-[`src/module_bindings.rs`](../src/module_bindings.rs), which is what
-`loam surfaces` prints:
+a public module. The declaration is the module's own
+`manifest.toml`: a `provides` key makes it public, its absence makes
+it internal. `loam surfaces --modules modules` reads those manifests
+and prints the result, so there is no second table to drift.
 
-| Module | Fluxor surface | Visibility | Achievable fence |
+ONE module declares a surface, and it is the one that can answer it:
+
+| Module | Fluxor surface | Ops | Fence it returns |
 | --- | --- | --- | --- |
-| `namespace_router` | `storage.namespace` | Public | `ReplicatedDurable` |
-| `object_index` | `storage.object` | Public | `ReplicatedDurable` |
-| `block_allocator` | `storage.block` | Public | `LocalDurable` |
-| `raft_metadata_client` | — | Internal | consumes clustor's public API |
-| `cache_manager` | — | Internal | page-backing is not a public surface |
-| `io_scheduler` | — | Internal | admission/flush plumbing |
-| `placement_router` | — | Internal | placement is internal to loam |
-| `telemetry_agg` | — | Internal | readiness/telemetry, not a surface |
+| `namespace_router` | `storage.namespace` | `LOOKUP` `STAT` `CLOSE` `BIND` `RENAME` `DELETE` `SUBSCRIBE` `CHANGES` `CAPS` | `ReplicatedDurable` on the quorum path, `LocalDurable` WAL-only, `Volatile` with no WAL |
+
+`LIST` (0x1302) is the one surface op the provider dispatch answers
+`ENOSYS` to. It is served on the channel wire instead
+(`loam_wire::OP_LIST`), because a listing is cursor-paged and a
+`provider_call` returns one buffer. A consumer that needs listings
+reaches the module by its ports.
+
+`CAPS` advertises the optional ops this provider implements — BIND,
+RENAME, DELETE, SUBSCRIBE, CHANGES. The mandatory read ops carry no
+bit, so a consumer reads the bits for what is optional and assumes
+the rest.
+
+Every other module is internal by omission.
+
+Two nearby modules deliberately claim NOTHING. `object_index`
+holds descriptors, so it cannot answer `storage.object`, which is
+whole-blob byte access — it has no bytes to return.
+`block_allocator` does volume accounting, so it cannot answer
+`storage.block`, which is raw block I/O owned by fluxor's `sd` /
+`nvme` / `flash_rp`. Either claim would be one nothing could
+honour, and by-contract resolution is precisely the mechanism that
+would route a real consumer to it. The `storage.object` surface is a
+composition — descriptors here, bytes from the body plane — which
+`admin_router` already performs; whoever exports a dispatch for it
+owns the claim.
+
+The fence column is what the dispatch actually returns, not a
+ceiling: `achieved_fence` reports `Volatile` when there is no WAL,
+because the whole point of the fence axis is that a consumer can
+tell the three apart.
 
 Public modules return real `Fence` values: `ReplicatedDurable` with
 a non-empty `ClustorFenceWitness` when backed by clustor, or

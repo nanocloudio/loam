@@ -30,7 +30,10 @@ pub const CLASS_REPLICATED: u8 = 2;
 pub const CLASS_CHAIN_REPLICATED: u8 = 3;
 pub const CLASS_SNAPSHOT: u8 = 4;
 
-pub const MAX_STRING: usize = 4096;
+/// Key ceiling, from the single register in `loam_limits.rs`.
+/// Deriving it rather than declaring a number here is what keeps
+/// this wire from accepting an id the arena slot cannot store.
+pub const MAX_STRING: usize = super::limits::MAX_OBJECT_ID;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireError {

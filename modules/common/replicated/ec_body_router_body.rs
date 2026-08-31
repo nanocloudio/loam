@@ -35,15 +35,12 @@
 //   - DELETE: fan DELETE(K_i) to every ranked target; existed is
 //          the OR of the replies, NAK only if every target failed.
 //
-// Bounded step contract: at most MAX_OPS_PER_STEP upstream
-// requests + MAX_OPS_PER_STEP responses-per-target per step; the
+// Bounded step contract: at most OPS_PER_STEP upstream
+// requests + OPS_PER_STEP responses-per-target per step; the
 // reconstruction solve is one ≤16×16 GF(256) inversion.
 
-const MAX_OPS_PER_STEP: u32 = 4;
 const READ_BUF: usize = super::body_wire::MAX_BODY + 64;
 const SCRATCH: usize = super::body_wire::MAX_BODY + 64;
-const PENDING_CAP: usize = 64;
-const JOIN_CAP: usize = 32;
 
 /// Per-shard stride in the reassembly buffer. k ≥ 2 bounds a
 /// shard at ceil(MAX_BODY / 2); blobs add SHARD_HDR on the wire
@@ -65,14 +62,6 @@ const KIND_SCRUB_CLEANUP: u8 = 9;
 use super::ec::MAX_SHARDS;
 use super::placement::Fleet;
 use super::placement_wire::MAX_FLEET;
-
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-pub struct PendingTarget {
-    pub in_use: u8,
-    pub join_idx: u16,
-    pub join_gen: u16,
-}
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -124,10 +113,12 @@ pub struct ModuleState {
     pub fleet_epoch: u64,
     pub fleet_members: [u8; MAX_FLEET],
     pub fleet_count: u8,
-    pub per_target_head: [u32; MAX_FLEET],
-    pub per_target_tail: [u32; MAX_FLEET],
-    pub per_target_pending: [[PendingTarget; PENDING_CAP]; MAX_FLEET],
-    pub joins: [JoinSlot; JOIN_CAP],
+    /// Per-member dispatch FIFOs — the shared engine
+    /// (`replicated/fanout_engine.rs`). Both routers fan one upstream
+    /// request to several members and rejoin by arrival order; that
+    /// queue is the seam where they genuinely agree.
+    pub queues: super::fanout_engine::TargetQueues<MAX_FLEET, { super::limits::ROUTER_PENDING }>,
+    pub joins: [JoinSlot; super::limits::ROUTER_JOINS],
     pub join_gen: u16,
     pub assembly: Assembly,
     pub blob_buf: [u8; BLOB_BUF],
@@ -279,47 +270,6 @@ unsafe fn free_join(s: &mut ModuleState, idx: u16) {
     }
 }
 
-unsafe fn enqueue_target(
-    s: &mut ModuleState,
-    target_slot: u8,
-    join_idx: u16,
-    join_gen: u16,
-) -> bool {
-    let t = target_slot as usize;
-    let next = (s.per_target_tail[t].wrapping_add(1)) % PENDING_CAP as u32;
-    if next == s.per_target_head[t] {
-        return false;
-    }
-    s.per_target_pending[t][s.per_target_tail[t] as usize] = PendingTarget {
-        in_use: 1,
-        join_idx,
-        join_gen,
-    };
-    s.per_target_tail[t] = next;
-    true
-}
-
-unsafe fn unenqueue_tail(s: &mut ModuleState, target_slot: u8) {
-    let t = target_slot as usize;
-    if s.per_target_head[t] == s.per_target_tail[t] {
-        return;
-    }
-    let prev = (s.per_target_tail[t].wrapping_add(PENDING_CAP as u32 - 1)) % PENDING_CAP as u32;
-    s.per_target_pending[t][prev as usize].in_use = 0;
-    s.per_target_tail[t] = prev;
-}
-
-unsafe fn dequeue_target(s: &mut ModuleState, target_slot: u8) -> Option<PendingTarget> {
-    let t = target_slot as usize;
-    if s.per_target_head[t] == s.per_target_tail[t] {
-        return None;
-    }
-    let entry = s.per_target_pending[t][s.per_target_head[t] as usize];
-    s.per_target_pending[t][s.per_target_head[t] as usize].in_use = 0;
-    s.per_target_head[t] = (s.per_target_head[t].wrapping_add(1)) % PENDING_CAP as u32;
-    Some(entry)
-}
-
 /// Write `req_n` bytes of `s.scratch` to `member_id` with a
 /// pending entry; false = unwound, no response will come.
 unsafe fn dispatch_to_target(
@@ -337,12 +287,12 @@ unsafe fn dispatch_to_target(
     if req_chan < 0 {
         return false;
     }
-    if !enqueue_target(s, member_id, join_idx, join_gen) {
+    if !s.queues.enqueue(member_id, join_idx, join_gen) {
         return false;
     }
     let wrote = (syscalls.channel_write)(req_chan, s.scratch.as_ptr(), req_n);
     if wrote < 0 || (wrote as usize) != req_n {
-        unenqueue_tail(s, member_id);
+        s.queues.unenqueue_tail(member_id);
         return false;
     }
     s.fanned_out = s.fanned_out.wrapping_add(1);
@@ -383,7 +333,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     // ── 1. FleetEpoch updates. ──────────────────────────────────
     if s.fleet_in_chan >= 0 {
         let mut handled: u32 = 0;
-        while handled < MAX_OPS_PER_STEP {
+        while handled < super::limits::OPS_PER_STEP {
             let mut buf = [0u8; 64];
             let n = (syscalls.channel_read)(s.fleet_in_chan, buf.as_mut_ptr(), buf.len());
             if n <= 0 {
@@ -415,7 +365,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
 
     // ── 3. Upstream body requests. ──────────────────────────────
     let mut handled: u32 = 0;
-    while handled < MAX_OPS_PER_STEP {
+    while handled < super::limits::OPS_PER_STEP {
         let mut buf = [0u8; READ_BUF];
         let n = (syscalls.channel_read)(s.admin_in_chan, buf.as_mut_ptr(), buf.len());
         if n <= 0 {
@@ -439,17 +389,17 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
             continue;
         }
         let mut drained: u32 = 0;
-        while drained < MAX_OPS_PER_STEP {
+        while drained < super::limits::OPS_PER_STEP {
             let mut buf = [0u8; READ_BUF];
             let n = (syscalls.channel_read)(resp_chan, buf.as_mut_ptr(), buf.len());
             if n <= 0 {
                 break;
             }
             let resp = &buf[..n as usize];
-            match dequeue_target(s, t as u8) {
+            match s.queues.dequeue(t as u8) {
                 Some(pending) => {
                     let ji = pending.join_idx as usize;
-                    if ji >= JOIN_CAP
+                    if ji >= super::limits::ROUTER_JOINS
                         || s.joins[ji].in_use == 0
                         || s.joins[ji].gen != pending.join_gen
                     {

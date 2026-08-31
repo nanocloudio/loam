@@ -1,12 +1,25 @@
 version = "0.1.0"
 hardware_targets = ["bcm2712"]
 
-# Canonical storage surface this module provides (fluxor
-# storage_capability_surface.md; declared per
-# rfc_storage_capability_symmetry §4/§6 phase 4). Consumers reach it
-# by naming the ports below — the documented channel-provider path.
-# Honest fence class: ReplicatedDurable (via raft_metadata_client) or LocalDurable (WAL-only single node).
-provides = ["storage.object"]
+# Deliberately NO `provides` claim.
+#
+# This module cannot serve `storage.object`. That surface is
+# whole-blob BYTE access — PUT / GET / HEAD / RANGE_GET / DELETE on
+# object bytes — and this module holds
+# DESCRIPTORS: id, size, placement, content digest. It has no bytes to
+# return, so a consumer resolving `storage.object` by contract would
+# bind to a provider that must ENOSYS the surface's whole reason for
+# existing. A declaration nothing can honour is worse than no
+# declaration: by-contract resolution is exactly the mechanism that
+# would route a real consumer here.
+#
+# The surface is a COMPOSITION — descriptor lookup here plus bytes from
+# the body plane — which is what `admin_router` already performs for
+# PUT_FILE / GET_FILE. Whoever owns that composition owns the claim;
+# until a module exports `module_provides_contract` for it, nothing in
+# loam does. Honest fence class of what this module DOES hold:
+# ReplicatedDurable (via raft_metadata_client) or LocalDurable
+# (WAL-only single node).
 
 [[ports]]
 name = "object_requests"
@@ -34,4 +47,4 @@ requires_contract = "fs"
 access = "write"
 
 [observability]
-exempt = "in-arena state counters (ops/errors/scrub tallies) readable by the host harness; typed MSG_METRIC_SAMPLE emission is tracked RFC 0004 polish"
+exempt = "in-arena state counters (ops/errors/scrub tallies) readable by the host harness; typed MSG_METRIC_SAMPLE emission is not wired yet"

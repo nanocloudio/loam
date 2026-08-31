@@ -18,7 +18,6 @@
 // record per step. Producer/consumer backpressure flows through
 // the channels naturally.
 
-const MAX_OPS_PER_STEP: u32 = 4;
 const READ_BUF: usize = 4200;
 const SCRATCH: usize = 4200;
 pub const LOG_PATH_BUF: usize = 256;
@@ -174,7 +173,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     };
 
     let mut handled: u32 = 0;
-    while handled < MAX_OPS_PER_STEP {
+    while handled < super::limits::OPS_PER_STEP {
         let mut buf = [0u8; READ_BUF];
         let n = (syscalls.channel_read)(s.in_chan, buf.as_mut_ptr(), READ_BUF);
         if n <= 0 {

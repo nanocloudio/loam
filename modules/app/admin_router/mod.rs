@@ -3,12 +3,11 @@
 // Loam's admin_router PIC module. Front-door for external admin
 // clients. Step body in `modules/common/mechanics/admin_router_body.rs`.
 //
-// Phase 4a: only the slot-0 input/output pair is wired by the
-// kernel via `module_new`. Downstream namespace_router channels
-// need explicit channel-port lookup once that helper exists; for
-// now the PIC won't function inside a real graph without
-// follow-up wiring. The host PIC harness exercises the body's
-// internals directly.
+// The kernel wires only the slot-0 input/output pair via
+// `module_new`; the downstream namespace_router channels are
+// resolved by explicit channel-port lookup, so a graph that omits
+// that wiring gets a router that can reply but not route. The host
+// PIC harness exercises the body's internals directly.
 
 use core::ffi::c_void;
 
@@ -24,6 +23,9 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 mod admin;
 
 #[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[path = "../../common/mechanics/loam_limits.rs"]
+mod limits;
+
 #[path = "../../common/mechanics/loam_wire.rs"]
 mod ns_wire;
 

@@ -78,7 +78,7 @@ scratch directory is enough:
 ```sh
 mkdir -p data/quickstart
 loam validate --config config/loam.toml
-loam surfaces
+loam surfaces --modules modules   # reads modules/app/*/manifest.toml
 echo "hello loam" | loam put-file --wal data/quickstart/ns.wal \
     --body-root data/quickstart/bodies acme /notes/hello.txt -
 loam read --wal data/quickstart/ns.wal acme /notes/hello.txt
@@ -123,6 +123,70 @@ restart replays to the same contents.
 per-access-key bucket scopes; without it the gateway is anonymous.
 `--gc-interval N` sweeps orphaned body blobs and unbound object
 descriptors every N ticks — see [durability.md](durability.md).
+
+## Remote admin
+
+The admin surface can also be reached over TCP, for a consumer that
+runs somewhere other than the storage node — a volume backend, a CSI
+plugin. It carries no per-op authorization: a connection that
+authenticates can bind, read and delete anything in any namespace,
+so `--admin-listen` is REFUSED without `--admin-token` rather than
+quietly serving an anonymous surface off-box.
+
+```sh
+head -c 32 /dev/urandom | xxd -p -c 64 > /etc/loam.token
+loam-server --socket /tmp/loam.sock --admin-listen 0.0.0.0:7788 \
+            --admin-token /etc/loam.token \
+            --ns-wal data/srv/ns.wal --obj-wal data/srv/obj.wal \
+            --fleet dir:data/srv/bodies
+```
+
+Authentication is connection-scoped, not per-request: a client
+presents the token once, and the boundary that matters is who is on
+the far end of the socket. `loam-client`'s `connect_tcp` pairs with
+`authenticate` for exactly that reason.
+
+## Block volumes over NBD
+
+A volume is N fixed-size extents in the body plane, replicated like
+any other body. `loam-nbd` exports one as an NBD device, so a kernel
+(`nbd-client`) or a hypervisor (qemu's `nbd:` driver) can mount what
+loam already stores:
+
+```sh
+loam-nbd --socket /tmp/loam.sock --volume vol:/disks/data \
+         --listen 127.0.0.1:10809
+```
+
+Against a remote node, which is the shape a volume backend runs in:
+
+```sh
+loam-nbd --admin tcp://storage-node:7788 --token-file /etc/loam.token \
+         --volume vol:/disks/data --listen 127.0.0.1:10809
+```
+
+## Snapshots, clones and export
+
+A snapshot is a manifest — a `(key, digest)` listing — and nothing
+more. It pins its bodies by BINDING them under a root the caller
+names, so they are protected by the same reachability answer the
+orphan GC already computes for ordinary bindings: no per-body
+refcount appears, and the collector needs no snapshot-shaped query.
+The manifest itself is returned to the caller as bytes, to store
+wherever it belongs.
+
+`loam-client` carries the operations: `snapshot_create` writes the
+manifest, `snapshot_restore` binds its entries under a new root (a
+clone — bodies are shared, not copied), and `snapshot_delete` drops
+it, after which the GC reclaims whatever nothing else references.
+
+Export between two clusters is a function over two clients rather
+than a protocol. `export_snapshot` asks the destination which
+digests it lacks (`manifest_missing_here`), sends only those, then
+binds the manifest's entries — so deduplication is free and the
+transfer is ordinary reads and writes. The manifest is
+encryption-agnostic and its digests are over plaintext, so it means
+the same thing on both sides whatever keys each cluster holds.
 
 ## Replicated body plane
 

@@ -35,11 +35,7 @@
 // capacity. A per-silicon fmod capacity knob is tracked in RFC
 // 0004 — modules loaded on the host profile today still carry the
 // embedded profile.
-#[cfg(target_os = "none")]
-const ARENA_CAPACITY: usize = 256;
-#[cfg(not(target_os = "none"))]
-const ARENA_CAPACITY: usize = 8192;
-const MAX_OPS_PER_STEP: u32 = 4;
+const ARENA_CAPACITY: usize = super::limits::NAMESPACE_SLOTS;
 /// Concurrent `LOOKUP` handles. Bounded like every other arena here:
 /// a provider that can be asked for unlimited handles is a provider
 /// with an unbounded step.
@@ -59,7 +55,7 @@ const READ_BUF: usize = 256;
 /// budget plus one more read, so refilling never starves the step: a
 /// buffer that only fits two reads caps intake at two records per step
 /// regardless of what the budget allows.
-const REQ_ASM: usize = READ_BUF * (MAX_OPS_PER_STEP as usize + 1);
+const REQ_ASM: usize = READ_BUF * (super::limits::OPS_PER_STEP as usize + 1);
 
 /// Inline WAL-path buffer in `ModuleState`. The TLV parameter
 /// handler populates this; the PIC mod.rs uses it to drive
@@ -188,6 +184,48 @@ pub struct ModuleState {
     pub snapshots_written: u32,
     pub evictions: u32,
     pub snap_misses: u32,
+    /// Live `namespace::SUBSCRIBE` registrations. Each holds the
+    /// prefix it watches and the channel to push `namespace.change`
+    /// onto.
+    pub subs: [SubSlot; NS_SUB_MAX],
+    /// Scratch for one encoded event. Sized from the register.
+    pub event_buf: [u8; super::change_wire::EVENT_MAX],
+}
+
+/// Concurrent change subscriptions. Small on purpose: each slot costs
+/// its prefix inline, and a graph wires a bounded set of consumers.
+pub const NS_SUB_MAX: usize = 8;
+
+/// One `namespace::SUBSCRIBE` registration.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct SubSlot {
+    pub in_use: u8,
+    /// Set when a push was refused by a full channel. The subscriber's
+    /// view is now incomplete, so it is owed a LOST sentinel and
+    /// nothing else until it has been sent one. Dropping events
+    /// silently is the failure this flag exists to make impossible.
+    pub lost_pending: u8,
+    pub prefix: [u8; super::limits::MAX_PATH],
+    pub prefix_len: u16,
+    pub sink_chan: i32,
+    pub sequence: u32,
+}
+
+impl SubSlot {
+    pub const fn empty() -> Self {
+        Self {
+            in_use: 0,
+            lost_pending: 0,
+            prefix: [0u8; super::limits::MAX_PATH],
+            prefix_len: 0,
+            sink_chan: -1,
+            sequence: 0,
+        }
+    }
+    pub fn prefix(&self) -> &[u8] {
+        &self.prefix[..self.prefix_len as usize]
+    }
 }
 
 /// Concurrent deletion reservations. The sweep holds one at a time;
@@ -294,12 +332,19 @@ pub unsafe fn open_and_replay_wal(state_ptr: *mut u8, wal_path: &[u8]) -> i32 {
     // replay: the WAL tail is revision-gated, so replaying over
     // any snapshot generation converges.
     s.snap_fd = -1;
-    if let Some((snap, slot)) = super::snapshot::snap_open_best(sys, wal_path) {
-        s.snap_active = 1;
-        s.snap_slot = slot;
-        s.snap_fd = snap.fd;
-        s.snap_count = snap.count;
-        s.snap_gen = snap.generation;
+    // `minimal` carries no snapshot tier: the arena is the whole set
+    // there and the WAL is its durable record. Guarding at the one
+    // activation point keeps every downstream `snap_active != 0`
+    // check correct without a second condition, and lets the
+    // optimiser drop the compactor with it.
+    if super::limits::SNAPSHOT_TIER {
+        if let Some((snap, slot)) = super::snapshot::snap_open_best(sys, wal_path) {
+            s.snap_active = 1;
+            s.snap_slot = slot;
+            s.snap_fd = snap.fd;
+            s.snap_count = snap.count;
+            s.snap_gen = snap.generation;
+        }
     }
 
     let mut scratch = [0u8; super::wal::MAX_WAL_REC];
@@ -340,46 +385,13 @@ pub unsafe fn open_and_replay_wal(state_ptr: *mut u8, wal_path: &[u8]) -> i32 {
 /// `ModuleState`; `params` must be a valid byte slice for the
 /// duration of the call.
 pub unsafe fn decode_wal_path_params(state_ptr: *mut u8, params: *const u8, params_len: usize) {
-    if state_ptr.is_null() || params.is_null() || params_len == 0 {
+    if state_ptr.is_null() {
         return;
     }
     let s = &mut *(state_ptr as *mut ModuleState);
-    let is_tlv = params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
-    if is_tlv {
-        // Scan the TLV stream for tag=1 (wal_path). Entries are
-        // `[tag:u8][len:u8][bytes:len]`; `0xFF` is the end marker.
-        let mut off = 4usize;
-        while off + 2 <= params_len {
-            let tag = *params.add(off);
-            let elen = *params.add(off + 1) as usize;
-            off += 2;
-            if tag == 0xFF {
-                break;
-            }
-            if tag == 1 && off + elen <= params_len {
-                let copy = elen.min(WAL_PATH_BUF);
-                let src = params.add(off);
-                let mut i = 0usize;
-                while i < copy {
-                    s.wal_path[i] = *src.add(i);
-                    i += 1;
-                }
-                s.wal_path_len = copy as u16;
-                return;
-            }
-            off += elen;
-        }
-        return;
+    if let Some(n) = super::wal::decode_wal_path(params, params_len, &mut s.wal_path) {
+        s.wal_path_len = n as u16;
     }
-    // Raw-bytes fallback.
-    let copy = params_len.min(WAL_PATH_BUF);
-    let src = params;
-    let mut i = 0usize;
-    while i < copy {
-        s.wal_path[i] = *src.add(i);
-        i += 1;
-    }
-    s.wal_path_len = copy as u16;
 }
 
 /// Open a WAL using the path the TLV param handler stored in
@@ -453,6 +465,13 @@ unsafe fn init_state(
     s.snap_fd = -1;
     s.cmp_writer_fd = -1;
     s.wal_path_len = 0;
+    for sub in s.subs.iter_mut() {
+        sub.in_use = 0;
+        sub.lost_pending = 0;
+        sub.prefix_len = 0;
+        sub.sink_chan = -1;
+        sub.sequence = 0;
+    }
     // `append_scratch` and `wal_path` are caller-zeroed; bytes are
     // overwritten as records and the TLV param flow.
     0
@@ -525,7 +544,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
 
     let mut handled: u32 = 0;
     let mut req_off: usize = 0;
-    while handled < MAX_OPS_PER_STEP {
+    while handled < super::limits::OPS_PER_STEP {
         // An answer still owed means the channel is not draining;
         // another record could not be answered either.
         if s.reply.owed() {
@@ -912,7 +931,10 @@ unsafe fn handle_lookup(s: &mut ModuleState, syscalls: &super::SyscallTable, byt
         }
     };
     let (ns_h, p_h) = super::state::key_hash(req.namespace_root, req.path);
-    let arena_hit = s.bindings.lookup_hashed(ns_h, p_h).copied();
+    let arena_hit = s
+        .bindings
+        .lookup_hashed(ns_h, p_h, req.namespace_root, req.path)
+        .copied();
     let n = match arena_hit {
         Some(slot) if slot.kind == super::state::KIND_TOMBSTONE => {
             // A tombstone masks any on-disk snapshot record.
@@ -1017,7 +1039,12 @@ unsafe fn handle_list(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes
                     if rec.ns_hash != ns_h
                         || rec.path_len == 0
                         || s.bindings
-                            .lookup_hashed(rec.ns_hash, rec.path_hash)
+                            .lookup_hashed(
+                                rec.ns_hash,
+                                rec.path_hash,
+                                &rec.root[..rec.root_len as usize],
+                                &rec.path[..rec.path_len as usize],
+                            )
                             .is_some()
                     {
                         continue;
@@ -1212,7 +1239,10 @@ unsafe fn apply_op(
     if op == super::wire::OP_UNBIND && s.snap_active != 0 {
         let dec = super::wire::decode_unbind(payload).map_err(|_| ApplyFault::Rejected)?;
         let (ns_h, p_h) = super::state::key_hash(dec.namespace_root, dec.path);
-        let revision = match s.bindings.lookup_hashed(ns_h, p_h) {
+        let revision = match s
+            .bindings
+            .lookup_hashed(ns_h, p_h, dec.namespace_root, dec.path)
+        {
             Some(slot) if slot.kind == super::state::KIND_TOMBSTONE => {
                 return Err(ApplyFault::Rejected)
             }
@@ -1539,11 +1569,22 @@ pub(super) fn apply_to_arena(
 // by resolving `module_provides_contract` + `module_provider_dispatch`,
 // so a declaration without them advertises a surface nothing can reach.
 //
-// What is implemented is exactly what `CAPS` reports. The arena holds
-// binding paths inline, so the read surface and BIND/DELETE are real;
-// SUBSCRIBE, CHANGES and RENAME are not implemented here and their
-// capability bits stay clear, which is the two-step procedure the
-// contract prescribes rather than a silent gap.
+// COST NOTE. `SUBSCRIBE`'s initial listing and `CHANGES` both walk
+// the whole arena inside one `provider_call`. That is O(arena), the
+// same order every other op here already pays — `live_slot` scans
+// linearly for LOOKUP, STAT and DELETE — so it is consistent with
+// the module rather than a new hazard. It is still a real number at
+// service-class capacity (8192 slots), and paging `CHANGES` on a
+// cursor the way `LIST` and `OP_REFERENCED` are paged is the obvious
+// next move if it starts to bind. The OUTPUT is already bounded: a
+// window that does not fit the caller's buffer answers LOST.
+//
+// What is implemented is exactly what `CAPS` reports, and that is now
+// the whole surface: the mandatory read ops, BIND, RENAME, DELETE,
+// and the two change ops. SUBSCRIBE and CHANGES are what make loam
+// usable as a control-plane store — level-triggered reconciliation is
+// how nanocloud's forty store-consuming modules are built, and a
+// store that must be polled cannot be that store.
 
 /// `storage.namespace` contract id.
 pub const CONTRACT_STORAGE_NAMESPACE: u32 = 0x0013;
@@ -1551,15 +1592,23 @@ pub const CONTRACT_STORAGE_NAMESPACE: u32 = 0x0013;
 pub const NS_OP_LOOKUP: u32 = 0x1300;
 pub const NS_OP_STAT: u32 = 0x1301;
 pub const NS_OP_LIST: u32 = 0x1302;
+pub const NS_OP_RENAME: u32 = 0x1303;
 pub const NS_OP_DELETE: u32 = 0x1304;
+pub const NS_OP_SUBSCRIBE: u32 = 0x1305;
+pub const NS_OP_CHANGES: u32 = 0x1307;
 pub const NS_OP_CLOSE: u32 = 0x1306;
 pub const NS_OP_BIND: u32 = 0x1308;
 pub const NS_OP_CAPS: u32 = 0x13FF;
 
-/// Capability bits this provider sets. BIND and DELETE only: the ops
-/// below them are the mandatory read surface, and the bits left clear
-/// are ops a caller must not assume.
-pub const NS_CAPS: u32 = (1 << 0) | (1 << 2);
+/// Capability bits this provider sets: BIND(0), RENAME(1), DELETE(2),
+/// SUBSCRIBE(3), CHANGES(4). Every optional op on the surface. The
+/// mandatory read ops carry no bit.
+pub const NS_CAPS: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4);
+
+/// Subscription handles are returned above the LOOKUP handle space so
+/// `CLOSE` can tell the two apart from the handle alone — the contract
+/// gives CLOSE one opcode for both.
+const SUB_HANDLE_BASE: i32 = 0x4000;
 
 const E_INVAL: i32 = -22;
 const E_NOENT: i32 = -2;
@@ -1590,6 +1639,70 @@ unsafe fn achieved_fence(s: &ModuleState) -> super::abi::fence::Fence {
     }
 }
 
+/// Pull the trailing `[fence_out_ptr u64][fence_out_cap u16]` pair
+/// out of an argument buffer at `off`. Absent is legal — a caller
+/// that does not want the fence simply omits it.
+fn read_fence_out(a: &[u8], off: usize) -> (*mut u8, usize) {
+    if a.len() < off + 10 {
+        return (core::ptr::null_mut(), 0);
+    }
+    let p = u64::from_le_bytes([
+        a[off],
+        a[off + 1],
+        a[off + 2],
+        a[off + 3],
+        a[off + 4],
+        a[off + 5],
+        a[off + 6],
+        a[off + 7],
+    ]);
+    let c = u16::from_le_bytes([a[off + 8], a[off + 9]]) as usize;
+    (p as *mut u8, c)
+}
+
+/// A stable 16-byte source id for a namespace root.
+///
+/// `ViewConsistent` and `RevisionMonotone` carry an explicit source
+/// so two unrelated namespaces at the same revision do not compare as
+/// dominating each other. Loam mints no ObjectIds, so the root's own
+/// bytes are the identity: FNV over the root, twice with different
+/// seeds, gives 16 stable bytes that differ when the roots differ.
+/// Not a secret and not a cryptographic id — it exists to keep the
+/// fence lattice honest, nothing more.
+fn view_source(root: &[u8]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let a = super::state::fnv1a64(root);
+    // Second half over the root with a byte appended, so a root and
+    // its prefix cannot collide into the same source.
+    let mut b = super::state::fnv1a64(root);
+    b ^= 0x9E37_79B9_7F4A_7C15;
+    out[0..8].copy_from_slice(&a.to_le_bytes());
+    out[8..16].copy_from_slice(&b.to_le_bytes());
+    out
+}
+
+/// Write a VIEW fence — what revision this read observed — into a
+/// caller-supplied out-parameter.
+///
+/// Distinct from `write_fence_out`, which reports DURABILITY. A read
+/// has not committed anything, so a durability fence answers a
+/// question nobody asked; what a `CHANGES` caller needs is the
+/// revision its window covered, because that is its next `since`.
+/// The contract says so explicitly and the snapshot design in RFC
+/// 0008 depends on it: a manifest is only a point-in-time record if
+/// something states which point in time.
+unsafe fn write_view_fence_out(root: &[u8], revision: u64, ptr: *mut u8, cap: usize) {
+    if ptr.is_null() || cap < super::abi::fence::WIRE_MAX_LEN {
+        return;
+    }
+    let buf = core::slice::from_raw_parts_mut(ptr, cap);
+    let _ = super::abi::fence::Fence::ViewConsistent {
+        source: view_source(root),
+        revision,
+    }
+    .encode(buf);
+}
+
 /// Write the achieved fence into a caller-supplied out-parameter.
 /// A short or absent buffer is the caller's error, not a reason to
 /// fail the operation that already happened.
@@ -1617,6 +1730,78 @@ unsafe fn respond(s: &mut ModuleState, syscalls: &super::SyscallTable, byte: u8)
     let _ = s.reply.send(syscalls.channel_write, s.out_chan, &[byte]);
 }
 
+/// Push one change to every subscriber watching a matching prefix.
+///
+/// Called AFTER the arena has been mutated, so what a subscriber sees
+/// is a change that happened, never one that was about to. A sink
+/// that refuses the write (a full channel) does not lose the event
+/// quietly: the subscription is flagged `lost_pending`, and the next
+/// successful push is the LOST sentinel, which tells the consumer to
+/// relist through `CHANGES` instead of trusting an incomplete stream.
+/// Silent loss is the one failure a level-triggered reconciler cannot
+/// detect for itself, which is why it is not an option here.
+unsafe fn notify_change(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    kind: u8,
+    key: &[u8],
+    value: &[u8],
+) {
+    // The arena stamped this mutation as it applied it, so the event
+    // and the slot carry the SAME position — a subscriber and a
+    // `CHANGES` caller therefore agree about ordering, which is the
+    // whole point of the pair.
+    let rev = s.bindings.change_seq();
+    for i in 0..NS_SUB_MAX {
+        if s.subs[i].in_use == 0 || s.subs[i].sink_chan < 0 {
+            continue;
+        }
+        if !super::change_wire::under_prefix(key, s.subs[i].prefix()) {
+            continue;
+        }
+        push_to_sub(s, syscalls, i, rev, kind, key, value);
+    }
+}
+
+/// Encode and push one event to subscription `i`, settling any owed
+/// LOST sentinel first.
+unsafe fn push_to_sub(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    i: usize,
+    rev: u64,
+    kind: u8,
+    key: &[u8],
+    value: &[u8],
+) {
+    let chan = s.subs[i].sink_chan;
+    if s.subs[i].lost_pending != 0 {
+        let seq = s.subs[i].sequence;
+        let Some(n) = super::change_wire::encode_lost_event(&mut s.event_buf, seq, rev) else {
+            return;
+        };
+        if (syscalls.channel_write)(chan, s.event_buf.as_ptr(), n) != n as i32 {
+            return; // still blocked; stay owed
+        }
+        s.subs[i].sequence = seq.wrapping_add(1);
+        s.subs[i].lost_pending = 0;
+        // The sentinel told the consumer to relist, so this event is
+        // covered by the relist it will now perform.
+        return;
+    }
+    let seq = s.subs[i].sequence;
+    let Some(n) = super::change_wire::encode_event(&mut s.event_buf, seq, rev, kind, key, value)
+    else {
+        s.subs[i].lost_pending = 1;
+        return;
+    };
+    if (syscalls.channel_write)(chan, s.event_buf.as_ptr(), n) == n as i32 {
+        s.subs[i].sequence = seq.wrapping_add(1);
+    } else {
+        s.subs[i].lost_pending = 1;
+    }
+}
+
 /// Find the live binding for `path`, or `None`.
 ///
 /// A deleted binding stays in the arena as a tombstone so the deletion
@@ -1627,7 +1812,9 @@ unsafe fn live_slot(s: &ModuleState, path: &[u8]) -> Option<(u32, u64)> {
     let (ns_h, p_h) = super::state::key_hash(&[], path);
     for i in 0..s.bindings.capacity() {
         if let Some(slot) = s.bindings.slot_ref(i) {
-            if slot.occupied && slot.matches(ns_h, p_h) && slot.kind != super::state::KIND_TOMBSTONE
+            if slot.occupied
+                && slot.matches(ns_h, p_h, &[], path)
+                && slot.kind != super::state::KIND_TOMBSTONE
             {
                 return Some((i as u32, slot.revision));
             }
@@ -1718,7 +1905,19 @@ pub unsafe fn provider_dispatch_impl(
             need as i32
         }
 
+        // One opcode closes both handle kinds; the base tells them
+        // apart, so a caller never has to say which it holds.
         NS_OP_CLOSE => {
+            if handle >= SUB_HANDLE_BASE {
+                let idx = (handle - SUB_HANDLE_BASE) as usize;
+                if idx >= NS_SUB_MAX || s.subs[idx].in_use == 0 {
+                    return E_INVAL;
+                }
+                s.subs[idx].in_use = 0;
+                s.subs[idx].sink_chan = -1;
+                s.subs[idx].lost_pending = 0;
+                return 0;
+            }
             let idx = handle as usize;
             if handle < 0 || idx >= NS_OPEN_MAX || s.ns_open[idx].in_use == 0 {
                 return E_INVAL;
@@ -1787,8 +1986,24 @@ pub unsafe fn provider_dispatch_impl(
             match s.bindings.bind(&[], path, target, kind, revision) {
                 Ok(_) => {
                     write_fence_out(s, fence_ptr, fence_cap);
+                    let k = if existing.is_some() {
+                        super::change_wire::KIND_MODIFIED
+                    } else {
+                        super::change_wire::KIND_ADDED
+                    };
+                    // Copy the key and value out before notifying: the
+                    // borrow of `arg` cannot outlive the &mut on state
+                    // that the push needs.
+                    let mut kb = [0u8; super::limits::MAX_PATH];
+                    let mut vb = [0u8; super::limits::MAX_OBJECT_ID];
+                    kb[..path.len()].copy_from_slice(path);
+                    vb[..target.len()].copy_from_slice(target);
+                    let (klen, vlen) = (path.len(), target.len());
+                    let sys = &*s.syscalls;
+                    notify_change(s, sys, k, &kb[..klen], &vb[..vlen]);
                     0
                 }
+                Err(super::state::ApplyError::KeyTooLong) => E_INVAL,
                 Err(_) => E_EXIST,
             }
         }
@@ -1808,9 +2023,295 @@ pub unsafe fn provider_dispatch_impl(
                 None => return E_NOENT,
             };
             match s.bindings.tombstone(&[], path, rev.wrapping_add(1)) {
-                Ok(_) => 0,
+                Ok(_) => {
+                    let mut kb = [0u8; super::limits::MAX_PATH];
+                    kb[..path.len()].copy_from_slice(path);
+                    let klen = path.len();
+                    let sys = &*s.syscalls;
+                    notify_change(s, sys, super::change_wire::KIND_DELETED, &kb[..klen], &[]);
+                    0
+                }
+                Err(super::state::ApplyError::KeyTooLong) => E_INVAL,
                 Err(_) => E_NOENT,
             }
+        }
+
+        // [from_len u16][from][to_len u16][to]
+        // [fence_out_ptr u64][fence_out_cap u16]
+        NS_OP_RENAME => {
+            if arg.is_null() || arg_len < 2 {
+                return E_INVAL;
+            }
+            let a = core::slice::from_raw_parts(arg, arg_len);
+            let from_len = u16::from_le_bytes([a[0], a[1]]) as usize;
+            let mut off = 2usize;
+            if arg_len < off + from_len + 2 {
+                return E_INVAL;
+            }
+            let from = &a[off..off + from_len];
+            off += from_len;
+            let to_len = u16::from_le_bytes([a[off], a[off + 1]]) as usize;
+            off += 2;
+            if arg_len < off + to_len {
+                return E_INVAL;
+            }
+            let to = &a[off..off + to_len];
+            off += to_len;
+            let (fence_ptr, fence_cap) = read_fence_out(a, off);
+
+            // Rename is a move, so the change stream carries it as the
+            // two events a consumer's table has to apply: the old key
+            // is gone and the new one exists. Collapsing it into one
+            // event would leave every consumer holding a stale entry
+            // under the old name.
+            let Some((idx, rev)) = live_slot(s, from) else {
+                return E_NOENT;
+            };
+            if live_slot(s, to).is_some() {
+                return E_EXIST;
+            }
+            let mut vb = [0u8; super::limits::MAX_OBJECT_ID];
+            let mut vlen = 0usize;
+            if let Some(slot) = s.bindings.slot_ref(idx as usize) {
+                let oid = slot.object_id();
+                vlen = oid.len();
+                vb[..vlen].copy_from_slice(oid);
+            }
+            match s.bindings.rename(&[], from, to, rev.wrapping_add(1)) {
+                Ok(_) => {
+                    write_fence_out(s, fence_ptr, fence_cap);
+                    let mut fb = [0u8; super::limits::MAX_PATH];
+                    let mut tb = [0u8; super::limits::MAX_PATH];
+                    fb[..from.len()].copy_from_slice(from);
+                    tb[..to.len()].copy_from_slice(to);
+                    let (flen, tlen) = (from.len(), to.len());
+                    let sys = &*s.syscalls;
+                    notify_change(s, sys, super::change_wire::KIND_DELETED, &fb[..flen], &[]);
+                    notify_change(
+                        s,
+                        sys,
+                        super::change_wire::KIND_ADDED,
+                        &tb[..tlen],
+                        &vb[..vlen],
+                    );
+                    0
+                }
+                Err(super::state::ApplyError::KeyTooLong) => E_INVAL,
+                Err(super::state::ApplyError::DestinationOccupied) => E_EXIST,
+                Err(_) => E_NOENT,
+            }
+        }
+
+        // [prefix_len u16][prefix][sink_chan u32][flags u8]
+        //
+        // Returns a subscription handle. `flags` bit 0 asks for the
+        // current listing as synthesised Added events; fluxor's own
+        // `table_consumer` core leaves it clear and takes the snapshot
+        // through CHANGES(since=0) instead, so cold start and LOST
+        // recovery run the same code. Both are supported: refusing the
+        // flag would make this provider the odd one out.
+        NS_OP_SUBSCRIBE => {
+            if arg.is_null() || arg_len < 2 {
+                return E_INVAL;
+            }
+            let a = core::slice::from_raw_parts(arg, arg_len);
+            let plen = u16::from_le_bytes([a[0], a[1]]) as usize;
+            if arg_len < 2 + plen + 5 || plen > super::limits::MAX_PATH {
+                return E_INVAL;
+            }
+            let prefix = &a[2..2 + plen];
+            let off = 2 + plen;
+            let sink = u32::from_le_bytes([a[off], a[off + 1], a[off + 2], a[off + 3]]) as i32;
+            let flags = a[off + 4];
+
+            let Some(idx) = (0..NS_SUB_MAX).find(|&i| s.subs[i].in_use == 0) else {
+                return E_MFILE;
+            };
+            let mut pb = [0u8; super::limits::MAX_PATH];
+            pb[..plen].copy_from_slice(prefix);
+            s.subs[idx].prefix[..plen].copy_from_slice(prefix);
+            s.subs[idx].prefix_len = plen as u16;
+            s.subs[idx].sink_chan = sink;
+            s.subs[idx].sequence = 0;
+            s.subs[idx].lost_pending = 0;
+            s.subs[idx].in_use = 1;
+
+            if flags & 1 != 0 {
+                // Synthesise the current listing as Added events, in
+                // slot order. Bounded by the arena, like LIST.
+                let sys = &*s.syscalls;
+                for i in 0..s.bindings.capacity() {
+                    let Some(slot) = s.bindings.slot_ref(i) else {
+                        continue;
+                    };
+                    if !slot.occupied
+                        || slot.kind == super::state::KIND_TOMBSTONE
+                        || slot.path_len == 0
+                    {
+                        continue;
+                    }
+                    let mut kb = [0u8; super::limits::MAX_PATH];
+                    let mut vb = [0u8; super::limits::MAX_OBJECT_ID];
+                    let (k, v) = (slot.path(), slot.object_id());
+                    let (klen, vlen) = (k.len(), v.len());
+                    kb[..klen].copy_from_slice(k);
+                    vb[..vlen].copy_from_slice(v);
+                    let rev = slot.change_rev;
+                    if !super::change_wire::under_prefix(&kb[..klen], &pb[..plen]) {
+                        continue;
+                    }
+                    push_to_sub(
+                        s,
+                        sys,
+                        idx,
+                        rev,
+                        super::change_wire::KIND_ADDED,
+                        &kb[..klen],
+                        &vb[..vlen],
+                    );
+                }
+            }
+            SUB_HANDLE_BASE + idx as i32
+        }
+
+        // [prefix_len u16][prefix][since u64][out_ptr u64][out_cap u32]
+        // [fence_out_ptr u64][fence_out_cap u16]
+        //
+        // The synchronous dual of SUBSCRIBE: "what changed under
+        // `prefix` since revision `since`?". `since = 0` is the full
+        // current snapshot as Added records — the relist a consumer
+        // performs on cold start and after a LOST.
+        NS_OP_CHANGES => {
+            if arg.is_null() || arg_len < 2 {
+                return E_INVAL;
+            }
+            let a = core::slice::from_raw_parts(arg, arg_len);
+            let plen = u16::from_le_bytes([a[0], a[1]]) as usize;
+            let mut off = 2usize;
+            if arg_len < off + plen + 8 + 8 + 4 {
+                return E_INVAL;
+            }
+            let mut pb = [0u8; super::limits::MAX_PATH];
+            if plen > super::limits::MAX_PATH {
+                return E_INVAL;
+            }
+            pb[..plen].copy_from_slice(&a[off..off + plen]);
+            off += plen;
+            let since = u64::from_le_bytes([
+                a[off],
+                a[off + 1],
+                a[off + 2],
+                a[off + 3],
+                a[off + 4],
+                a[off + 5],
+                a[off + 6],
+                a[off + 7],
+            ]);
+            off += 8;
+            let out_ptr = u64::from_le_bytes([
+                a[off],
+                a[off + 1],
+                a[off + 2],
+                a[off + 3],
+                a[off + 4],
+                a[off + 5],
+                a[off + 6],
+                a[off + 7],
+            ]) as *mut u8;
+            off += 8;
+            let out_cap = u32::from_le_bytes([a[off], a[off + 1], a[off + 2], a[off + 3]]) as usize;
+            off += 4;
+            let (fence_ptr, fence_cap) = read_fence_out(a, off);
+            if out_ptr.is_null() || out_cap < super::change_wire::CHANGES_HEADER {
+                return E_INVAL;
+            }
+            let out = core::slice::from_raw_parts_mut(out_ptr, out_cap);
+
+            // A window we can no longer account for is answered LOST,
+            // never with a silently short one. `since > change_rev` is
+            // a client ahead of us — also a relist, since we cannot
+            // prove what it missed.
+            let head = s.bindings.change_seq();
+            // The arena is a hot cache, so a window is only
+            // answerable while the evidence is still resident. Below
+            // the horizon — a slot evicted, a tombstone compacted
+            // away — the honest answer is LOST, because a short
+            // window that looked complete is exactly what a
+            // level-triggered consumer cannot detect.
+            let horizon = s.bindings.change_horizon();
+            if (since != 0 && since < horizon) || since > head {
+                out[0] = super::change_wire::STATUS_LOST;
+                out[1..5].copy_from_slice(&0u32.to_le_bytes());
+                write_view_fence_out(&pb[..plen], head, fence_ptr, fence_cap);
+                return super::change_wire::CHANGES_HEADER as i32;
+            }
+
+            let mut n = super::change_wire::CHANGES_HEADER;
+            let mut count = 0u32;
+            for i in 0..s.bindings.capacity() {
+                let Some(slot) = s.bindings.slot_ref(i) else {
+                    continue;
+                };
+                if !slot.occupied || slot.path_len == 0 {
+                    continue;
+                }
+                // Ordered on the CHANGE stream, never on the
+                // per-key pointer revision: a freshly bound path
+                // starts at revision 1 no matter what else has
+                // happened, so filtering on that would drop every new
+                // key from a delta window.
+                if since != 0 && slot.change_rev <= since {
+                    continue;
+                }
+                let tomb = slot.kind == super::state::KIND_TOMBSTONE;
+                // since = 0 is a SNAPSHOT: it answers "what is there",
+                // so a tombstone — the record of an absence — has no
+                // place in it. A delta window carries it as Deleted.
+                if tomb && since == 0 {
+                    continue;
+                }
+                if !super::change_wire::under_prefix(slot.path(), &pb[..plen]) {
+                    continue;
+                }
+                let kind = if tomb {
+                    super::change_wire::KIND_DELETED
+                } else if since == 0 {
+                    super::change_wire::KIND_ADDED
+                } else {
+                    super::change_wire::KIND_MODIFIED
+                };
+                let value: &[u8] = if tomb { &[] } else { slot.object_id() };
+                match super::change_wire::encode_record(
+                    &mut out[n..],
+                    slot.change_rev,
+                    kind,
+                    slot.path(),
+                    value,
+                ) {
+                    Some(written) => {
+                        n += written;
+                        count += 1;
+                    }
+                    // The caller's buffer is full. Answering LOST is
+                    // the honest response: a truncated window that
+                    // looked complete is exactly the bug this surface
+                    // exists to prevent, and the contract already has
+                    // a code for "relist".
+                    None => {
+                        out[0] = super::change_wire::STATUS_LOST;
+                        out[1..5].copy_from_slice(&0u32.to_le_bytes());
+                        write_view_fence_out(&pb[..plen], head, fence_ptr, fence_cap);
+                        return super::change_wire::CHANGES_HEADER as i32;
+                    }
+                }
+            }
+            out[0] = super::change_wire::STATUS_EVENTS;
+            out[1..5].copy_from_slice(&count.to_le_bytes());
+            // The revision this window COVERS — the caller's next
+            // `since`, and the point in time a snapshot manifest
+            // built from it records.
+            write_view_fence_out(&pb[..plen], head, fence_ptr, fence_cap);
+            n as i32
         }
 
         // Not implemented, and `CAPS` says so. Returning ENOSYS rather

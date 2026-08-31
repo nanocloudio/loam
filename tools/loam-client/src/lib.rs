@@ -23,6 +23,12 @@ pub(crate) mod sha256_impl {
 }
 use sha256_impl::Sha256;
 
+#[path = "../../../modules/common/mechanics/loam_limits.rs"]
+mod limits;
+
+#[path = "../../../modules/common/mechanics/loam_manifest_wire.rs"]
+pub mod manifest_wire;
+
 #[path = "../../../modules/common/mechanics/loam_admin_wire.rs"]
 pub mod admin_wire;
 
@@ -36,8 +42,10 @@ pub mod wire_scope {
 }
 pub use wire_scope::extent_wire;
 
+use admin_wire as wire;
 use admin_wire::WireError;
 use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
@@ -49,6 +57,13 @@ pub const IO_CHUNK: usize = 48 * 1024;
 #[derive(Debug)]
 pub enum ClientError {
     Io(std::io::Error),
+    /// A manifest could not be encoded or decoded.
+    Manifest(String),
+    /// The server requires authentication and this connection has
+    /// not provided it, or the token was wrong. The server closes
+    /// the connection either way, so recovery is to reconnect —
+    /// not to retry on this one.
+    Unauthenticated,
     /// The server answered, but with a NAK status.
     Nak(u8),
     /// A reply that doesn't decode as the expected ack.
@@ -64,6 +79,12 @@ impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClientError::Io(e) => write!(f, "io: {e}"),
+            ClientError::Manifest(m) => write!(f, "manifest: {m}"),
+            ClientError::Unauthenticated => write!(
+                f,
+                "not authenticated — the server requires --admin-token; \
+                 call authenticate() first, and reconnect after a failure"
+            ),
             ClientError::Nak(s) => write!(f, "server nak (status 0x{s:02x})"),
             ClientError::Protocol(e) => write!(f, "protocol: {e:?}"),
             ClientError::CorrelationMismatch { expected, observed } => {
@@ -75,6 +96,12 @@ impl std::fmt::Display for ClientError {
 
 impl std::error::Error for ClientError {}
 
+impl From<WireError> for ClientError {
+    fn from(e: WireError) -> Self {
+        ClientError::Protocol(e)
+    }
+}
+
 impl From<std::io::Error> for ClientError {
     fn from(e: std::io::Error) -> Self {
         ClientError::Io(e)
@@ -83,9 +110,45 @@ impl From<std::io::Error> for ClientError {
 
 pub type Result<T> = std::result::Result<T, ClientError>;
 
-/// A blocking connection to a loam-server admin socket.
+/// What the admin wire is carried over.
+///
+/// An enum rather than a `Box<dyn Read + Write>`: there are exactly
+/// two transports, the dispatch is on the hot path of every frame,
+/// and a concrete type keeps the error surface honest — a unix
+/// socket and a TCP socket fail in different ways and the caller can
+/// tell which it has.
+enum Transport {
+    Unix(UnixStream),
+    Tcp(TcpStream),
+}
+
+impl Read for Transport {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Transport::Unix(s) => s.read(buf),
+            Transport::Tcp(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Transport {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Transport::Unix(s) => s.write(buf),
+            Transport::Tcp(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Transport::Unix(s) => s.flush(),
+            Transport::Tcp(s) => s.flush(),
+        }
+    }
+}
+
+/// A blocking connection to a loam-server admin surface.
 pub struct LoamClient {
-    conn: UnixStream,
+    conn: Transport,
     next_cid: u32,
 }
 
@@ -94,7 +157,48 @@ impl LoamClient {
     pub fn connect(path: impl AsRef<Path>) -> Result<Self> {
         let conn = UnixStream::connect(path)?;
         conn.set_read_timeout(Some(Duration::from_secs(30)))?;
-        Ok(LoamClient { conn, next_cid: 1 })
+        Ok(LoamClient {
+            conn: Transport::Unix(conn),
+            next_cid: 1,
+        })
+    }
+
+    /// Connect to a remote admin surface over TCP.
+    ///
+    /// This is what lets a volume backend run somewhere other than
+    /// the storage node. It is deliberately paired
+    /// with [`authenticate`](Self::authenticate) in the docs and in
+    /// every example, because the admin surface can bind, read and
+    /// delete anything in any namespace: a server started without
+    /// `--admin-token` will accept this connection and everything
+    /// sent over it, and exposing THAT off-box is worse than having
+    /// no remote transport at all.
+    pub fn connect_tcp(addr: impl std::net::ToSocketAddrs) -> Result<Self> {
+        let conn = TcpStream::connect(addr)?;
+        conn.set_read_timeout(Some(Duration::from_secs(30)))?;
+        conn.set_nodelay(true).ok();
+        Ok(LoamClient {
+            conn: Transport::Tcp(conn),
+            next_cid: 1,
+        })
+    }
+
+    /// Present `token` to the server. Must succeed before any other
+    /// call when the server was started with `--admin-token`.
+    ///
+    /// A server that requires auth closes the connection on a wrong
+    /// token rather than letting it be guessed again, so a failure
+    /// here means reconnecting, not retrying.
+    pub fn authenticate(&mut self, token: &[u8]) -> Result<()> {
+        let cid = self.cid();
+        let mut buf = vec![0u8; 8 + token.len()];
+        let n = wire::encode_admin_auth(&mut buf, cid, token)?;
+        let status = self.round_trip(&buf[..n], wire::decode_admin_auth_ack, cid)?;
+        if status == wire::STATUS_OK {
+            Ok(())
+        } else {
+            Err(ClientError::Unauthenticated)
+        }
     }
 
     fn cid(&mut self) -> u32 {
@@ -422,6 +526,35 @@ impl Volume {
 }
 
 impl LoamClient {
+    /// Raw content-addressed body write. Returns the digest the
+    /// store named it by, which is a fact about the bytes and not a
+    /// choice — so two writers storing the same bytes get the same
+    /// answer, on any cluster.
+    pub fn put_body(&mut self, blob: &[u8]) -> Result<[u8; 32]> {
+        let cid = self.cid();
+        let mut buf = vec![0u8; blob.len() + 64];
+        let n = admin_wire::encode_admin_put_body(&mut buf, cid, blob)
+            .map_err(ClientError::Protocol)?;
+        let (status, digest) = self.round_trip(
+            &buf[..n],
+            |b| {
+                admin_wire::decode_admin_put_body_ack(b)
+                    .map(|a| (a.correlation_id, (a.status, a.digest.map(|d| d.to_vec()))))
+            },
+            cid,
+        )?;
+        if status != admin_wire::STATUS_OK {
+            return Err(ClientError::Nak(status));
+        }
+        let d = digest.ok_or(ClientError::Nak(status))?;
+        let mut out = [0u8; 32];
+        if d.len() != 32 {
+            return Err(ClientError::Nak(status));
+        }
+        out.copy_from_slice(&d);
+        Ok(out)
+    }
+
     /// Raw keyed body write (mutable, last write wins).
     pub fn put_body_keyed(&mut self, key: &[u8; 32], blob: &[u8]) -> Result<()> {
         let cid = self.cid();
@@ -604,4 +737,254 @@ fn check_range(vol: &Volume, offset: u64, len: usize) -> Result<()> {
 
 fn encode_desc(dst: &mut [u8], desc: &extent_wire::VolumeDesc) -> Result<usize> {
     extent_wire::encode_volume_desc(dst, desc).map_err(|_| ClientError::Nak(admin_wire::STATUS_NAK))
+}
+
+// ── Snapshots, clones and portable export ────────────────────────
+//
+// Content addressing gives these away almost free, and the design
+// exploits that rather than building a parallel mechanism:
+//
+//   snapshot = the same object ids bound under a second root
+//   clone    = a snapshot restored into a writable root
+//   export   = the manifest blob plus the bodies it names
+//
+// The consequence worth stating: **the orphan GC needs no changes at
+// all.** It already asks "is this object id bound by anything?", and
+// a snapshot's bindings are bindings. A design that instead
+// reference-counted bodies would have needed a new durable counter,
+// a new crash model for it, and a new way to be wrong.
+//
+// A snapshot costs N bindings, which is what the namespace's hot
+// cache over a compacted snapshot file exists to absorb.
+
+impl LoamClient {
+    /// Bind `(namespace_root, path)` to an existing `object_id`
+    /// without moving any bytes.
+    ///
+    /// This is the primitive a clone is built from: the body is
+    /// already stored under its content digest, so a second name for
+    /// it is a metadata write and nothing more.
+    pub fn bind(
+        &mut self,
+        namespace_root: &[u8],
+        path: &[u8],
+        object_id: &[u8],
+        revision: u64,
+    ) -> Result<()> {
+        let cid = self.cid();
+        let mut buf = vec![0u8; namespace_root.len() + path.len() + object_id.len() + 64];
+        let n = admin_wire::encode_admin_bind(
+            &mut buf,
+            cid,
+            namespace_root,
+            path,
+            object_id,
+            0,
+            revision,
+        )?;
+        let status = self.round_trip(
+            &buf[..n],
+            |b| admin_wire::decode_admin_bind_ack(b).map(|a| (a.correlation_id, a.status)),
+            cid,
+        )?;
+        if status == admin_wire::STATUS_OK {
+            Ok(())
+        } else {
+            Err(ClientError::Nak(status))
+        }
+    }
+
+    /// The content digest of the object bound at `path`, or `None`.
+    ///
+    /// COST: this reads the body to hash it. The descriptor already
+    /// holds the digest and `STAT_FILE` could return it — that is the
+    /// obvious optimisation and it is a wire change, deliberately not
+    /// bundled into the feature that revealed the need. Snapshotting
+    /// a large namespace therefore reads it once.
+    pub fn digest_of(&mut self, namespace_root: &[u8], path: &[u8]) -> Result<Option<[u8; 32]>> {
+        let Some(body) = self.get_file(namespace_root, path)? else {
+            return Ok(None);
+        };
+        let mut h = Sha256::new();
+        h.update(&body);
+        Ok(Some(h.finalize()))
+    }
+
+    /// Freeze everything under `src_root` as a snapshot bound under
+    /// `snap_root`, and return the manifest describing it.
+    ///
+    /// Every entry is bound, not copied, so the snapshot shares its
+    /// bodies with the live namespace — and pins them against the
+    /// orphan GC by the ordinary means. The manifest is returned
+    /// rather than stored, so the caller decides whether it is worth
+    /// keeping; `put_file` it wherever you like, and it becomes an
+    /// ordinary content-addressed object with binding, replication
+    /// and GC unchanged.
+    pub fn snapshot_create(&mut self, src_root: &[u8], snap_root: &[u8]) -> Result<Vec<u8>> {
+        let keys = self.list_files(src_root)?;
+        let mut digests: Vec<(Vec<u8>, [u8; 32])> = Vec::with_capacity(keys.len());
+        for key in &keys {
+            // A key that vanished between the listing and here is
+            // simply not in the snapshot. A snapshot is of a moment,
+            // and this is that moment's honest content — better than
+            // failing the whole operation over one concurrent delete.
+            if let Some(d) = self.digest_of(src_root, key)? {
+                digests.push((key.clone(), d));
+            }
+        }
+        for (key, digest) in &digests {
+            let oid = object_id_for(digest);
+            self.bind(snap_root, key, oid.as_bytes(), 1)?;
+        }
+        let refs: Vec<(&[u8], [u8; 32])> =
+            digests.iter().map(|(k, d)| (k.as_slice(), *d)).collect();
+        let mut out = vec![0u8; manifest_wire::encoded_len(src_root, &refs)];
+        let n = manifest_wire::encode(&mut out, src_root, &refs)
+            .map_err(|e| ClientError::Manifest(format!("{e:?}")))?;
+        out.truncate(n);
+        Ok(out)
+    }
+
+    /// Restore a manifest into `dst_root`, binding every entry to the
+    /// body it names. With a fresh `dst_root` this is a CLONE: no
+    /// bytes move, because the bodies are already there under their
+    /// content digests.
+    ///
+    /// Returns how many entries were bound.
+    pub fn snapshot_restore(&mut self, manifest: &[u8], dst_root: &[u8]) -> Result<usize> {
+        let mut entries: Vec<(Vec<u8>, [u8; 32])> = Vec::new();
+        manifest_wire::for_each(manifest, |key, digest| {
+            entries.push((key.to_vec(), *digest));
+        })
+        .map_err(|e| ClientError::Manifest(format!("{e:?}")))?;
+        for (key, digest) in &entries {
+            let oid = object_id_for(digest);
+            self.bind(dst_root, key, oid.as_bytes(), 1)?;
+        }
+        Ok(entries.len())
+    }
+
+    /// Drop every binding under `snap_root`.
+    ///
+    /// The bodies are NOT deleted here, and that is the point: they
+    /// may still be named by the live namespace or another snapshot.
+    /// Whatever is left unreferenced is the orphan GC's to reclaim,
+    /// by the same rule it already applies to everything else.
+    pub fn snapshot_delete(&mut self, snap_root: &[u8]) -> Result<usize> {
+        let keys = self.list_files(snap_root)?;
+        let mut n = 0;
+        for key in &keys {
+            if self.delete_file(snap_root, key)? {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// The digests a destination would need in order to receive this
+    /// manifest — every digest it does not already hold.
+    ///
+    /// This is what makes a portable export cheap: the receiver asks
+    /// only for what it lacks, and deduplication across the transfer
+    /// is free because the names are content digests on both sides.
+    pub fn manifest_missing_here(&mut self, manifest: &[u8]) -> Result<Vec<[u8; 32]>> {
+        let mut want: Vec<[u8; 32]> = Vec::new();
+        manifest_wire::for_each(manifest, |_, d| want.push(*d))
+            .map_err(|e| ClientError::Manifest(format!("{e:?}")))?;
+        want.sort_unstable();
+        want.dedup();
+        let mut missing = Vec::new();
+        for d in want {
+            if self.get_body(&d)?.is_none() {
+                missing.push(d);
+            }
+        }
+        Ok(missing)
+    }
+}
+
+/// Copy a snapshot from `src` to `dst`, transferring only the
+/// bodies `dst` lacks, then binding the manifest's entries under
+/// `dst_root`.
+///
+/// It is deliberately a FUNCTION OVER TWO CLIENTS rather than a
+/// protocol. The manifest is encryption-agnostic and its digests are
+/// over plaintext, so a manifest means the same thing on both sides
+/// whatever
+/// keys each cluster holds — which is what lets the whole transfer
+/// be ordinary reads and writes.
+///
+/// Deduplication across the transfer is free: the receiver is asked
+/// what it lacks, and "lacks" is decided by content digest, so
+/// bytes it already holds under any other name are never sent.
+///
+/// ORDER MATTERS and is the one invariant here. Every body lands
+/// BEFORE any binding names it. A binding whose body has not
+/// arrived is a dangling name — a reader gets a not-found for
+/// something the namespace says exists — and on an interrupted
+/// transfer that state would persist. Bodies first means an
+/// interrupted export leaves unreferenced blobs, which the orphan
+/// sweep reclaims, rather than broken names, which nothing repairs.
+///
+/// Returns `(bodies_sent, entries_bound)`.
+pub fn export_snapshot(
+    src: &mut LoamClient,
+    dst: &mut LoamClient,
+    manifest: &[u8],
+    dst_root: &[u8],
+) -> Result<(usize, usize)> {
+    // 1. Ask the DESTINATION what it lacks. Asking the source would
+    //    send everything.
+    let missing = dst.manifest_missing_here(manifest)?;
+
+    // 2. Ship exactly those, verifying as we go. A digest the source
+    //    cannot produce is a broken manifest, not something to skip
+    //    quietly — skipping would produce a snapshot at the
+    //    destination that silently contains less than it claims.
+    let mut sent = 0usize;
+    for digest in &missing {
+        let body = src.get_body(digest)?.ok_or_else(|| {
+            ClientError::Manifest(format!(
+                "source does not hold {}, so this manifest cannot be exported whole",
+                hex_digest(digest)
+            ))
+        })?;
+        let landed = dst.put_body(&body)?;
+        if &landed != digest {
+            // Content addressing makes this checkable for free, and
+            // it is worth checking: it catches a corrupted transfer
+            // and a store that named the bytes differently.
+            return Err(ClientError::Manifest(format!(
+                "destination named the body {} where the manifest says {}",
+                hex_digest(&landed),
+                hex_digest(digest)
+            )));
+        }
+        sent += 1;
+    }
+
+    // 3. Only now bind. See ORDER MATTERS above.
+    let bound = dst.snapshot_restore(manifest, dst_root)?;
+    Ok((sent, bound))
+}
+
+fn hex_digest(d: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in d {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// The content-derived object id for a digest: `sha256:<64 hex>`.
+/// The one form `object_index` treats as enumerable, because it is
+/// the one whose lifecycle the storage substrate owns.
+pub fn object_id_for(digest: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(7 + 64);
+    s.push_str("sha256:");
+    for b in digest {
+        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
+    }
+    s
 }

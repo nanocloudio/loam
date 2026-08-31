@@ -94,6 +94,93 @@ struct Args {
     /// to an allowed bucket; without it the gateway is anonymous.
     #[arg(long)]
     s3_credentials: Option<PathBuf>,
+    /// TCP address for the admin surface, for a consumer that runs
+    /// somewhere other than the storage node (a volume backend, a
+    /// CSI plugin). REFUSED without --admin-token: the admin surface
+    /// can bind, read and delete anything in any namespace, so
+    /// exposing it off-box unauthenticated is worse than not
+    /// exposing it at all.
+    #[arg(long)]
+    admin_listen: Option<String>,
+    /// File holding the shared secret an admin connection must
+    /// present before any op is accepted. Without it the admin
+    /// surface is ANONYMOUS — which is why it must never be exposed
+    /// off-box unauthenticated.
+    #[arg(long)]
+    admin_token: Option<PathBuf>,
+}
+
+/// An admin connection, whichever transport carried it.
+///
+/// One at a time, as before. Admin correlation ids are chosen by the
+/// CLIENT, so two concurrent external clients could pick the same
+/// one and a reply would go to the wrong peer; keeping a single slot
+/// keeps that impossible rather than merely unlikely. Serving
+/// several at once needs a server-assigned cid space first, which is
+/// a wire change and not this one.
+enum AdminConn {
+    Unix(std::os::unix::net::UnixStream),
+    Tcp(TcpStream),
+}
+
+impl Read for AdminConn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            AdminConn::Unix(s) => s.read(buf),
+            AdminConn::Tcp(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for AdminConn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            AdminConn::Unix(s) => s.write(buf),
+            AdminConn::Tcp(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            AdminConn::Unix(s) => s.flush(),
+            AdminConn::Tcp(s) => s.flush(),
+        }
+    }
+}
+
+// ── Admin auth ─────────────────────────────────────────────────────
+//
+// Connection-scoped, not per-request. The admin surface can bind,
+// read and delete anything in any namespace, so what matters is who
+// is on the far end of the socket, established once — a per-op token
+// would be the same secret repeated with more chances to leak it.
+//
+// Until a connection has authenticated it may send exactly one kind
+// of frame: `OP_AUTH`. Anything else is refused and the connection is
+// CLOSED rather than left open to guess again, which is what turns a
+// bounded secret into a bounded number of attempts per reconnect.
+
+/// The configured admin secret, or `None` for an anonymous surface.
+type AdminAuth = Option<Vec<u8>>;
+
+fn load_admin_token(path: &std::path::Path) -> Result<Vec<u8>> {
+    let raw =
+        std::fs::read_to_string(path).map_err(|e| anyhow!("reading {}: {e}", path.display()))?;
+    let token = raw.trim().as_bytes().to_vec();
+    if token.is_empty() {
+        return Err(anyhow!(
+            "{} is empty — an empty admin token would authenticate everyone",
+            path.display()
+        ));
+    }
+    if token.len() > admin_wire::MAX_TOKEN {
+        return Err(anyhow!(
+            "{} holds {} bytes; the admin wire caps a token at {}",
+            path.display(),
+            token.len(),
+            admin_wire::MAX_TOKEN
+        ));
+    }
+    Ok(token)
 }
 
 // ── S3 auth ────────────────────────────────────────────────────────
@@ -464,6 +551,40 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
         headers,
         body,
     })
+}
+
+/// The store is at a table boundary: well-formed request, no room
+/// right now.
+///
+/// 503 with a `Retry-After`, never 500. Loam is built from
+/// fixed-size arenas, so refusing at a boundary is a designed
+/// condition rather than a fault — and the two produce opposite
+/// client behaviour. An S3 client backs off and retries a 503; it
+/// surfaces a 500 to the caller and stops. Reporting back-pressure
+/// as a fault costs availability under exactly the load that causes
+/// it.
+/// The tenant's quota would be crossed.
+///
+/// 507, not 503: waiting will not help, and a client told "busy"
+/// retries forever against a ceiling only the tenant or the operator
+/// can move. The two refusals look identical from inside the store
+/// and could not be more different to the caller.
+fn http_respond_quota(stream: &mut TcpStream) {
+    http_respond(
+        stream,
+        "507 Insufficient Storage",
+        &[],
+        b"quota exceeded for this bucket",
+    )
+}
+
+fn http_respond_busy(stream: &mut TcpStream) {
+    http_respond(
+        stream,
+        "503 Service Unavailable",
+        &[("Retry-After", "1".to_string())],
+        b"",
+    );
 }
 
 fn http_respond(stream: &mut TcpStream, status: &str, headers: &[(&str, String)], body: &[u8]) {
@@ -876,6 +997,15 @@ fn handle_s3_request(
                             let etag = format!("\"{}\"", hex_of(digest));
                             http_respond(stream, "200 OK", &[("ETag", etag)], b"");
                         }
+                        // A full table is back-pressure, not a fault:
+                        // 503 so the client retries, where 500 tells
+                        // it to give up. See `STATUS_BUSY`.
+                        Ok((_, status, _)) if status == admin_wire::STATUS_BUSY => {
+                            http_respond_busy(stream)
+                        }
+                        Ok((_, status, _)) if status == admin_wire::STATUS_QUOTA => {
+                            http_respond_quota(stream)
+                        }
                         _ => http_respond(stream, "500 Internal Server Error", &[], b""),
                     },
                     None => http_respond(stream, "500 Internal Server Error", &[], b"timeout"),
@@ -908,6 +1038,14 @@ fn handle_s3_request(
             });
             let pfid = match open.and_then(|r| admin_wire::decode_put_file_open_ack(&r).ok()) {
                 Some((_, status, pfid)) if status == admin_wire::STATUS_OK => pfid,
+                Some((_, status, _)) if status == admin_wire::STATUS_BUSY => {
+                    http_respond_busy(stream);
+                    return;
+                }
+                Some((_, status, _)) if status == admin_wire::STATUS_QUOTA => {
+                    http_respond_quota(stream);
+                    return;
+                }
                 _ => {
                     http_respond(stream, "500 Internal Server Error", &[], b"open");
                     return;
@@ -1556,8 +1694,29 @@ fn main() -> Result<()> {
         }
         None => None,
     };
-    if unix_listener.is_none() && s3_listener.is_none() {
-        return Err(anyhow!("no surface: pass --socket and/or --s3-listen"));
+    // The refusal is here rather than at the accept: a misconfigured
+    // server should fail to START, loudly, not run happily and be
+    // wide open. There is no --insecure escape hatch, deliberately.
+    if args.admin_listen.is_some() && args.admin_token.is_none() {
+        return Err(anyhow!(
+            "--admin-listen requires --admin-token: the admin surface can \
+             bind, read and delete anything in any namespace, and exposing \
+             it over TCP unauthenticated is worse than not exposing it"
+        ));
+    }
+    let admin_tcp_listener = match &args.admin_listen {
+        Some(addr) => {
+            let l = TcpListener::bind(addr)?;
+            l.set_nonblocking(true)?;
+            eprintln!("[loam-server] admin surface on tcp {}", l.local_addr()?);
+            Some(l)
+        }
+        None => None,
+    };
+    if unix_listener.is_none() && s3_listener.is_none() && admin_tcp_listener.is_none() {
+        return Err(anyhow!(
+            "no surface: pass --socket, --admin-listen and/or --s3-listen"
+        ));
     }
 
     // ── Concurrency shape: the PIC graph stays single-threaded in
@@ -1583,6 +1742,22 @@ fn main() -> Result<()> {
         }
         None => None,
     });
+    let admin_auth: AdminAuth = match &args.admin_token {
+        Some(path) => {
+            let t = load_admin_token(path)?;
+            eprintln!("[loam-server] admin auth REQUIRED");
+            Some(t)
+        }
+        None => {
+            if args.socket.is_some() {
+                eprintln!(
+                    "[loam-server] admin socket is ANONYMOUS — pass \
+                     --admin-token FILE before exposing it off-box"
+                );
+            }
+            None
+        }
+    };
     if let Some(l) = s3_listener {
         l.set_nonblocking(false)?;
         let acceptor_port = port.clone();
@@ -1602,7 +1777,10 @@ fn main() -> Result<()> {
     drop(port);
 
     let tick = Duration::from_micros(args.tick_us);
-    let mut unix_conn: Option<std::os::unix::net::UnixStream> = None;
+    let mut unix_conn: Option<AdminConn> = None;
+    // Whether the CURRENT connection has authenticated. Reset on
+    // every accept, so a dropped-and-reconnected peer starts over.
+    let mut unix_authed = admin_auth.is_none();
     let mut pending: std::collections::HashMap<u32, std::sync::mpsc::Sender<Vec<u8>>> =
         std::collections::HashMap::new();
     let mut read_buf = vec![0u8; 128 * 1024];
@@ -1612,7 +1790,28 @@ fn main() -> Result<()> {
                 match l.accept() {
                     Ok((stream, _)) => {
                         stream.set_nonblocking(true).ok();
-                        unix_conn = Some(stream);
+                        unix_conn = Some(AdminConn::Unix(stream));
+                        unix_authed = admin_auth.is_none();
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => {}
+                }
+            }
+        }
+        if let Some(ref l) = admin_tcp_listener {
+            if unix_conn.is_none() {
+                match l.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(true).ok();
+                        stream.set_nodelay(true).ok();
+                        unix_conn = Some(AdminConn::Tcp(stream));
+                        // Startup refuses --admin-listen without a
+                        // token, so this is always false here; it is
+                        // written from the same expression as the
+                        // unix path so the two can never drift into
+                        // disagreeing about what "authenticated"
+                        // means.
+                        unix_authed = admin_auth.is_none();
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(_) => {}
@@ -1623,7 +1822,59 @@ fn main() -> Result<()> {
         if let Some(ref mut c) = unix_conn {
             match c.read(&mut read_buf) {
                 Ok(0) => drop_unix = true,
-                Ok(n) => server.push_admin_request(read_buf[..n].to_vec()),
+                Ok(n) => {
+                    let frame = &read_buf[..n];
+                    if unix_authed {
+                        server.push_admin_request(frame.to_vec());
+                    } else {
+                        // Unauthenticated: the ONLY frame that gets
+                        // past here is a valid OP_AUTH. It is answered
+                        // on this thread and never reaches the graph,
+                        // so an unauthenticated peer cannot cause any
+                        // work beyond one comparison.
+                        match admin_wire::decode_admin_auth(frame) {
+                            Ok((cid, token))
+                                if admin_wire::tokens_match(
+                                    token,
+                                    admin_auth.as_deref().unwrap_or_default(),
+                                ) =>
+                            {
+                                unix_authed = true;
+                                let mut ack = [0u8; 6];
+                                if let Ok(n) = admin_wire::encode_admin_auth_ack(
+                                    &mut ack,
+                                    cid,
+                                    admin_wire::STATUS_OK,
+                                ) {
+                                    if c.write_all(&ack[..n]).is_err() {
+                                        drop_unix = true;
+                                    }
+                                }
+                            }
+                            other => {
+                                // A wrong token and a wrong op get the
+                                // same answer and the same close: a
+                                // caller learns "not authenticated",
+                                // never which of the two it was.
+                                let cid = match other {
+                                    Ok((cid, _)) => cid,
+                                    Err(_) => 0,
+                                };
+                                let mut ack = [0u8; 6];
+                                if let Ok(n) = admin_wire::encode_admin_auth_ack(
+                                    &mut ack,
+                                    cid,
+                                    admin_wire::STATUS_NAK,
+                                ) {
+                                    let _ = c.write_all(&ack[..n]);
+                                }
+                                // Closing bounds guessing to one
+                                // attempt per connection.
+                                drop_unix = true;
+                            }
+                        }
+                    }
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(_) => drop_unix = true,
             }

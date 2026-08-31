@@ -20,7 +20,6 @@
 // a legal state (epoch advances; consumers cache count=0 and
 // answer "no targets" to upstream PUT attempts).
 
-const MAX_OPS_PER_STEP: u32 = 4;
 const READ_BUF: usize = 64;
 const EMIT_BUF: usize = 64;
 
@@ -40,6 +39,14 @@ pub struct ModuleState {
     /// Monotonic epoch — bumps on every membership change.
     pub epoch: u64,
     pub fleet: [u8; super::placement_wire::MAX_FLEET],
+    /// Failure domain per member, positionally aligned with `fleet`.
+    /// All-zero means one domain, which is what an operator who has
+    /// not described their topology gets — and is the safe reading,
+    /// because it assumes members CAN fail together.
+    pub domains: [u8; super::placement_wire::MAX_FLEET],
+    /// Per-member state, positionally aligned with `fleet`:
+    /// active or draining. All-zero is fully active.
+    pub states: [u8; super::placement_wire::MAX_FLEET],
     /// Sticky flag: set after the first FleetEpoch emission so we
     /// don't re-emit unchanged state every step. Cleared whenever
     /// the fleet changes.
@@ -77,7 +84,7 @@ pub unsafe fn module_new_with_seed_impl(
         return rc;
     }
     let s = &mut *(state_ptr as *mut ModuleState);
-    apply_fleet_update(s, seed_members);
+    apply_fleet_update(s, seed_members, &[], &[]);
     0
 }
 
@@ -134,7 +141,7 @@ pub unsafe fn decode_seed_params(state_ptr: *mut u8, params: *const u8, params_l
                 let copy = elen.min(super::placement_wire::MAX_FLEET);
                 let src = params.add(off);
                 let slice = core::slice::from_raw_parts(src, copy);
-                apply_fleet_update(s, slice);
+                apply_fleet_update(s, slice, &[], &[]);
                 return;
             }
             off += elen;
@@ -143,7 +150,7 @@ pub unsafe fn decode_seed_params(state_ptr: *mut u8, params: *const u8, params_l
     }
     let copy = params_len.min(super::placement_wire::MAX_FLEET);
     let slice = core::slice::from_raw_parts(params, copy);
-    apply_fleet_update(s, slice);
+    apply_fleet_update(s, slice, &[], &[]);
 }
 
 /// Public wrapper around `apply_fleet_update` for the PIC shim's
@@ -153,16 +160,23 @@ pub unsafe fn decode_seed_params(state_ptr: *mut u8, params: *const u8, params_l
 /// SAFETY: same as `apply_fleet_update`; caller must hold a valid
 /// `&mut ModuleState`.
 pub unsafe fn apply_fleet_update_pub(s: &mut ModuleState, members: &[u8]) {
-    apply_fleet_update(s, members);
+    apply_fleet_update(s, members, &[], &[]);
 }
 
 /// Replace the fleet membership atomically and bump the epoch.
 /// Deduplicates and clamps to `MAX_FLEET`; preserves caller order
 /// after dedup (first occurrence wins).
-unsafe fn apply_fleet_update(s: &mut ModuleState, members: &[u8]) {
+///
+/// `domains` is positionally aligned with `members` and survives the
+/// dedup with its member. Empty means one domain — an operator who
+/// has not described their topology gets the safe reading, which is
+/// that members may fail together.
+unsafe fn apply_fleet_update(s: &mut ModuleState, members: &[u8], domains: &[u8], states: &[u8]) {
     let mut next = [0u8; super::placement_wire::MAX_FLEET];
+    let mut next_dom = [0u8; super::placement_wire::MAX_FLEET];
+    let mut next_state = [0u8; super::placement_wire::MAX_FLEET];
     let mut next_count: usize = 0;
-    for &m in members.iter() {
+    for (pos, &m) in members.iter().enumerate() {
         if next_count >= super::placement_wire::MAX_FLEET {
             break;
         }
@@ -177,16 +191,28 @@ unsafe fn apply_fleet_update(s: &mut ModuleState, members: &[u8]) {
         }
         if !seen {
             next[next_count] = m;
+            next_dom[next_count] = domains.get(pos).copied().unwrap_or(0);
+            next_state[next_count] = states.get(pos).copied().unwrap_or(0);
             next_count += 1;
         }
     }
-    let unchanged =
-        (next_count as u8 == s.member_count) && next[..next_count] == s.fleet[..next_count];
+    // A topology change with the same members is still a change:
+    // consumers place differently once they know two members share a
+    // rack, so the epoch has to move or they never find out.
+    // Draining a member is a change even though the member list is
+    // identical: consumers must stop placing new writes there, and
+    // they only find out through a new epoch.
+    let unchanged = (next_count as u8 == s.member_count)
+        && next[..next_count] == s.fleet[..next_count]
+        && next_dom[..next_count] == s.domains[..next_count]
+        && next_state[..next_count] == s.states[..next_count];
     if unchanged {
         // No-op update — don't bump epoch, don't re-broadcast.
         return;
     }
     s.fleet = next;
+    s.domains = next_dom;
+    s.states = next_state;
     s.member_count = next_count as u8;
     s.epoch = s.epoch.wrapping_add(1);
     s.emitted_current = 0;
@@ -207,7 +233,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
 
     // ── 1. Drain incoming FleetUpdate messages. ────────────────
     let mut handled: u32 = 0;
-    while handled < MAX_OPS_PER_STEP {
+    while handled < super::limits::OPS_PER_STEP {
         let mut buf = [0u8; READ_BUF];
         let n = (syscalls.channel_read)(s.in_chan, buf.as_mut_ptr(), READ_BUF);
         if n <= 0 {
@@ -218,7 +244,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
             Some(super::placement_wire::OP_FLEET_UPDATE) => {
                 match super::placement_wire::decode_fleet_update(bytes) {
                     Ok(decoded) => {
-                        apply_fleet_update(s, decoded.members);
+                        apply_fleet_update(s, decoded.members, decoded.domains, decoded.states);
                     }
                     Err(_) => {
                         s.apply_errors = s.apply_errors.wrapping_add(1);
@@ -240,6 +266,8 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
             &mut s.scratch,
             s.epoch,
             &s.fleet[..members_len],
+            &s.domains[..members_len],
+            &s.states[..members_len],
         ) {
             Ok(n) => n,
             Err(_) => {
