@@ -27,14 +27,18 @@
 // live binding budget per PIC instance, not just a hot cache size.
 // Bump per-instance for larger working sets; multi-PIC deployments
 // shard further by partition (see `src/placement.rs`).
-// ModuleState size at this cap: BindingSlot(~40B) × 256 + 4 KiB
-// append scratch + headers ≈ 14 KiB.
-// Capacity profile: bare-metal PIC builds (target_os = "none")
-// keep the bounded embedded arena; host-runtime builds (the
-// loam-server standalone service, host tests) get service-class
-// capacity. A per-silicon fmod capacity knob is tracked in RFC
-// 0004 — modules loaded on the host profile today still carry the
-// embedded profile.
+// ModuleState is dominated by the arena: `BindingSlot` is 384 B on
+// the embedded profile, so 256 slots is ~96 KiB of the ~116 KiB the
+// whole struct occupies there, the rest being the reassembly buffers
+// and the append scratch. The kernel heap-allocates it, so the cap
+// and the module's memory budget move together — see
+// `docs/limit_register.md`, which carries the figures and the test
+// that pins them.
+//
+// Which cap applies is the capacity profile: an explicit
+// `--cfg loam_profile`, with the build target as the fallback. The
+// pack step passes no profile, so a bare-metal image takes the
+// `embedded` default.
 const ARENA_CAPACITY: usize = super::limits::NAMESPACE_SLOTS;
 /// Concurrent `LOOKUP` handles. Bounded like every other arena here:
 /// a provider that can be asked for unlimited handles is a provider
@@ -107,6 +111,16 @@ pub struct ModuleState {
     /// drain walks complete records and carries partial tails.
     pub cmt_asm: [u8; 8192],
     pub cmt_asm_len: usize,
+    /// Proof from the most recently applied committed record, and
+    /// whether one has been applied at all.
+    ///
+    /// The fence this PIC reports is only ever as strong as the last
+    /// commit it actually applied, so the proof is retained at the
+    /// point of application rather than reconstructed later. Cleared
+    /// state means nothing has been applied and there is nothing to
+    /// claim.
+    pub last_proof: super::decision::CommitProof,
+    pub has_proof: u8,
     /// Reassembly for the `requests` byte stream. A batching producer
     /// puts several records into one read and a read can end
     /// mid-record; both are the stream behaving normally.
@@ -436,6 +450,14 @@ unsafe fn init_state(
     s.replicated = 0;
     s.outstanding = 0;
     s.cmt_asm_len = 0;
+    s.last_proof = super::decision::CommitProof {
+        source: [0u8; 16],
+        term: 0,
+        index: 0,
+        quorum: 0,
+        witness: [0u8; 32],
+    };
+    s.has_proof = 0;
     s.req_asm_len = 0;
     s.req_resyncing = 0;
     for slot in s.ns_open.iter_mut() {
@@ -627,27 +649,27 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         // Replicated mode: mutating ops are proposed to the metadata
         // plane instead of being applied here. The apply + 1-byte ack
         // happen in drain_committed() when the commit round-trips.
-        // Propose = [0x10][plane=0x01][corr u32=0][len u16][inner].
         if s.replicated != 0 {
-            let hdr = 8usize;
-            if hdr + bytes.len() <= s.append_scratch.len() && bytes.len() <= u16::MAX as usize {
-                s.append_scratch[0] = 0x10; // OP_PROPOSE (loam_decision_wire)
-                s.append_scratch[1] = 0x01; // PLANE_NAMESPACE
-                s.append_scratch[2..6].copy_from_slice(&0u32.to_le_bytes());
-                s.append_scratch[6..8].copy_from_slice(&(bytes.len() as u16).to_le_bytes());
-                s.append_scratch[hdr..hdr + bytes.len()].copy_from_slice(bytes);
-                let n = hdr + bytes.len();
-                let wrote =
-                    (syscalls.channel_write)(s.metadata_ops_chan, s.append_scratch.as_ptr(), n);
-                if wrote != n as i32 {
+            match super::decision::encode_propose(
+                &mut s.append_scratch,
+                super::decision::PLANE_NAMESPACE,
+                0,
+                bytes,
+            ) {
+                Ok(n) => {
+                    let wrote =
+                        (syscalls.channel_write)(s.metadata_ops_chan, s.append_scratch.as_ptr(), n);
+                    if wrote != n as i32 {
+                        s.apply_errors = s.apply_errors.wrapping_add(1);
+                        respond(s, syscalls, 0xFF);
+                    } else {
+                        s.outstanding = s.outstanding.wrapping_add(1);
+                    }
+                }
+                Err(_) => {
                     s.apply_errors = s.apply_errors.wrapping_add(1);
                     respond(s, syscalls, 0xFF);
-                } else {
-                    s.outstanding = s.outstanding.wrapping_add(1);
                 }
-            } else {
-                s.apply_errors = s.apply_errors.wrapping_add(1);
-                respond(s, syscalls, 0xFF);
             }
             handled = handled.wrapping_add(1);
             continue;
@@ -761,36 +783,36 @@ unsafe fn drain_committed(s: &mut ModuleState, syscalls: &super::SyscallTable) {
         }
         s.cmt_asm_len += n as usize;
     }
-    // Walk complete records. Committed = [0x11][plane][corr u32]
-    // [quorum u8][epoch u64][len u16 @15..17][inner]; marker = [0x13].
+    // Record boundaries and field offsets come from the decision wire
+    // rather than from constants restated here: this drain is where
+    // the commit proof enters the PIC, and an offset copied into this
+    // file is how a field on that record stops being read.
     let mut off = 0usize;
     while off < s.cmt_asm_len {
-        let b0 = s.cmt_asm[off];
-        if b0 == 0x13 {
+        let rec_len = match super::decision::record_len(&s.cmt_asm[off..s.cmt_asm_len]) {
+            Ok(Some(n)) => n,
+            Ok(None) => break, // partial record: wait for more bytes
+            Err(_) => {
+                // Unknown opcode: skip one byte to resync.
+                s.apply_errors = s.apply_errors.wrapping_add(1);
+                off += 1;
+                continue;
+            }
+        };
+        if s.cmt_asm[off] == super::decision::OP_REPLAY_DRAINED {
             s.read_ready = 1;
-            off += 1;
-            continue;
-        }
-        if b0 != 0x11 {
-            // Unknown/garbage byte: skip one to resync.
-            s.apply_errors = s.apply_errors.wrapping_add(1);
-            off += 1;
-            continue;
-        }
-        if s.cmt_asm_len - off < 17 {
-            break; // partial header: wait for more bytes
-        }
-        let inner_len = u16::from_le_bytes([s.cmt_asm[off + 15], s.cmt_asm[off + 16]]) as usize;
-        let rec_len = 17 + inner_len;
-        if s.cmt_asm_len - off < rec_len {
-            break; // partial record
-        }
-        let plane = s.cmt_asm[off + 1];
-        if plane != 0x01 {
-            s.apply_errors = s.apply_errors.wrapping_add(1);
             off += rec_len;
             continue;
         }
+        let (inner_len, proof) =
+            match super::decision::decode_committed(&s.cmt_asm[off..off + rec_len]) {
+                Ok(c) if c.plane == super::decision::PLANE_NAMESPACE => (c.inner.len(), c.proof),
+                _ => {
+                    s.apply_errors = s.apply_errors.wrapping_add(1);
+                    off += rec_len;
+                    continue;
+                }
+            };
         // Copy the inner out so the arena/WAL calls don't alias cmt_asm.
         let mut inner_buf = [0u8; READ_BUF];
         if inner_len > inner_buf.len() {
@@ -798,7 +820,8 @@ unsafe fn drain_committed(s: &mut ModuleState, syscalls: &super::SyscallTable) {
             off += rec_len;
             continue;
         }
-        inner_buf[..inner_len].copy_from_slice(&s.cmt_asm[off + 17..off + 17 + inner_len]);
+        let hdr = super::decision::COMMITTED_HDR;
+        inner_buf[..inner_len].copy_from_slice(&s.cmt_asm[off + hdr..off + hdr + inner_len]);
         let inner = &inner_buf[..inner_len];
         let live = s.outstanding > 0;
         // The local WAL is this PIC's recovery authority (see
@@ -841,6 +864,8 @@ unsafe fn drain_committed(s: &mut ModuleState, syscalls: &super::SyscallTable) {
         match result {
             Ok(_) => {
                 s.ops_applied = s.ops_applied.wrapping_add(1);
+                s.last_proof = proof;
+                s.has_proof = 1;
                 if live {
                     s.outstanding -= 1;
                     respond_applied(s, syscalls, inner, result);
@@ -1618,21 +1643,48 @@ const E_MFILE: i32 = -24;
 
 /// The strongest fence this provider can honestly claim right now.
 ///
-/// Replicated mode commits through a quorum, so a bind that has
-/// round-tripped is `ReplicatedDurable`. Single-node with a WAL is
-/// `LocalDurable`. Without a WAL there is no durability to claim and
-/// the honest answer is `Volatile` — the whole point of the fence axis
-/// is that a consumer can tell those apart.
+/// Claimed from the PROOF in hand, never from the mode configured.
+/// Being wired for replication says where records come from; it says
+/// nothing about whether any of them reached a quorum, so it cannot
+/// be what licenses a `ReplicatedDurable` claim. What licenses it is
+/// a commit record whose proof carries a real quorum and a real
+/// witness — `CommitProof::is_replicated`, which is the one place
+/// that rule lives.
+///
+/// The ladder, strongest first:
+///
+/// - An applied commit whose proof is replicated: `ReplicatedDurable`
+///   carrying that proof verbatim, so a consumer can order it against
+///   another fence from the same log and detect a fork against a
+///   divergent one.
+/// - Otherwise a WAL: `LocalDurable`. This covers single-replica
+///   mode, where every commit is durably logged by one voter — real
+///   durability, no replication — and a replicated deployment before
+///   its first commit round-trips.
+/// - Otherwise `Volatile`. No WAL is no durability, and the whole
+///   point of the fence axis is that a consumer can tell these apart.
 unsafe fn achieved_fence(s: &ModuleState) -> super::abi::fence::Fence {
-    if s.replicated != 0 {
-        super::abi::fence::Fence::ReplicatedDurable {
-            source: [0u8; 16],
-            commit_index: s.ops_applied as u64,
-            epoch: 0,
-            quorum: 0,
-            witness: [0u8; 32],
-        }
-    } else if s.wal_fd >= 0 {
+    if s.has_proof != 0 && s.last_proof.is_replicated() {
+        let p = &s.last_proof;
+        return super::abi::fence::Fence::ReplicatedDurable {
+            source: p.source,
+            commit_index: p.index,
+            // The Raft term is the epoch the fence lattice orders on.
+            // It is `u64` upstream and `u32` here; a term that
+            // outruns `u32` would alias an older one, so it is
+            // saturated rather than wrapped — an epoch that stops
+            // advancing refuses to order, while a wrapped one would
+            // silently order a new fence under an old one.
+            epoch: if p.term > u32::MAX as u64 {
+                u32::MAX
+            } else {
+                p.term as u32
+            },
+            quorum: p.quorum,
+            witness: p.witness,
+        };
+    }
+    if s.wal_fd >= 0 {
         super::abi::fence::Fence::LocalDurable { device_id: 0 }
     } else {
         super::abi::fence::Fence::Volatile
@@ -1688,9 +1740,9 @@ fn view_source(root: &[u8]) -> [u8; 16] {
 /// has not committed anything, so a durability fence answers a
 /// question nobody asked; what a `CHANGES` caller needs is the
 /// revision its window covered, because that is its next `since`.
-/// The contract says so explicitly and the snapshot design in RFC
-/// 0008 depends on it: a manifest is only a point-in-time record if
-/// something states which point in time.
+/// The contract says so explicitly, and a snapshot depends on it: a
+/// manifest is only a point-in-time record if something states which
+/// point in time.
 unsafe fn write_view_fence_out(root: &[u8], revision: u64, ptr: *mut u8, cap: usize) {
     if ptr.is_null() || cap < super::abi::fence::WIRE_MAX_LEN {
         return;

@@ -6,13 +6,19 @@
 // of a `MSG_CLIENT_PROPOSAL` and written to `clustor_out`
 // (→ consensus.proposals).
 //
-// Commit path: `clustor_in` (← consensus.committed_entries)
-// carries enveloped `MSG_COMMITTED_ENTRY` payloads of
-// [term u64][index u64][body]. The body is the loam Propose record we
-// proposed; it is decoded and re-emitted on `commits` as a loam
-// Committed with witness_epoch = the Raft commit index and
-// witness_quorum = the `witness_quorum` param (voter count; 1 for a
-// single-node group).
+// Commit path: `clustor_in` (← consensus.committed_entries) carries
+// enveloped `MSG_COMMITTED_ENTRY` payloads, decoded by the facade
+// (which owns the header layout, so this file cannot drift from it).
+// The body is the loam Propose record we proposed; it is re-emitted
+// on `commits` as a loam Committed carrying the entry's full proof:
+// the group's `source`, its Raft `term` and `index`, the configured
+// voter `quorum`, and a `witness` over the committed bytes.
+//
+// This bridge is where that proof can be assembled and nowhere
+// downstream is: only here are the group identity and the raw
+// committed entry both in hand. A consumer builds its fence from
+// what this record carries, so anything dropped here becomes a fence
+// claim nobody can substantiate.
 //
 // Clustor never inspects the command bytes (opaque-command contract,
 // consumer_facade.md), so no clustor-side change is required.
@@ -26,6 +32,7 @@ use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
 
 #[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
 #[path = "../../common/mechanics/loam_limits.rs"]
@@ -34,8 +41,15 @@ mod limits;
 #[path = "../../common/mechanics/reply_out.rs"]
 mod reply_out;
 
-#[path = "../../common/replicated/loam_decision_wire.rs"]
+#[path = "../../common/mechanics/loam_decision_wire.rs"]
 mod wire;
+
+mod sha256 {
+    pub use super::Sha256;
+}
+
+#[path = "../../common/replicated/commit_proof.rs"]
+mod proof;
 
 // The Clustor consumer facade — the only surface a downstream replicated
 // consumer binds to. It owns the channel envelope (type ids, framing,
@@ -52,6 +66,28 @@ define_params! {
 
     1, witness_quorum, u8, 1
         => |s, d, len| { s.witness_quorum = p_u8(d, len, 1, 1); };
+
+    2, group_id, str, 0
+        => |s, d, len| { s.group_id = p_group_id(d, len); };
+}
+
+/// Fold an operator-supplied group name into 16 bytes of log
+/// identity.
+///
+/// Absent, it stays zero — the honest default, since this bridge
+/// cannot know its deployment's name unless told. A name longer than
+/// 16 bytes is MIXED rather than truncated, so two groups whose
+/// names share a prefix do not collapse to the same source; see
+/// `commit_source` for why a shared source is the thing to avoid.
+unsafe fn p_group_id(d: *const u8, len: usize) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let mut i = 0usize;
+    while i < len {
+        let slot = i % 16;
+        out[slot] ^= (*d.add(i)).rotate_left((i / 16) as u32 % 8);
+        i += 1;
+    }
+    out
 }
 
 #[repr(C)]
@@ -63,6 +99,7 @@ pub struct ModuleState {
     clustor_in: i32,
     clustor_out: i32,
     witness_quorum: u8,
+    group_id: [u8; 16],
     // Envelope reassembly for clustor_in (header + payload may arrive
     // across reads on a byte-stream channel).
     asm: [u8; BUF],
@@ -274,13 +311,25 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     if let Some(entry) = facade::CommittedEntry::decode(payload) {
                         match wire::decode_propose(entry.command) {
                             Ok(p) => {
+                                let source = proof::commit_source(&s.group_id, entry.partition_id);
+                                let proof = wire::CommitProof {
+                                    source,
+                                    term: entry.term,
+                                    index: entry.index,
+                                    quorum: s.witness_quorum,
+                                    witness: proof::commit_witness(
+                                        &source,
+                                        entry.term,
+                                        entry.index,
+                                        entry.command,
+                                    ),
+                                };
                                 let mut out = [0u8; BUF];
                                 match wire::encode_committed(
                                     &mut out,
                                     p.plane,
                                     p.correlation_id,
-                                    s.witness_quorum,
-                                    entry.index, // witness epoch = the commit index
+                                    &proof,
                                     p.inner,
                                 ) {
                                     Ok(m) => {

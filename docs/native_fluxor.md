@@ -53,9 +53,21 @@ ceiling: `achieved_fence` reports `Volatile` when there is no WAL,
 because the whole point of the fence axis is that a consumer can
 tell the three apart.
 
-Public modules return real `Fence` values: `ReplicatedDurable` with
-a non-empty `ClustorFenceWitness` when backed by clustor, or
-`LocalDurable` when acting purely against a local device.
+Public modules return real `Fence` values, claimed from the PROOF in
+hand rather than from the mode configured. Being wired for
+replication says where records arrive from; it says nothing about
+whether any of them reached a quorum, so it cannot be what licenses a
+`ReplicatedDurable` claim.
+
+What licenses it is an applied commit whose record carries a real
+quorum and a real witness. Each `Committed` record on
+[`loam_decision_wire.rs`](../modules/common/mechanics/loam_decision_wire.rs)
+carries its own proof — the log's `source`, the Raft `term` and
+`index`, the `quorum`, and a witness over the committed bytes — and
+`CommitProof::is_replicated` is the single place that decides whether
+those add up to replication. A commit backed by one voter, or
+carrying no witness, reports `LocalDurable`: durable, which it is,
+rather than replicated, which it is not.
 
 The body plane and the admin front door are internal throughout —
 `body_store`, `body_fanout_router`, `ec_body_router`,

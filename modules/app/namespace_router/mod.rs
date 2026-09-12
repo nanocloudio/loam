@@ -56,6 +56,9 @@ mod wal;
 mod snapshot;
 
 #[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[path = "../../common/mechanics/loam_decision_wire.rs"]
+mod decision;
+
 #[path = "../../common/mechanics/namespace_pic_body.rs"]
 mod body;
 

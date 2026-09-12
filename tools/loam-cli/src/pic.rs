@@ -86,6 +86,9 @@ mod wire {
 #[path = "../../../modules/common/mechanics/loam_snapshot.rs"]
 pub mod snapshot;
 
+#[path = "../../../modules/common/mechanics/loam_decision_wire.rs"]
+mod decision;
+
 #[allow(
     dead_code,
     reason = "shared PIC body include; each includer drives a subset"

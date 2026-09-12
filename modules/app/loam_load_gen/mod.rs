@@ -46,7 +46,7 @@ mod limits;
 mod wire;
 
 #[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
-#[path = "../../common/replicated/loam_decision_wire.rs"]
+#[path = "../../common/mechanics/loam_decision_wire.rs"]
 mod decision;
 
 /// Ceiling on records emitted in one step, whatever `batch_per_step`

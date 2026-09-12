@@ -423,6 +423,48 @@ unsafe fn find_pending(s: &mut ModuleState, correlation_id: u32) -> Option<&mut 
     None
 }
 
+/// The proof a single-replica commit can honestly carry.
+///
+/// There is no group here, so there is nothing to prove: quorum is
+/// one voter, and the witness stays zero because a commitment to an
+/// agreement that never happened would be a fiction a consumer would
+/// read as replication. `CommitProof::is_replicated` is false for
+/// this shape, so downstream reports `LocalDurable` — which is what
+/// a durably-logged write on one device actually achieved.
+///
+/// `source` still names this node's log, so two nodes' fences never
+/// compare as ordered, and `index` still advances, so a consumer can
+/// tell a later commit from an earlier one on the same log.
+fn local_proof(s: &ModuleState, index: u64) -> super::wire::CommitProof {
+    super::wire::CommitProof {
+        source: local_source(s),
+        term: 0,
+        index,
+        quorum: 1,
+        witness: [0u8; 32],
+    }
+}
+
+/// This node's log identity.
+///
+/// Built from the WAL path and `self_id` — the two things that
+/// already distinguish one proposer from another — so two nodes'
+/// commits never compare as ordered. Recomputed rather than cached
+/// because both inputs are set during init and a cached copy would
+/// depend on the order they arrive in.
+fn local_source(s: &ModuleState) -> [u8; 16] {
+    let len = s.wal_path_len as usize;
+    let path = &s.wal_path[..len.min(WAL_PATH_BUF)];
+    let a = super::hash::fnv1a64(path);
+    let mut seed = [0u8; 1];
+    seed[0] = s.self_id;
+    let b = super::hash::fnv1a64(&seed) ^ a.rotate_left(17);
+    let mut out = [0u8; 16];
+    out[0..8].copy_from_slice(&a.to_le_bytes());
+    out[8..16].copy_from_slice(&b.to_le_bytes());
+    out
+}
+
 /// Emit a Committed record for `correlation_id` on the results
 /// channel. Releases the pending slot on success.
 ///
@@ -433,8 +475,7 @@ unsafe fn find_pending(s: &mut ModuleState, correlation_id: u32) -> Option<&mut 
 unsafe fn emit_committed_for(
     s: &mut ModuleState,
     correlation_id: u32,
-    witness_quorum: u8,
-    witness_epoch: u64,
+    proof: &super::wire::CommitProof,
 ) -> bool {
     // Pull the fields we need from the pending entry, then drop
     // the &mut PendingEntry borrow so we can use `s.syscalls` and
@@ -455,14 +496,7 @@ unsafe fn emit_committed_for(
     let scratch_cap = s.append_scratch.len();
     let inner = core::slice::from_raw_parts(inner_ptr, inner_len);
     let scratch = core::slice::from_raw_parts_mut(scratch_ptr, scratch_cap);
-    let n = match super::wire::encode_committed(
-        scratch,
-        plane,
-        origin,
-        witness_quorum,
-        witness_epoch,
-        inner,
-    ) {
+    let n = match super::wire::encode_committed(scratch, plane, origin, proof, inner) {
         Ok(n) => n,
         Err(_) => return false,
     };
@@ -562,9 +596,10 @@ unsafe fn admit_proposal(s: &mut ModuleState, plane: u8, origin: u32, inner: &[u
             // Single-replica: emit Committed immediately with a
             // synthetic LocalDurable witness (quorum = 1, epoch =
             // monotone counter).
-            let epoch = s.next_epoch;
+            let index = s.next_epoch;
             s.next_epoch = s.next_epoch.wrapping_add(1);
-            emit_committed_for(s, cid, 1, epoch);
+            let proof = local_proof(s, index);
+            emit_committed_for(s, cid, &proof);
         }
     }
 }
@@ -772,46 +807,39 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
             }
             s.cin_asm_len += n as usize;
         }
-        // Walk complete records: Committed [0x11][plane][corr u32]
-        // [quorum][epoch u64][len u16 @15..17][inner]; Aborted
-        // [0x12][corr u32] (5 bytes).
+        // Record boundaries and field offsets both come from the wire
+        // module: it owns the layout, so a change there reaches this
+        // drain without anyone remembering to update an offset here.
         let mut off = 0usize;
         while off < s.cin_asm_len {
+            let rec_len = match super::wire::record_len(&s.cin_asm[off..s.cin_asm_len]) {
+                Ok(Some(n)) => n,
+                // A whole record has not arrived yet: leave the tail
+                // for the next read.
+                Ok(None) => break,
+                // Unknown opcode. Skip one byte to resync rather than
+                // stall forever on a stream we cannot parse.
+                Err(_) => {
+                    s.apply_errors = s.apply_errors.wrapping_add(1);
+                    off += 1;
+                    continue;
+                }
+            };
             match s.cin_asm[off] {
                 super::wire::OP_COMMITTED => {
-                    if s.cin_asm_len - off < 17 {
-                        break;
+                    match super::wire::decode_committed(&s.cin_asm[off..off + rec_len]) {
+                        Ok(c) => {
+                            let proof = c.proof;
+                            let corr = c.correlation_id;
+                            emit_committed_for(s, corr, &proof);
+                        }
+                        Err(_) => {
+                            s.apply_errors = s.apply_errors.wrapping_add(1);
+                        }
                     }
-                    let inner_len =
-                        u16::from_le_bytes([s.cin_asm[off + 15], s.cin_asm[off + 16]]) as usize;
-                    let rec_len = 17 + inner_len;
-                    if s.cin_asm_len - off < rec_len {
-                        break;
-                    }
-                    let corr = u32::from_le_bytes([
-                        s.cin_asm[off + 2],
-                        s.cin_asm[off + 3],
-                        s.cin_asm[off + 4],
-                        s.cin_asm[off + 5],
-                    ]);
-                    let quorum = s.cin_asm[off + 6];
-                    let epoch = u64::from_le_bytes([
-                        s.cin_asm[off + 7],
-                        s.cin_asm[off + 8],
-                        s.cin_asm[off + 9],
-                        s.cin_asm[off + 10],
-                        s.cin_asm[off + 11],
-                        s.cin_asm[off + 12],
-                        s.cin_asm[off + 13],
-                        s.cin_asm[off + 14],
-                    ]);
-                    emit_committed_for(s, corr, quorum, epoch);
                     off += rec_len;
                 }
                 super::wire::OP_ABORTED => {
-                    if s.cin_asm_len - off < 5 {
-                        break;
-                    }
                     let corr = u32::from_le_bytes([
                         s.cin_asm[off + 1],
                         s.cin_asm[off + 2],
@@ -830,7 +858,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                     } else {
                         s.aborted = s.aborted.wrapping_add(1);
                     }
-                    off += 5;
+                    off += rec_len;
                 }
                 _ => {
                     s.apply_errors = s.apply_errors.wrapping_add(1);
@@ -958,9 +986,10 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         }
         while retried < to_retry_n as u32 {
             let cid = to_retry[retried as usize];
-            let epoch = s.next_epoch;
+            let index = s.next_epoch;
             s.next_epoch = s.next_epoch.wrapping_add(1);
-            if !emit_committed_for(s, cid, 1, epoch) {
+            let proof = local_proof(s, index);
+            if !emit_committed_for(s, cid, &proof) {
                 break;
             }
             retried = retried.wrapping_add(1);

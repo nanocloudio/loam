@@ -82,6 +82,22 @@ required. Shared primitives:
 [`modules/common/mechanics/wal_io.rs`](../modules/common/mechanics/wal_io.rs);
 the contracts are in [`durability.md`](durability.md).
 
+What a PIC then ADVERTISES is decided by the proof it holds, not by
+how it was wired. In replicated mode each `Committed` record carries
+its own proof — the log's `source`, the Raft `term` and `index`, the
+`quorum`, and a witness over the committed bytes — and a provider
+reports `ReplicatedDurable` only for an applied commit whose proof
+shows a real quorum and a real witness. One voter, or no witness,
+reports `LocalDurable`.
+
+The witness is what makes that fence checkable. `Fence::dominates`
+orders two fences from the same log by commit index, and at the same
+index it compares witnesses: two replicas of one log commit identical
+bytes and so agree, while two logs that diverged at that position do
+not. A witness that were a counter, or zero, would report a fork as
+agreement — which is why a proof missing one is refused a replicated
+claim rather than being padded into the shape of one.
+
 `admin_router` fronts the public PICs. External admin clients speak
 [`loam_admin_wire.rs`](../modules/common/mechanics/loam_admin_wire.rs)
 — the whole file lifecycle (`BIND`, `PUT_FILE`, `GET_FILE`,

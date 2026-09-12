@@ -13,21 +13,28 @@
 //
 // Layout (multi-byte ints LE):
 //
-//   Propose      [op:u8=0x10][plane:u8][correlation_id:u32][inner_len:u16][inner:inner_len]
-//   Committed    [op:u8=0x11][plane:u8][correlation_id:u32]
-//                [witness_quorum:u8][witness_epoch:u64]
-//                [inner_len:u16][inner:inner_len]
-//   Aborted      [op:u8=0x12][correlation_id:u32]
+//   Propose       [op:u8=0x10][plane:u8][correlation_id:u32][inner_len:u16][inner:inner_len]
+//   Committed     [op:u8=0x11][plane:u8][correlation_id:u32]
+//                 [quorum:u8][source:16][term:u64][index:u64]
+//                 [witness:32][inner_len:u16][inner:inner_len]
+//   Aborted       [op:u8=0x12][correlation_id:u32]
+//   ReplayDrained [op:u8=0x13]
 //
 // Plane bytes:
 //   0x01 = namespace, 0x02 = object, 0x03 = block.
 //
-// The `Committed` witness fields carry a *summary* of the
-// `ClustorFenceWitness` (quorum + epoch only); a full witness
-// requires a participants list which is too large for the bounded
-// per-record budget. Consumers that need the full witness can
-// query the Clustor PIC directly via a separate channel — out of
-// scope for this phase.
+// A `Committed` record carries the PROOF of its own commit, not a
+// summary of it: source, term, index, quorum and a witness over the
+// committed entry. Those five are exactly the terms of
+// `Fence::dominates`, so a consumer holding this record can build an
+// honest fence without asking anything else — and cannot build one
+// stronger than the proof it was handed. See `CommitProof`.
+//
+// What deliberately does NOT cross this wire is the acked-participant
+// LIST. Naming which voters acked is a diagnostic, not a term in the
+// fence lattice, and a variable-length list of node identities does
+// not fit the bounded per-record budget every record here is held to.
+// That list stays with the replicating provider that issued it.
 
 #![allow(
     dead_code,
@@ -128,12 +135,69 @@ pub fn decode_propose(src: &[u8]) -> Result<DecodedPropose<'_>, WireError> {
 
 // ── Committed ──────────────────────────────────────────────────────
 
+/// The proof a commit carries, as one value.
+///
+/// These five fields exist together or not at all: each is a term in
+/// `Fence::dominates`, and a consumer handed a subset cannot decide
+/// whether two fences are ordered or forked. Passing them as one
+/// struct is what stops a caller from filling three and defaulting
+/// the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitProof {
+    /// Which replicated log this entry committed in. Distinct logs
+    /// MUST carry distinct sources: `dominates` compares
+    /// `commit_index` only after `source` and `epoch` match, so two
+    /// logs sharing a source would have their unrelated indices
+    /// ordered against each other.
+    pub source: [u8; 16],
+    /// The Raft term the entry committed in.
+    pub term: u64,
+    /// The log index the entry committed at.
+    pub index: u64,
+    /// How many voters the commit required. 0 or 1 means the write
+    /// was never replicated, and a consumer must NOT report
+    /// `ReplicatedDurable` for it — see `is_replicated`.
+    pub quorum: u8,
+    /// Commitment to the committed entry itself. Two replicas of one
+    /// log at the same `(term, index)` commit identical bytes and so
+    /// compute an identical witness; divergent logs do not. That is
+    /// the whole fork check, and it is why the witness is a function
+    /// of the entry rather than a counter.
+    ///
+    /// Zero on a proof that was never replicated: with a single voter
+    /// there is no agreement to commit to, and inventing bytes that
+    /// look like one would be the dishonesty this record exists to
+    /// prevent.
+    pub witness: [u8; 32],
+}
+
+impl CommitProof {
+    /// Whether this proof supports a `ReplicatedDurable` claim.
+    ///
+    /// Two conditions, both required. A quorum of one is a single
+    /// voter agreeing with itself — durability on one device, not
+    /// replication. And a zero witness is no commitment at all: a
+    /// fence carrying one cannot be told apart from a fence over a
+    /// forked log, which is precisely what `dominates` consults the
+    /// witness to decide.
+    ///
+    /// So a proof missing either downgrades to `LocalDurable` rather
+    /// than asserting a fence nothing substantiates. This is the one
+    /// place the rule lives, so no consumer re-derives it and none
+    /// can quietly relax it.
+    pub fn is_replicated(&self) -> bool {
+        self.quorum >= 2 && self.witness != [0u8; 32]
+    }
+}
+
+/// Fixed part of a Committed record, before the inner bytes.
+pub const COMMITTED_HDR: usize = 1 + 1 + 4 + 1 + 16 + 8 + 8 + 32 + 2;
+
 pub fn encode_committed(
     dst: &mut [u8],
     plane: u8,
     correlation_id: u32,
-    witness_quorum: u8,
-    witness_epoch: u64,
+    proof: &CommitProof,
     inner: &[u8],
 ) -> Result<usize, WireError> {
     if !matches!(plane, PLANE_NAMESPACE | PLANE_OBJECT | PLANE_BLOCK) {
@@ -145,8 +209,7 @@ pub fn encode_committed(
             max: MAX_INNER,
         });
     }
-    let header = 1 + 1 + 4 + 1 + 8 + 2;
-    let needed = header + inner.len();
+    let needed = COMMITTED_HDR + inner.len();
     if dst.len() < needed {
         return Err(WireError::BufferTooSmall {
             needed,
@@ -156,10 +219,13 @@ pub fn encode_committed(
     dst[0] = OP_COMMITTED;
     dst[1] = plane;
     dst[2..6].copy_from_slice(&correlation_id.to_le_bytes());
-    dst[6] = witness_quorum;
-    dst[7..15].copy_from_slice(&witness_epoch.to_le_bytes());
-    dst[15..17].copy_from_slice(&(inner.len() as u16).to_le_bytes());
-    dst[header..header + inner.len()].copy_from_slice(inner);
+    dst[6] = proof.quorum;
+    dst[7..23].copy_from_slice(&proof.source);
+    dst[23..31].copy_from_slice(&proof.term.to_le_bytes());
+    dst[31..39].copy_from_slice(&proof.index.to_le_bytes());
+    dst[39..71].copy_from_slice(&proof.witness);
+    dst[71..73].copy_from_slice(&(inner.len() as u16).to_le_bytes());
+    dst[COMMITTED_HDR..COMMITTED_HDR + inner.len()].copy_from_slice(inner);
     Ok(needed)
 }
 
@@ -167,13 +233,12 @@ pub fn encode_committed(
 pub struct DecodedCommitted<'a> {
     pub plane: u8,
     pub correlation_id: u32,
-    pub witness_quorum: u8,
-    pub witness_epoch: u64,
+    pub proof: CommitProof,
     pub inner: &'a [u8],
 }
 
 pub fn decode_committed(src: &[u8]) -> Result<DecodedCommitted<'_>, WireError> {
-    if src.len() < 17 {
+    if src.len() < COMMITTED_HDR {
         return Err(WireError::Truncated);
     }
     if src[0] != OP_COMMITTED {
@@ -184,19 +249,26 @@ pub fn decode_committed(src: &[u8]) -> Result<DecodedCommitted<'_>, WireError> {
         return Err(WireError::BadPlane { observed: plane });
     }
     let correlation_id = u32::from_le_bytes(src[2..6].try_into().unwrap());
-    let witness_quorum = src[6];
-    let witness_epoch = u64::from_le_bytes(src[7..15].try_into().unwrap());
-    let inner_len = u16::from_le_bytes([src[15], src[16]]) as usize;
-    let header = 17;
-    if header + inner_len > src.len() {
+    let mut source = [0u8; 16];
+    source.copy_from_slice(&src[7..23]);
+    let mut witness = [0u8; 32];
+    witness.copy_from_slice(&src[39..71]);
+    let proof = CommitProof {
+        source,
+        term: u64::from_le_bytes(src[23..31].try_into().unwrap()),
+        index: u64::from_le_bytes(src[31..39].try_into().unwrap()),
+        quorum: src[6],
+        witness,
+    };
+    let inner_len = u16::from_le_bytes([src[71], src[72]]) as usize;
+    if COMMITTED_HDR + inner_len > src.len() {
         return Err(WireError::Truncated);
     }
     Ok(DecodedCommitted {
         plane,
         correlation_id,
-        witness_quorum,
-        witness_epoch,
-        inner: &src[header..header + inner_len],
+        proof,
+        inner: &src[COMMITTED_HDR..COMMITTED_HDR + inner_len],
     })
 }
 
@@ -270,11 +342,11 @@ pub fn record_len(src: &[u8]) -> Result<Option<usize>, WireError> {
             })
         }
         OP_COMMITTED => {
-            if src.len() < 17 {
+            if src.len() < COMMITTED_HDR {
                 return Ok(None);
             }
-            let inner_len = u16::from_le_bytes([src[15], src[16]]) as usize;
-            let total = 17 + inner_len;
+            let inner_len = u16::from_le_bytes([src[71], src[72]]) as usize;
+            let total = COMMITTED_HDR + inner_len;
             Ok(if src.len() >= total {
                 Some(total)
             } else {

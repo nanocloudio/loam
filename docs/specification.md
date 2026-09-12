@@ -17,8 +17,12 @@ where it is stated.
   - A purely in-memory store advertises `Volatile` for local ops.
   - A WAL-backed store advertises `LocalDurable` only after the WAL
     append has been fsync'd.
-  - `ReplicatedDurable` requires a non-empty `ClustorFenceWitness`;
-    the store refuses to construct one without proof of quorum.
+  - `ReplicatedDurable` requires a witness issued by the
+    replicating provider the operation went through — a non-empty
+    `FenceWitness` on the host contract, the
+    `(source, epoch, commit_index, quorum, witness)` tuple on the
+    module ABI. A store that cannot prove quorum advertises
+    `LocalDurable` instead of asserting a fence it did not earn.
   - Stores refuse caller-asserted fences they cannot honour: a
     memory-only namespace store will not accept a caller's
     `LocalDurable`.
@@ -37,15 +41,17 @@ where it is stated.
 - **BODY-OUT-OF-RAFT:** Object bodies, EC shards, cache contents,
   and page-backing state never enter any Raft log. Raft replicates
   only the `Propose` records of
-  [`loam_decision_wire.rs`](../modules/common/replicated/loam_decision_wire.rs)
+  [`loam_decision_wire.rs`](../modules/common/mechanics/loam_decision_wire.rs)
   — small, identity-bearing metadata (path bindings, object
   descriptors with `content_hash`, block volume metadata, placement
   claims), capped at `MAX_INNER` = 4 KiB per record. Body durability
   is proved independently: by content hash
   (`Fence::ContentHashed`), by local fsync (`Fence::LocalDurable`),
   and/or by a body-provider quorum whose witness is issued by the
-  body provider, not by `ClustorFenceWitness`. The two witnesses
-  prove different things and have independent fault domains.
+  body provider rather than by the metadata replicator. The two
+  witnesses prove different things and have independent fault
+  domains, even where both are carried in the same `FenceWitness`
+  shape.
 - **TOPOLOGY-INVARIANT:** A `Propose` record's shape is identical on
   a 1-node "cluster," a micro-DC, and a hyperscale fleet. Cluster
   topology decides how many Raft groups and which group routes a
@@ -109,7 +115,7 @@ answer.
 Clustor is the only Raft substrate. Loam binds namespace, object
 metadata, and block maps to clustor replica groups through explicit
 descriptors carried on the decision wire
-([`modules/common/replicated/loam_decision_wire.rs`](../modules/common/replicated/loam_decision_wire.rs)).
+([`modules/common/mechanics/loam_decision_wire.rs`](../modules/common/mechanics/loam_decision_wire.rs)).
 Loam consumes clustor's public API only; it does not depend on
 clustor internals.
 

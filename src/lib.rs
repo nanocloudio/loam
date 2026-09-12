@@ -54,7 +54,7 @@ pub mod prelude {
     pub use crate::core::error::{Error, Result};
     pub use crate::fluxor::{FluxorGraphProfile, FluxorTarget};
     pub use crate::fluxor_contracts::{
-        ClustorFenceWitness, Fence, HashAlgo, StorageHandle, StorageSurface,
+        Fence, FenceWitness, HashAlgo, StorageHandle, StorageSurface,
     };
     pub use crate::storage::AchievableFence;
 }

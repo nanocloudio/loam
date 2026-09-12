@@ -13,7 +13,7 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 
 #[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
-#[path = "../../common/replicated/loam_decision_wire.rs"]
+#[path = "../../common/mechanics/loam_decision_wire.rs"]
 mod wire;
 
 #[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
@@ -210,7 +210,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         _ => {}
                     }
                     match wire::decode_committed(&s.asm[rec_start..rec_start + len]) {
-                        Ok(c) if is_probe_bind(c.inner) && c.witness_epoch > 0 => {
+                        // A commit the plane can substantiate: the
+                        // proof carries a log position, not just an
+                        // opcode saying the word "committed".
+                        Ok(c) if is_probe_bind(c.inner) && c.proof.index > 0 => {
                             verdict = 1;
                             break;
                         }

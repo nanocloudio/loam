@@ -7,7 +7,14 @@ Layout follows the fluxor CLI convention: module shims live at
 `modules/app/<name>/mod.rs` (+ `manifest.toml`), shared step bodies
 and wire formats under `modules/common/mechanics/` and
 `modules/common/replicated/`, split by fence class and enforced by
-`tools/ci/tier_guard.sh`. `fluxor modules build`
+`tools/ci/tier_guard.sh`. The split is directional: `replicated/` may
+consume `mechanics/`, never the reverse, so the mechanics tier stays
+extractable on its own. Shared vocabulary therefore lives in
+`mechanics/` even when the replicated tier is its busiest consumer —
+`loam_decision_wire.rs`, the Propose/Committed/Aborted protocol, sits
+there because `namespace_router` speaks it too and a mechanics module
+reaching upward for it would weld the tiers together.
+`fluxor modules build`
 discovers `modules/app/*/mod.rs`,
 handles staleness, and emits to `target/fluxor/<silicon>/modules/`.
 

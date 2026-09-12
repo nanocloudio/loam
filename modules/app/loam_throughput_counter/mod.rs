@@ -48,7 +48,7 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 mod load_helpers;
 use load_helpers::{copy_tag, write_hex_u32};
 
-#[path = "../../common/replicated/loam_decision_wire.rs"]
+#[path = "../../common/mechanics/loam_decision_wire.rs"]
 mod wire;
 
 const READ_BUF: usize = 512;

@@ -236,7 +236,7 @@ decision commits through a durability quorum before the client sees
 `Committed`, and a plane-level read gate holds reads until replay has
 drained. Bodies stay outside the Raft log throughout — only the
 fixed-size decision records of
-[`loam_decision_wire.rs`](../modules/common/replicated/loam_decision_wire.rs)
+[`loam_decision_wire.rs`](../modules/common/mechanics/loam_decision_wire.rs)
 are replicated.
 
 Composing that graph needs clustor's published module palette in the
