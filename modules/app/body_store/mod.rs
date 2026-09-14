@@ -8,7 +8,11 @@
 
 use core::ffi::c_void;
 
-#[allow(dead_code, unused_imports, reason = "shared fluxor SDK include; each module uses a subset")]
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "shared fluxor SDK include; each module uses a subset"
+)]
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
@@ -17,7 +21,10 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/mechanics/loam_hash.rs"]
 mod hash;
 
@@ -34,15 +41,24 @@ mod sha256 {
     pub use super::Sha256;
 }
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/mechanics/loam_ec_wire.rs"]
 mod ec_wire;
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/mechanics/loam_extent_wire.rs"]
 mod extent_wire;
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/mechanics/body_store_body.rs"]
 mod body;
 
@@ -101,11 +117,7 @@ pub extern "C" fn module_new(
 /// Decode the `root_dir` param: either a TLV blob (`[0xFE, 0x01, …]`)
 /// with `tag = 1` entry, or a raw byte slice. Mirrors the dual-mode
 /// decoder in `namespace_pic_body::decode_wal_path_params`.
-unsafe fn decode_root_dir_params(
-    state_ptr: *mut u8,
-    params: *const u8,
-    params_len: usize,
-) {
+unsafe fn decode_root_dir_params(state_ptr: *mut u8, params: *const u8, params_len: usize) {
     if params.is_null() || params_len == 0 {
         return;
     }

@@ -10,7 +10,11 @@
 
 use core::ffi::c_void;
 
-#[allow(dead_code, unused_imports, reason = "shared fluxor SDK include; each module uses a subset")]
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "shared fluxor SDK include; each module uses a subset"
+)]
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
@@ -18,7 +22,10 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/mechanics/loam_limits.rs"]
 mod limits;
 
@@ -28,7 +35,10 @@ mod hash;
 #[path = "../../common/mechanics/loam_decision_wire.rs"]
 mod wire;
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/mechanics/fs_names.rs"]
 mod fs_names;
 
@@ -38,7 +48,10 @@ mod reply_out;
 #[path = "../../common/mechanics/wal_io.rs"]
 mod wal;
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/replicated/raft_proposer_body.rs"]
 mod body;
 
@@ -105,7 +118,13 @@ pub extern "C" fn module_new(
         let clustor_out = dev_channel_port(&*sys, 1, 1);
         let clustor_in = dev_channel_port(&*sys, 0, 1);
         let rc = body::module_new_full_impl(
-            in_chan, clustor_out, out_chan, clustor_in, state_ptr, state_size, sys,
+            in_chan,
+            clustor_out,
+            out_chan,
+            clustor_in,
+            state_ptr,
+            state_size,
+            sys,
         );
         if rc != 0 {
             return rc;

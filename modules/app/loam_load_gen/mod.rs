@@ -26,7 +26,11 @@
 
 use core::ffi::c_void;
 
-#[allow(dead_code, unused_imports, reason = "shared fluxor SDK include; each module uses a subset")]
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "shared fluxor SDK include; each module uses a subset"
+)]
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
@@ -34,7 +38,10 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/replicated/load_helpers.rs"]
 mod load_helpers;
 use load_helpers::{copy_tag, write_hex_u32};
@@ -45,7 +52,10 @@ mod limits;
 #[path = "../../common/mechanics/loam_wire.rs"]
 mod wire;
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/mechanics/loam_decision_wire.rs"]
 mod decision;
 
@@ -196,8 +206,6 @@ unsafe fn emit_report(s: &ModuleState, syscalls: &SyscallTable) {
     pos += write_hex_u32(&mut line[pos..], s.refused);
     dev_log(syscalls, 3, line.as_ptr(), pos);
 }
-
-
 
 /// Write `value` as `width` lowercase hex digits ending at `end`.
 fn write_hex(dst: &mut [u8], end: usize, width: usize, value: u32) {

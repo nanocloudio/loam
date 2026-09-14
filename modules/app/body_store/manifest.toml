@@ -4,11 +4,20 @@ hardware_targets = ["bcm2712"]
 # Deliberately NO `provides` claim: body_store is loam's INTERNAL
 # content-addressed byte plane, reached through the body wire by the
 # routers above it (body_fanout_router / ec_body_router) and composed
-# behind `object_index` — which holds the graph's one unkeyed
-# `storage.object` claim. Declaring it here too would be two default
-# providers of one contract in the same graph, which the config gate
-# rejects as silent shadowing. Fence class: LocalDurable (fsynced
-# blobs); the replicated tier lifts this to ReplicatedDurable.
+# behind `object_index`.
+#
+# NOTHING IN LOAM CLAIMS `storage.object` TODAY. `object_index` declines
+# it and says why — it holds descriptors, not bytes, so a consumer
+# resolving the surface by contract would bind to a provider that must
+# ENOSYS the surface's whole purpose. The claim belongs to whoever owns
+# the composition of descriptor plus bytes, which `admin_router`
+# already performs for PUT_FILE / GET_FILE; until a module exports
+# `module_provides_contract` for it, the surface has no provider here.
+# Declaring it HERE would still be wrong: this plane is keyed by digest
+# and reached through the routers, and a second default provider of one
+# contract in a graph is what the config gate rejects as silent
+# shadowing. Fence class: LocalDurable (fsynced blobs); the replicated
+# tier lifts this to ReplicatedDurable.
 
 # Content-addressed object body store. Bodies are keyed by their
 # SHA-256 digest; the PIC exposes channel-based put/get/head/

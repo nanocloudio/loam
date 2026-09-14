@@ -5,18 +5,28 @@
 
 use core::ffi::c_void;
 
-#[allow(dead_code, unused_imports, reason = "shared fluxor SDK include; each module uses a subset")]
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "shared fluxor SDK include; each module uses a subset"
+)]
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/mechanics/loam_decision_wire.rs"]
 mod wire;
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/mechanics/loam_limits.rs"]
 mod limits;
 
@@ -39,15 +49,7 @@ const PROBE_REVISION: u64 = 1;
 
 /// Encode the probe's bind into `dst`, returning its length.
 fn encode_probe_bind(dst: &mut [u8]) -> Option<usize> {
-    ns_wire::encode_bind(
-        dst,
-        PROBE_ROOT,
-        PROBE_PATH,
-        PROBE_OBJECT,
-        0,
-        PROBE_REVISION,
-    )
-    .ok()
+    ns_wire::encode_bind(dst, PROBE_ROOT, PROBE_PATH, PROBE_OBJECT, 0, PROBE_REVISION).ok()
 }
 
 /// Does `inner` decode back to the bind this probe proposed?
@@ -185,11 +187,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     if space == 0 {
                         break;
                     }
-                    let n = (sys.channel_read)(
-                        s.results_in,
-                        s.asm.as_mut_ptr().add(s.asm_len),
-                        space,
-                    );
+                    let n =
+                        (sys.channel_read)(s.results_in, s.asm.as_mut_ptr().add(s.asm_len), space);
                     if n <= 0 {
                         break;
                     }

@@ -1,16 +1,21 @@
 #![no_std]
-
 // Loam's namespace_router PIC module. The step-body logic lives in
 // `modules/common/mechanics/namespace_pic_body.rs`, path-included below; this
 // file is the thin `#[no_mangle] extern "C"` glue plus the
 // `define_params!` schema that lets the fluxor build tool pack a
 // YAML `params: { wal_path: "..." }` field into the TLV blob the
 // kernel hands to `module_new`.
-
-#![allow(dead_code, reason = "SDK runtime/params include! lands at crate root; each shim drives a subset")]
+#![allow(
+    dead_code,
+    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+)]
 use core::ffi::c_void;
 
-#[allow(dead_code, unused_imports, reason = "shared fluxor SDK include; each module uses a subset")]
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "shared fluxor SDK include; each module uses a subset"
+)]
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
@@ -24,7 +29,10 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 // referenced by the macro-generated `PARAM_SCHEMA` table.
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/mechanics/loam_change_wire.rs"]
 mod change_wire;
 
@@ -43,19 +51,31 @@ mod fs_names;
 #[path = "../../common/mechanics/loam_wire.rs"]
 mod wire;
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/mechanics/namespace_pic_state.rs"]
 mod state;
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/mechanics/wal_io.rs"]
 mod wal;
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/mechanics/loam_snapshot.rs"]
 mod snapshot;
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/mechanics/loam_decision_wire.rs"]
 mod decision;
 

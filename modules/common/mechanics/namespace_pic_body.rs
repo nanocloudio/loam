@@ -1641,6 +1641,39 @@ const E_NOSYS: i32 = -38;
 const E_EXIST: i32 = -17;
 const E_MFILE: i32 = -24;
 
+/// Write one `LIST` entry into `out`, answering whether it fitted.
+///
+/// `trailer` is the room the mandatory cursor record must keep, reserved
+/// before any entry is written: a full buffer carrying entries and no way to
+/// continue would have the caller parse a page it cannot follow.
+///
+/// A name the entry header cannot express is passed over as though it did
+/// fit. `name_len` is one byte and this namespace binds paths far longer, so
+/// the frame cannot carry such a name and the contract has no "skipped"
+/// signal to report it with. Recorded as a contract gap rather than hidden.
+///
+/// The ceiling is 254, not 255: the trailing cursor record is marked with
+/// `0xFF` in the same position an entry carries `name_len`, so a name of
+/// exactly 255 bytes would produce an entry a consumer reads as the end of
+/// the page — every later entry lost, and silently. Emitting one would be
+/// worse than omitting it, which is why the length a byte can hold is not
+/// the length this writes.
+fn list_take(out: &mut [u8], w: &mut usize, name: &[u8], kind: u8, trailer: usize) -> bool {
+    if name.is_empty() || name.len() >= u8::MAX as usize {
+        return true;
+    }
+    let need = 2 + name.len();
+    if *w + need + trailer > out.len() {
+        return false;
+    }
+    let at = *w;
+    out[at] = name.len() as u8;
+    out[at + 1] = kind;
+    out[at + 2..at + 2 + name.len()].copy_from_slice(name);
+    *w = at + need;
+    true
+}
+
 /// The strongest fence this provider can honestly claim right now.
 ///
 /// Claimed from the PROOF in hand, never from the mode configured.
@@ -2366,8 +2399,201 @@ pub unsafe fn provider_dispatch_impl(
             n as i32
         }
 
-        // Not implemented, and `CAPS` says so. Returning ENOSYS rather
-        // than a wrong answer is what lets a consumer branch on it.
+        // List the keys under a prefix, one page per call.
+        //
+        // The contract's surface is ONE FLAT KEYSPACE: `LOOKUP` above
+        // resolves through `live_slot`, which hashes with an empty
+        // root, so that is the root listed here too. Naming a root is
+        // the channel wire's job, and a caller that wants one uses
+        // it. The prefix filters the PATH, which is the only thing
+        // this state can filter on.
+        //
+        // arg is
+        //   [prefix_len u16][prefix][cursor_len u16][cursor]
+        //   [out_buf u64][out_cap u32][fence_ptr u64][fence_cap u16]
+        NS_OP_LIST => {
+            if arg.is_null() || arg_len < 4 || s.syscalls.is_null() {
+                return E_INVAL;
+            }
+            let a = core::slice::from_raw_parts(arg, arg_len);
+            let le64 = |at: usize| -> u64 {
+                let mut b = [0u8; 8];
+                let mut i = 0usize;
+                while i < 8 {
+                    b[i] = a[at + i];
+                    i += 1;
+                }
+                u64::from_le_bytes(b)
+            };
+            let prefix_len = u16::from_le_bytes([a[0], a[1]]) as usize;
+            let mut p = 2usize;
+            if arg_len < p + prefix_len + 2 {
+                return E_INVAL;
+            }
+            let prefix = &a[p..p + prefix_len];
+            p += prefix_len;
+            let cursor_len = u16::from_le_bytes([a[p], a[p + 1]]) as usize;
+            p += 2;
+            // Through the output buffer is required; the fence pair after
+            // it is optional, which `read_fence_out` is the reader for.
+            if arg_len < p + cursor_len + 8 + 4 {
+                return E_INVAL;
+            }
+            // The cursor is opaque to the caller and four little-endian
+            // bytes to us: the position in the walk below. A shorter one
+            // is read as far as it goes, and an absent one starts over.
+            let mut cbytes = [0u8; 4];
+            let take = cursor_len.min(4);
+            let mut i = 0usize;
+            while i < take {
+                cbytes[i] = a[p + i];
+                i += 1;
+            }
+            let cursor = u32::from_le_bytes(cbytes);
+            p += cursor_len;
+            let out_ptr = le64(p) as usize as *mut u8;
+            p += 8;
+            let out_cap = u32::from_le_bytes([a[p], a[p + 1], a[p + 2], a[p + 3]]) as usize;
+            p += 4;
+            let (fence_ptr, fence_cap) = read_fence_out(a, p);
+            if out_ptr.is_null() {
+                return E_INVAL;
+            }
+            // The trailing cursor record is mandatory, so its worst case
+            // is reserved before any entry is written. Without that a
+            // full buffer would carry entries and no way to continue.
+            const CURSOR_RECORD_BYTES: usize = 2 + 4;
+            let out = core::slice::from_raw_parts_mut(out_ptr, out_cap);
+            let mut w = 0usize;
+            let arena_cap = s.bindings.capacity() as u32;
+            // The table the loader handed this module, checked non-null
+            // above; the snapshot phase reads through it.
+            let sys = &*s.syscalls;
+
+            // The arena first, then the snapshot: the same two-phase
+            // cursor space `handle_list` walks, because a key evicted to
+            // the snapshot is still bound and a listing that skipped it
+            // would be wrong rather than short.
+            let mut resume: Option<u32> = None;
+            let mut done = false;
+            if cursor < arena_cap {
+                match s.bindings.list_page_prefixed(
+                    &[],
+                    prefix,
+                    cursor,
+                    usize::MAX,
+                    |path, kind| list_take(out, &mut w, path, kind, CURSOR_RECORD_BYTES),
+                ) {
+                    Some(idx) => resume = Some(idx),
+                    None => {
+                        if s.snap_active != 0 && s.snap_count > 0 {
+                            resume = Some(arena_cap);
+                        } else {
+                            done = true;
+                        }
+                    }
+                }
+            } else {
+                resume = Some(cursor);
+            }
+
+            if !done {
+                if let Some(at) = resume {
+                    if at >= arena_cap && s.snap_active != 0 {
+                        let snap = super::snapshot::OpenSnapshot {
+                            fd: s.snap_fd,
+                            count: s.snap_count,
+                            generation: s.snap_gen,
+                        };
+                        let ns_h = super::state::fnv1a64(&[]);
+                        let mut idx = at - arena_cap;
+                        let mut stalled = false;
+                        while idx < s.snap_count {
+                            match super::snapshot::snap_read_at(sys, &snap, idx) {
+                                Some(rec) => {
+                                    let path = &rec.path[..(rec.path_len as usize)
+                                        .min(super::state::MAX_LIST_PATH)];
+                                    // The arena's entry, live or tombstone,
+                                    // is authoritative for a key it holds.
+                                    let shadowed = s
+                                        .bindings
+                                        .lookup_hashed(
+                                            rec.ns_hash,
+                                            rec.path_hash,
+                                            &rec.root[..rec.root_len as usize],
+                                            path,
+                                        )
+                                        .is_some();
+                                    if rec.ns_hash != ns_h
+                                        || rec.path_len == 0
+                                        || shadowed
+                                        || !path.starts_with(prefix)
+                                    {
+                                        idx += 1;
+                                        continue;
+                                    }
+                                    if !list_take(out, &mut w, path, rec.kind, CURSOR_RECORD_BYTES)
+                                    {
+                                        stalled = true;
+                                        break;
+                                    }
+                                    idx += 1;
+                                }
+                                None => {
+                                    idx = s.snap_count;
+                                    break;
+                                }
+                            }
+                        }
+                        resume = if stalled || idx < s.snap_count {
+                            Some(arena_cap + idx)
+                        } else {
+                            None
+                        };
+                    }
+                }
+            }
+
+            let next = if done { None } else { resume };
+            // A buffer that cannot hold one entry and the trailer cannot
+            // be paged out of: answering an empty page with a cursor that
+            // does not advance would have the caller ask forever. That is
+            // the one case the contract's "page rather than refuse" has
+            // no answer for, so it is refused.
+            if w == 0 && next.is_some() && out_cap < CURSOR_RECORD_BYTES + 3 {
+                return E_INVAL;
+            }
+            match next {
+                Some(at) => {
+                    if w + 6 > out_cap {
+                        return E_INVAL;
+                    }
+                    out[w] = 0xFF;
+                    out[w + 1] = 4;
+                    out[w + 2..w + 6].copy_from_slice(&at.to_le_bytes());
+                    w += 6;
+                }
+                None => {
+                    if w + 2 > out_cap {
+                        return E_INVAL;
+                    }
+                    out[w] = 0xFF;
+                    out[w + 1] = 0;
+                    w += 2;
+                }
+            }
+
+            if !fence_ptr.is_null() && fence_cap >= super::abi::fence::WIRE_MAX_LEN {
+                let fbuf = core::slice::from_raw_parts_mut(fence_ptr, fence_cap);
+                let _ = achieved_fence(s).encode(fbuf);
+            }
+            w as i32
+        }
+
+        // Not implemented. For the ops `CAPS` carries a bit for, that
+        // bitmap says so too; for the rest, this errno is the whole of
+        // the answer. Returning it rather than a wrong answer is what
+        // lets a consumer branch on it.
         _ => E_NOSYS,
     }
 }

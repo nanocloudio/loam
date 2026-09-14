@@ -792,15 +792,71 @@ impl<const N: usize> PicNamespaceState<N> {
         best
     }
 
-    /// One page of the namespace's paths, in slot order. `emit` is
-    /// called once per path (at most `max` times); returns the next
-    /// cursor, 0 when the enumeration wrapped.
+    /// One page of the keys under `namespace_root` whose path begins
+    /// with `prefix`, in slot order.
+    ///
+    /// `emit` is called once per matching key, with its path and its
+    /// kind, and answers whether it TOOK the entry. A `false` stops
+    /// the walk without consuming that entry, so the cursor returned
+    /// points AT it and the next page offers it again — which is what
+    /// lets a caller fill a fixed buffer and come back for the rest
+    /// instead of refusing the listing.
+    ///
+    /// The answer is where to resume, or `None` once every slot has
+    /// been examined. `None` rather than a zero sentinel because slot
+    /// 0 is a valid place to resume: a caller whose buffer could not
+    /// hold even the first entry must be told "resume at 0", and a
+    /// sentinel would tell it "finished" instead.
     ///
     /// Every bound key appears: the wire refuses anything that would
     /// not fit inline, so there is no "bound but unlistable" state
     /// for a listing to skip. The root is compared on BYTES — a
     /// root-hash match alone would enumerate one tenant's keys under
-    /// another tenant's root.
+    /// another tenant's root. The prefix is a byte prefix of the path
+    /// and nothing else: this state holds no notion of a separator,
+    /// so a caller that means "children" says so in the bytes it
+    /// sends.
+    pub fn list_page_prefixed(
+        &self,
+        namespace_root: &[u8],
+        prefix: &[u8],
+        cursor: u32,
+        max: usize,
+        mut emit: impl FnMut(&[u8], u8) -> bool,
+    ) -> Option<u32> {
+        let ns_h = fnv1a64(namespace_root);
+        let mut idx = cursor as usize;
+        let mut count = 0usize;
+        while idx < N {
+            if count >= max {
+                return Some(idx as u32);
+            }
+            let s = &self.slots[idx];
+            if s.occupied
+                && s.kind != KIND_TOMBSTONE
+                && s.namespace_hash == ns_h
+                && s.path_len != 0
+                && s.root() == namespace_root
+                && s.path().starts_with(prefix)
+            {
+                if !emit(s.path(), s.kind) {
+                    return Some(idx as u32);
+                }
+                count += 1;
+            }
+            idx += 1;
+        }
+        None
+    }
+
+    /// One page of the namespace's paths, in slot order. `emit` is
+    /// called once per path (at most `max` times); returns the next
+    /// cursor, 0 when the enumeration wrapped.
+    ///
+    /// The empty prefix matches every path, so this is
+    /// `list_page_prefixed` with the filter open and the kind
+    /// dropped. One walk, one set of match rules: a second copy of
+    /// them is a second place for a tenant's keys to leak from.
     pub fn list_page(
         &self,
         namespace_root: &[u8],
@@ -808,27 +864,13 @@ impl<const N: usize> PicNamespaceState<N> {
         max: usize,
         mut emit: impl FnMut(&[u8]),
     ) -> u32 {
-        let ns_h = fnv1a64(namespace_root);
-        let mut idx = cursor as usize;
-        let mut count = 0usize;
-        while idx < N && count < max {
-            let s = &self.slots[idx];
-            if s.occupied
-                && s.kind != KIND_TOMBSTONE
-                && s.namespace_hash == ns_h
-                && s.path_len != 0
-                && s.root() == namespace_root
-            {
-                emit(s.path());
-                count += 1;
-            }
-            idx += 1;
-        }
-        if idx >= N {
-            0
-        } else {
-            idx as u32
-        }
+        // `None` is "every slot examined", which this surface reports
+        // as the 0 its own contract calls "wrapped".
+        self.list_page_prefixed(namespace_root, &[], cursor, max, |path, _kind| {
+            emit(path);
+            true
+        })
+        .unwrap_or_default()
     }
 
     pub fn unbind(&mut self, namespace_root: &[u8], path: &[u8]) -> Result<ApplyOk, ApplyError> {

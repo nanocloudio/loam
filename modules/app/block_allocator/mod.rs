@@ -1,13 +1,18 @@
 #![no_std]
-
 // Loam's block_allocator PIC module. See `namespace_router/mod.rs`
 // for the WAL + TLV param plumbing pattern; this module follows the
 // same shape with the block-plane wire and arena.
-
-#![allow(dead_code, reason = "SDK runtime/params include! lands at crate root; each shim drives a subset")]
+#![allow(
+    dead_code,
+    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+)]
 use core::ffi::c_void;
 
-#[allow(dead_code, unused_imports, reason = "shared fluxor SDK include; each module uses a subset")]
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "shared fluxor SDK include; each module uses a subset"
+)]
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
@@ -15,7 +20,10 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/mechanics/loam_hash.rs"]
 mod hash;
 
@@ -31,15 +39,24 @@ mod fs_names;
 #[path = "../../common/mechanics/loam_block_wire.rs"]
 mod wire;
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/mechanics/block_pic_state.rs"]
 mod state;
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/mechanics/wal_io.rs"]
 mod wal;
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/mechanics/block_pic_body.rs"]
 mod body;
 

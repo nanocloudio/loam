@@ -19,6 +19,31 @@ impl Drop for ServerGuard {
     }
 }
 
+/// Wait until the server is accepting on `socket`.
+///
+/// A socket PATH existing is not a server listening. A killed server leaves
+/// its path behind, so on a restart `exists()` is already true before the new
+/// process has bound — and the fixed sleep that used to follow it was a guess
+/// that lost under load, which is what made `block_volume_lifecycle` fail on
+/// its reconnect. Connecting is the only observation that means ready, so it
+/// is the one waited on.
+///
+/// `ServerGuard` kills and reaps the previous server before a restart reaches
+/// here, so a connection that succeeds can only be the new one's.
+fn wait_until_listening(socket: &std::path::Path) {
+    let started = Instant::now();
+    loop {
+        if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "loam-server didn't accept on its socket within 5s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn spawn_server(socket: &std::path::Path, dir: &std::path::Path) -> ServerGuard {
     let mut cmd = Command::new(server_bin());
     cmd.args([
@@ -36,15 +61,7 @@ fn spawn_server(socket: &std::path::Path, dir: &std::path::Path) -> ServerGuard 
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
     let child = cmd.spawn().expect("spawn loam-server");
-    let started = Instant::now();
-    while !socket.exists() {
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "loam-server didn't open its socket within 5s"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    std::thread::sleep(Duration::from_millis(50));
+    wait_until_listening(socket);
     ServerGuard(child)
 }
 
@@ -248,15 +265,7 @@ fn spawn_server_with_token(
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
     let child = cmd.spawn().expect("spawn loam-server");
-    let started = Instant::now();
-    while !socket.exists() {
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "loam-server didn't open its socket within 5s"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    std::thread::sleep(Duration::from_millis(50));
+    wait_until_listening(socket);
     ServerGuard(child)
 }
 

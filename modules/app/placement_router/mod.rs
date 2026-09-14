@@ -1,16 +1,21 @@
 #![no_std]
-
 // Loam's placement_router PIC module. The step-body logic lives in
 // `modules/common/replicated/placement_router_body.rs`, path-included below;
 // this file is the thin `#[no_mangle] extern "C"` glue plus the
 // `define_params!` schema that lets the fluxor build tool pack a
 // YAML `params: { seed_members: [0,1,2] }` field into the TLV blob
 // the kernel hands to `module_new`.
-
-#![allow(dead_code, reason = "SDK runtime/params include! lands at crate root; each shim drives a subset")]
+#![allow(
+    dead_code,
+    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+)]
 use core::ffi::c_void;
 
-#[allow(dead_code, unused_imports, reason = "shared fluxor SDK include; each module uses a subset")]
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "shared fluxor SDK include; each module uses a subset"
+)]
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
@@ -18,14 +23,20 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/mechanics/loam_limits.rs"]
 mod limits;
 
 #[path = "../../common/replicated/loam_placement_wire.rs"]
 mod placement_wire;
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/replicated/placement_router_body.rs"]
 mod body;
 

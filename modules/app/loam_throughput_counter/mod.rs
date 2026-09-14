@@ -267,6 +267,3 @@ unsafe fn emit_report(s: &ModuleState, syscalls: &SyscallTable) {
     }
     dev_log(syscalls, 3, line.as_ptr(), pos);
 }
-
-
-

@@ -25,7 +25,11 @@
 
 use core::ffi::c_void;
 
-#[allow(dead_code, unused_imports, reason = "shared fluxor SDK include; each module uses a subset")]
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "shared fluxor SDK include; each module uses a subset"
+)]
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
@@ -34,7 +38,10 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
 
-#[allow(dead_code, reason = "shared PIC body; each module shim drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared PIC body; each module shim drives a subset"
+)]
 #[path = "../../common/mechanics/loam_limits.rs"]
 mod limits;
 
@@ -55,7 +62,10 @@ mod proof;
 // consumer binds to. It owns the channel envelope (type ids, framing,
 // reassembly) and the committed-entry payload decode, so the bridge holds no
 // copy of Clustor's wire vocabulary and cannot drift from it.
-#[allow(dead_code, reason = "shared consumer facade; the bridge drives a subset")]
+#[allow(
+    dead_code,
+    reason = "shared consumer facade; the bridge drives a subset"
+)]
 #[path = "../../../target/fluxor/clustor-common/replica_facade.rs"]
 mod facade;
 
@@ -221,8 +231,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if space == 0 {
                     break;
                 }
-                let n =
-                    (sys.channel_read)(s.proposals_in, s.req_asm.as_mut_ptr().add(s.req_asm_len), space);
+                let n = (sys.channel_read)(
+                    s.proposals_in,
+                    s.req_asm.as_mut_ptr().add(s.req_asm_len),
+                    space,
+                );
                 if n <= 0 {
                     break;
                 }
