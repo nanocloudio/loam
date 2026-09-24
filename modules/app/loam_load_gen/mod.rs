@@ -1,4 +1,8 @@
 #![no_std]
+#![allow(
+    dead_code,
+    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+)]
 
 // Metadata-plane load generator.
 //

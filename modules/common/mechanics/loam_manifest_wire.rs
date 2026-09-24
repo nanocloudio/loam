@@ -30,11 +30,6 @@
 // Same include discipline as the other mechanics sources: no_std,
 // no dependencies, `#[path]`-included by every consumer.
 
-#![allow(
-    dead_code,
-    reason = "shared #[path]-included surface; each includer uses a subset"
-)]
-
 pub const MAGIC: u32 = u32::from_le_bytes(*b"LMAN");
 
 /// Digest width. SHA-256, as everywhere else in the body plane.

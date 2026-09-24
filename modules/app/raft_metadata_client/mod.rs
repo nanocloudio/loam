@@ -1,4 +1,8 @@
 #![no_std]
+#![allow(
+    dead_code,
+    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+)]
 
 // Loam's raft_metadata_client PIC module. Implements the proposer
 // adapter between the public-surface PICs (namespace_router,

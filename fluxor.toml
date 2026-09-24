@@ -22,6 +22,34 @@ targets = ["bcm2712"]
 forbid_inline_tests = ["modules", "src"]
 mode                = "strict"
 
+# Crate-root suppressions, per standards/lints.md §4. Each prefix names
+# ONE cause, and every file under it was checked to need the attribute:
+# a suppression that no longer fired was deleted rather than kept, so
+# these cover live causes only.
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "modules/app/"
+reason = """A PIC module mounts the SDK runtime and params by include!, so its \
+compile sees the whole generated surface — define_params! emits parse_tlv and \
+dispatch_param into every module whether it takes params or not. The unused \
+items are not in the module's own source, so there is no item to move the \
+attribute onto: it is a property of how a PIC module is built."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "modules/common/"
+reason = """Shared step bodies and wire vocabularies, #[path]-mounted into several \
+PIC modules and into the host crates and tests. Each consumer uses a different \
+subset, so an item dead in one consumer is live in another. A per-item \
+#[expect] cannot express that — it errors in every consumer where the item is \
+used — and a per-item #[allow] on several hundred items would say less than one \
+statement of what these files are."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "tests/common/"
+reason = """The PIC harness, #[path]-mounted into every test crate. Each suite \
+drives the channels and syscalls it needs and none drives all of them — the \
+same multi-consumer cause as modules/common/, on the test side."""
+
 [ci.test]
 # Shadow-checkout hard-fail guard:
 # tests/ and examples/ are shadow-tracked in .git-shadow/, so a

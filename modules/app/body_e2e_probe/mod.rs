@@ -1,4 +1,8 @@
 #![no_std]
+#![allow(
+    dead_code,
+    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+)]
 // Runtime e2e probe: PUT → GET → verify against the body_store PIC.
 // Step 1 sends the PUT; subsequent steps read the response channel,
 // then send the GET, then verify the returned bytes byte-for-byte.

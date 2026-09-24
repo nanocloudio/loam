@@ -1,4 +1,8 @@
 #![no_std]
+#![allow(
+    dead_code,
+    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+)]
 
 // Loam's body_store PIC module. Disk-backed content-addressed
 // object body store; bodies live at `<root_dir>/<hex(sha256)>`.

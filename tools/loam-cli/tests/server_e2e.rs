@@ -1,12 +1,14 @@
 //! End-to-end test for the loam-server + admin-bind pipe.
-//! Spawns the server as a subprocess, lets the unix socket
-//! appear, fires an `admin-bind` from the CLI, and verifies the
+//! Spawns the server as a subprocess, waits for it to announce its
+//! admin socket, fires an `admin-bind` from the CLI, and verifies the
 //! round-trip.
 
+mod support;
+
 use serde_json::Value;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use support::{spawn_ready, Proc};
 use tempfile::tempdir;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -19,16 +21,7 @@ fn server_bin() -> &'static str {
     env!("CARGO_BIN_EXE_loam-server")
 }
 
-struct ServerGuard(Child);
-
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn spawn_server(socket: &std::path::Path, dir: &std::path::Path) -> ServerGuard {
+fn spawn_server(socket: &std::path::Path, dir: &std::path::Path) -> Proc {
     let mut cmd = Command::new(server_bin());
     cmd.args([
         "--socket",
@@ -42,20 +35,7 @@ fn spawn_server(socket: &std::path::Path, dir: &std::path::Path) -> ServerGuard 
         "--tick-us",
         "1000",
     ]);
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::null());
-    let child = cmd.spawn().expect("spawn loam-server");
-    // Wait for the socket to appear.
-    let started = Instant::now();
-    while !socket.exists() {
-        if started.elapsed() > Duration::from_secs(5) {
-            panic!("loam-server didn't open its socket within 5s");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    // Give the server one more tick to be ready to accept.
-    std::thread::sleep(Duration::from_millis(50));
-    ServerGuard(child)
+    spawn_ready(cmd, "admin socket on").0
 }
 
 fn run_cli(args: &[&str]) -> (Value, std::process::ExitStatus) {

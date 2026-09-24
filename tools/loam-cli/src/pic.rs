@@ -4,11 +4,6 @@
 //! a `VecDeque<Vec<u8>>`. Each CLI command resets state, runs one
 //! step, drains the output channel, and prints.
 
-#![allow(
-    dead_code,
-    reason = "shared #[path]-included surface; each includer uses a subset"
-)]
-
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};

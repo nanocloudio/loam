@@ -3,62 +3,24 @@
 //! over their public surfaces — TCP body bridge, unix admin
 //! socket, HTTP.
 
-use std::io::{BufRead, BufReader, Read, Write};
+mod support;
+
+use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
+use support::{announced_addr, spawn_ready, Proc};
 
 fn server_bin() -> &'static str {
     env!("CARGO_BIN_EXE_loam-server")
 }
 
-struct ServerProc {
-    child: Child,
-}
-
-impl Drop for ServerProc {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// Spawn loam-server with `args`, wait for a stderr line containing
-/// `ready_marker`, and return (process, that line).
-fn spawn_server(args: &[&str], ready_marker: &str) -> (ServerProc, String) {
-    let mut child = Command::new(server_bin())
-        .args(args)
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn loam-server");
-    let stderr = child.stderr.take().unwrap();
-    let mut reader = BufReader::new(stderr);
-    let mut line = String::new();
-    let marker = loop {
-        line.clear();
-        let n = reader.read_line(&mut line).expect("read server stderr");
-        assert!(n > 0, "server exited before becoming ready");
-        if line.contains(ready_marker) {
-            break line.trim().to_string();
-        }
-    };
-    // Keep draining stderr in the background so the server can't
-    // block on a full pipe.
-    std::thread::spawn(move || {
-        let mut sink = String::new();
-        while reader.read_line(&mut sink).map(|n| n > 0).unwrap_or(false) {
-            sink.clear();
-        }
-    });
-    (ServerProc { child }, marker)
-}
-
-fn addr_from_marker(marker: &str) -> String {
-    marker
-        .rsplit(' ')
-        .next()
-        .expect("addr at end of marker line")
-        .to_string()
+/// Spawn loam-server with `args` and wait for it to announce
+/// `ready_marker`. Returns the process and the announcing line.
+fn spawn_server(args: &[&str], ready_marker: &str) -> (Proc, String) {
+    let mut cmd = Command::new(server_bin());
+    cmd.args(args);
+    spawn_ready(cmd, ready_marker)
 }
 
 /// Send one admin frame over the unix socket and read one reply.
@@ -139,7 +101,7 @@ fn body_plane_spans_two_nodes_over_tcp() {
         ],
         "body-serve listening on",
     );
-    let b_addr = addr_from_marker(&marker);
+    let b_addr = announced_addr(&marker).to_string();
 
     // Node A: metadata plane + admin surface; body plane bridged
     // to node B.
@@ -230,7 +192,7 @@ fn s3_gateway_object_lifecycle() {
         ],
         "s3 gateway on",
     );
-    let addr = addr_from_marker(&marker);
+    let addr = announced_addr(&marker).to_string();
 
     // PUT an object.
     let content = b"hello from the loam s3 gateway";
@@ -402,7 +364,7 @@ fn s3_gateway_fronts_a_remote_body_node() {
         ],
         "body-serve listening on",
     );
-    let b_addr = addr_from_marker(&marker);
+    let b_addr = announced_addr(&marker).to_string();
 
     let (_node_a, marker) = spawn_server(
         &[
@@ -417,7 +379,7 @@ fn s3_gateway_fronts_a_remote_body_node() {
         ],
         "s3 gateway on",
     );
-    let addr = addr_from_marker(&marker);
+    let addr = announced_addr(&marker).to_string();
 
     // The full stack: HTTP → admin_router → namespace/object PICs
     // locally, body bytes over the TCP bridge to the other node.
@@ -456,7 +418,7 @@ fn s3_gateway_serves_concurrent_clients() {
         ],
         "s3 gateway on",
     );
-    let addr = addr_from_marker(&marker);
+    let addr = announced_addr(&marker).to_string();
 
     // A slow client connects and sends NOTHING — its worker thread
     // sits in the request read. Other clients must not be blocked
@@ -529,7 +491,7 @@ fn replicated_fleet_survives_a_body_node_death() {
         ],
         "body-serve listening on",
     );
-    let a_addr = addr_from_marker(&marker);
+    let a_addr = announced_addr(&marker).to_string();
     let (_node_b, marker) = spawn_server(
         &[
             "--serve-body",
@@ -539,7 +501,7 @@ fn replicated_fleet_survives_a_body_node_death() {
         ],
         "body-serve listening on",
     );
-    let b_addr = addr_from_marker(&marker);
+    let b_addr = announced_addr(&marker).to_string();
 
     let (_admin, marker) = spawn_server(
         &[
@@ -554,7 +516,7 @@ fn replicated_fleet_survives_a_body_node_death() {
         ],
         "s3 gateway on",
     );
-    let addr = addr_from_marker(&marker);
+    let addr = announced_addr(&marker).to_string();
 
     // PUT with replica_count 2 (auto: min(3, fleet=2)) — the blob
     // must land on BOTH body nodes' disks.
@@ -616,7 +578,7 @@ fn s3_gateway_streams_large_objects() {
         ],
         "s3 gateway on",
     );
-    let addr = addr_from_marker(&marker);
+    let addr = announced_addr(&marker).to_string();
 
     // 2 MiB: past the gateway's memory-spool threshold AND ~44
     // chunked admin round-trips each way.
@@ -799,7 +761,7 @@ fn s3_gateway_enforces_sigv4_and_bucket_scopes() {
         ],
         "s3 gateway on",
     );
-    let addr = addr_from_marker(&marker);
+    let addr = announced_addr(&marker).to_string();
 
     // Unsigned requests are refused outright.
     let (head, _) = http(
@@ -1089,7 +1051,7 @@ fn s3_gateway_multipart_upload() {
         ],
         "s3 gateway on",
     );
-    let addr = addr_from_marker(&marker);
+    let addr = announced_addr(&marker).to_string();
 
     // Initiate.
     let (head, body) = http(

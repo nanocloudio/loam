@@ -1,4 +1,8 @@
 #![no_std]
+#![allow(
+    dead_code,
+    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+)]
 // Bridge: loam_decision_wire ⇄ Clustor replica group.
 //
 // Proposal path: raw loam Propose records (with correlation_id) arrive

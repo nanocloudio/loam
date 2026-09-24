@@ -9,18 +9,11 @@
 //! Keeping them separate avoids the static-state aliasing the
 //! single-PIC harness would otherwise have to defend against.
 
-#![allow(
-    dead_code,
-    static_mut_refs,
-    reason = "shared #[path]-included surface; each includer uses a subset"
-)]
-
 use anyhow::{anyhow, Result};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Mutex;
-use std::time::Duration;
 
 #[allow(
     dead_code,
@@ -668,9 +661,6 @@ impl ModuleStorage {
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.backing.as_mut_ptr() as *mut u8
     }
-    pub fn as_ptr(&self) -> *const u8 {
-        self.backing.as_ptr() as *const u8
-    }
     pub fn len(&self) -> usize {
         self.backing.len() * 8
     }
@@ -689,8 +679,6 @@ pub struct Server {
     /// members. Empty when running the single-body_store graph.
     fanout: Option<ModuleStorage>,
     fleet_stores: Vec<ModuleStorage>,
-    sock_conn: Option<std::os::unix::net::UnixStream>,
-    read_buf: Vec<u8>,
 }
 
 impl Server {
@@ -719,8 +707,6 @@ impl Server {
             obj: ModuleStorage::new(core::mem::size_of::<obj_body::ModuleState>()),
             fanout: None,
             fleet_stores: Vec::new(),
-            sock_conn: None,
-            read_buf: vec![0u8; 8192],
         })
     }
 
@@ -809,96 +795,14 @@ impl Server {
         Ok(())
     }
 
-    pub fn spin_up_pics(&mut self, ns_wal: &str, obj_wal: &str, body_root: &str) -> Result<()> {
-        let rc = unsafe {
-            ns_body::module_new_with_wal_impl(
-                CHAN_NS_REQ,
-                CHAN_NS_RESP,
-                ns_wal.as_bytes(),
-                self.ns.as_mut_ptr(),
-                self.ns.len(),
-                &self.syscalls,
-            )
-        };
-        if rc != 0 {
-            return Err(anyhow!("namespace_router init rc={rc}"));
-        }
-        let rc = unsafe {
-            obj_body::module_new_with_wal_impl(
-                CHAN_OBJ_REQ,
-                CHAN_OBJ_RESP,
-                obj_wal.as_bytes(),
-                self.obj.as_mut_ptr(),
-                self.obj.len(),
-                &self.syscalls,
-            )
-        };
-        if rc != 0 {
-            return Err(anyhow!("object_index init rc={rc}"));
-        }
-        let rc = unsafe {
-            body_store_body::module_new_impl(
-                CHAN_BODY_REQ,
-                CHAN_BODY_RESP,
-                self.body_store.as_mut_ptr(),
-                self.body_store.len(),
-                &self.syscalls,
-            )
-        };
-        if rc != 0 {
-            return Err(anyhow!("body_store init rc={rc}"));
-        }
-        unsafe {
-            body_store_body::set_root_dir(self.body_store.as_mut_ptr(), body_root.as_bytes());
-        }
-        let rc = unsafe {
-            admin_body::module_new_with_objects_impl(
-                CHAN_ADMIN_IN,
-                CHAN_ADMIN_OUT,
-                CHAN_NS_REQ,
-                CHAN_NS_RESP,
-                CHAN_BODY_REQ,
-                CHAN_BODY_RESP,
-                CHAN_OBJ_REQ,
-                CHAN_OBJ_RESP,
-                self.admin.as_mut_ptr(),
-                self.admin.len(),
-                &self.syscalls,
-            )
-        };
-        if rc != 0 {
-            return Err(anyhow!("admin_router init rc={rc}"));
-        }
-        Ok(())
-    }
-
-    /// Single tick: socket I/O + step every PIC body once.
+    /// Step every PIC body once.
+    ///
+    /// Connection I/O is the server's, not the runtime's: the server
+    /// feeds requests in with `push_admin_request`, calls `tick_once`,
+    /// and takes replies with `pop_admin_out`, so it can multiplex any
+    /// number of admin connections — unix socket, TCP, the S3 gateway —
+    /// over the one graph.
     fn tick(&mut self) {
-        // Accept-then-pump shape: each tick reads from the open
-        // socket (if any), steps the four PICs, and drains
-        // admin_out back to the socket.
-
-        // Read socket → admin_in.
-        if let Some(ref mut conn) = self.sock_conn {
-            conn.set_nonblocking(true).ok();
-            match conn.read(&mut self.read_buf) {
-                Ok(0) => {
-                    // peer closed
-                    self.sock_conn = None;
-                }
-                Ok(n) => {
-                    ADMIN_IN
-                        .lock()
-                        .unwrap()
-                        .push_back(self.read_buf[..n].to_vec());
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => {
-                    self.sock_conn = None;
-                }
-            }
-        }
-
         // Step each PIC. admin_router steps first so it forwards
         // new requests; then downstream PICs handle their inputs;
         // then admin_router again drains responses. In fleet mode
@@ -920,49 +824,6 @@ impl Server {
             obj_body::module_step_impl(self.obj.as_mut_ptr());
             admin_body::module_step_impl(self.admin.as_mut_ptr());
         }
-
-        // Drain admin_out → socket.
-        if let Some(ref mut conn) = self.sock_conn {
-            let mut out = ADMIN_OUT.lock().unwrap();
-            while let Some(frame) = out.pop_front() {
-                if conn.write_all(&frame).is_err() {
-                    self.sock_conn = None;
-                    break;
-                }
-            }
-        }
-    }
-
-    pub fn run(&mut self, listener: std::os::unix::net::UnixListener, tick_delay: Duration) {
-        loop {
-            // Accept a new connection if we don't have one.
-            if self.sock_conn.is_none() {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        stream.set_nonblocking(true).ok();
-                        self.sock_conn = Some(stream);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(_) => {}
-                }
-            }
-            self.tick();
-            std::thread::sleep(tick_delay);
-        }
-    }
-
-    /// Single-shot, in-process variant: runs `tick` until the
-    /// admin_out has at least one frame or `max_ticks` is hit.
-    /// Used by the in-process integration test.
-    pub fn drain_one_response(&mut self, max_ticks: u32) -> Option<Vec<u8>> {
-        for _ in 0..max_ticks {
-            self.tick();
-            let mut out = ADMIN_OUT.lock().unwrap();
-            if let Some(frame) = out.pop_front() {
-                return Some(frame);
-            }
-        }
-        None
     }
 
     pub fn push_admin_request(&mut self, frame: Vec<u8>) {
@@ -975,30 +836,12 @@ impl Server {
         self.tick();
     }
 
-    /// Take the unix-socket connection out of the tick loop so a
-    /// caller (the S3 handler) can drain admin_out itself without
-    /// tick() forwarding frames to the unix client. Restore with
-    /// `restore_sock_conn`.
-    pub fn take_sock_conn(&mut self) -> Option<std::os::unix::net::UnixStream> {
-        self.sock_conn.take()
-    }
-
-    pub fn restore_sock_conn(&mut self, conn: Option<std::os::unix::net::UnixStream>) {
-        self.sock_conn = conn;
-    }
-
-    pub fn set_sock_conn(&mut self, conn: std::os::unix::net::UnixStream) {
-        self.sock_conn = Some(conn);
-    }
-
-    pub fn has_sock_conn(&self) -> bool {
-        self.sock_conn.is_some()
-    }
-
-    /// Admin node whose body plane lives on ANOTHER node: spin up
-    /// admin/namespace/object PICs but no local body_store — the
-    /// body_req/body_resp channels are pumped by a network bridge
-    /// instead. (A zeroed body_store state no-ops its step.)
+    /// The metadata half of a node: admin, namespace and object PICs,
+    /// and no local body_store. `spin_up_pics_fleet` builds on it and
+    /// hands `body_req`/`body_resp` to the fan-out router, which
+    /// reaches every member — local root or TCP bridge — through its
+    /// own per-member channels. (A zeroed body_store state no-ops its
+    /// step.)
     pub fn spin_up_pics_remote_body(&mut self, ns_wal: &str, obj_wal: &str) -> Result<()> {
         let rc = unsafe {
             ns_body::module_new_with_wal_impl(
@@ -1074,16 +917,13 @@ impl Server {
     }
 }
 
-// ── Body-channel access for network bridging ───────────────────────
+// ── Body-channel access for a serving body node ────────────────────
 //
-// The bridge on the admin node pops body_req (admin_router's
-// downstream writes) and pushes body_resp; the bridge on the body
-// node does the reverse. Same queues the PICs use — a bridged
-// channel is indistinguishable from a local one.
-
-pub fn pop_body_req() -> Option<Vec<u8>> {
-    BODY_REQ.lock().unwrap().pop_front()
-}
+// A `--serve-body` node's bridge pushes each request arriving from the
+// network onto body_req and pops body_resp to send the answer back.
+// Same queues the local body_store uses, so a bridged channel is
+// indistinguishable from a local one. An admin node reaches remote
+// members through the per-member fleet channels below instead.
 
 pub fn push_body_req(frame: Vec<u8>) {
     BODY_REQ.lock().unwrap().push_back(frame);
@@ -1091,10 +931,6 @@ pub fn push_body_req(frame: Vec<u8>) {
 
 pub fn pop_body_resp() -> Option<Vec<u8>> {
     BODY_RESP.lock().unwrap().pop_front()
-}
-
-pub fn push_body_resp(frame: Vec<u8>) {
-    BODY_RESP.lock().unwrap().push_back(frame);
 }
 
 pub fn pop_admin_out() -> Option<Vec<u8>> {

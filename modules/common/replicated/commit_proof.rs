@@ -12,11 +12,6 @@
 // same discipline `loam_extent_wire.rs` uses, so a consumer that
 // needs no witness pays for no hash.
 
-#![allow(
-    dead_code,
-    reason = "shared #[path]-included surface; each includer uses a subset"
-)]
-
 /// Domain separator, so a commit witness can never collide with a
 /// digest this store computed for some other purpose over the same
 /// bytes. Versioned by its trailing byte: a change to what the

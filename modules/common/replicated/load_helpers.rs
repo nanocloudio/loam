@@ -12,11 +12,6 @@
 // idea: a third consumer would be a reason to look again at what
 // they have in common, not a reason to add more here.
 
-#![allow(
-    dead_code,
-    reason = "shared #[path]-included surface; each includer uses a subset"
-)]
-
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 /// Write `value` as 8 lowercase hex digits. Returns bytes written,

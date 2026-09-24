@@ -166,12 +166,16 @@ implying they are settled:
   than a mechanism one — the axis is there to take — but no such
   decision has been made, and a number nobody has chosen per profile
   is recorded here rather than presented as a considered one.
-- **The pack step does not yet pass a profile.** `fluxor modules
-  build` compiles with no `--cfg loam_profile`, so a bare-metal
-  image takes the `embedded` fallback. That is the right default,
-  but it means `minimal` and `server` are reachable only through
-  `RUSTFLAGS`. A profile selector on the pack step is an upstream
-  ask on fluxor, not something loam can settle in this tree.
+- **The pack step does not pass or declare a profile.** `fluxor
+  modules build` compiles with no `--cfg loam_profile`, so a
+  bare-metal image always takes the `embedded` fallback — the right
+  default, but `minimal` and `server` are reachable only in cargo
+  builds, through `RUSTFLAGS`. The same step declares no
+  `--check-cfg` for `loam_profile` either, so its strict build sees
+  the selector as an unknown name; `loam_limits.rs` fences that one
+  ladder with a scoped `allow`. A way for a project to pass and
+  declare its own cfg is an upstream ask on fluxor, not something
+  loam can settle in this tree.
 - **`DIGEST_LEN` is declared in eight places.** Const-equal, and a
   mismatch would surface at the first cross-wire round trip, but the
   width has no single home.

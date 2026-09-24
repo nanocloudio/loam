@@ -1,4 +1,8 @@
 #![no_std]
+#![allow(
+    dead_code,
+    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+)]
 // Metadata-plane e2e probe: one Propose in, one Committed out,
 // verified. Exercises proposer WAL → clustor_bridge → Raft (WAL,
 // quorum, commit) → apply → bridge → Committed, end to end.

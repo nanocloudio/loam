@@ -48,37 +48,54 @@
 // `--cfg loam_profile="typo"` falls through to the target default
 // instead of silently selecting whichever arm happened to be last.
 
-/// Human-readable profile name. Diagnostics and the health surface
-/// read it; nothing parses it.
-#[cfg(loam_profile = "minimal")]
-pub const PROFILE: &str = "minimal";
-#[cfg(loam_profile = "embedded")]
-pub const PROFILE: &str = "embedded";
-#[cfg(loam_profile = "node")]
-pub const PROFILE: &str = "node";
-#[cfg(loam_profile = "server")]
-pub const PROFILE: &str = "server";
-/// Fallback: nothing was declared, so the build target decides.
-#[cfg(all(
-    not(any(
-        loam_profile = "minimal",
-        loam_profile = "embedded",
-        loam_profile = "node",
-        loam_profile = "server"
-    )),
-    target_os = "none"
-))]
-pub const PROFILE: &str = "embedded";
-#[cfg(all(
-    not(any(
-        loam_profile = "minimal",
-        loam_profile = "embedded",
-        loam_profile = "node",
-        loam_profile = "server"
-    )),
-    not(target_os = "none")
-))]
-pub const PROFILE: &str = "node";
+/// The one place `loam_profile` is read, fenced so that only it is
+/// excused from cfg checking.
+///
+/// Cargo declares `loam_profile` and its values (see `Cargo.toml`), so
+/// a host build checks this ladder and would catch a misspelt value.
+/// The PIC build is raw `rustc`, and it declares only the cfgs fluxor
+/// itself defines, so there every arm here reads as an unknown name.
+/// The excuse is `allow` rather than `expect` because it is
+/// target-conditional: an `expect` would fail every cargo build, where
+/// the lint rightly does not fire.
+#[allow(
+    unexpected_cfgs,
+    reason = "the PIC build does not declare loam's own cfg; cargo builds do, and check it"
+)]
+mod selector {
+    /// Human-readable profile name. Diagnostics and the health surface
+    /// read it; nothing parses it.
+    #[cfg(loam_profile = "minimal")]
+    pub const PROFILE: &str = "minimal";
+    #[cfg(loam_profile = "embedded")]
+    pub const PROFILE: &str = "embedded";
+    #[cfg(loam_profile = "node")]
+    pub const PROFILE: &str = "node";
+    #[cfg(loam_profile = "server")]
+    pub const PROFILE: &str = "server";
+    /// Fallback: nothing was declared, so the build target decides.
+    #[cfg(all(
+        not(any(
+            loam_profile = "minimal",
+            loam_profile = "embedded",
+            loam_profile = "node",
+            loam_profile = "server"
+        )),
+        target_os = "none"
+    ))]
+    pub const PROFILE: &str = "embedded";
+    #[cfg(all(
+        not(any(
+            loam_profile = "minimal",
+            loam_profile = "embedded",
+            loam_profile = "node",
+            loam_profile = "server"
+        )),
+        not(target_os = "none")
+    ))]
+    pub const PROFILE: &str = "node";
+}
+pub use selector::PROFILE;
 
 /// True on the two constrained profiles. Every profiled constant
 /// below branches on these three predicates rather than on the raw

@@ -2,49 +2,17 @@
 //! public call, over the actual unix admin socket. This is the
 //! contract a volume backend (nanocloud's CsiPlugin) builds on.
 
+mod support;
+
 use loam_client::{ClientError, LoamClient, IO_CHUNK};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use support::{announced_addr, spawn_ready, Proc};
 
 fn server_bin() -> &'static str {
     env!("CARGO_BIN_EXE_loam-server")
 }
 
-struct ServerGuard(Child);
-
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Wait until the server is accepting on `socket`.
-///
-/// A socket PATH existing is not a server listening. A killed server leaves
-/// its path behind, so on a restart `exists()` is already true before the new
-/// process has bound — and the fixed sleep that used to follow it was a guess
-/// that lost under load, which is what made `block_volume_lifecycle` fail on
-/// its reconnect. Connecting is the only observation that means ready, so it
-/// is the one waited on.
-///
-/// `ServerGuard` kills and reaps the previous server before a restart reaches
-/// here, so a connection that succeeds can only be the new one's.
-fn wait_until_listening(socket: &std::path::Path) {
-    let started = Instant::now();
-    loop {
-        if std::os::unix::net::UnixStream::connect(socket).is_ok() {
-            return;
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "loam-server didn't accept on its socket within 5s"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-fn spawn_server(socket: &std::path::Path, dir: &std::path::Path) -> ServerGuard {
+fn spawn_server(socket: &std::path::Path, dir: &std::path::Path) -> Proc {
     let mut cmd = Command::new(server_bin());
     cmd.args([
         "--socket",
@@ -58,11 +26,7 @@ fn spawn_server(socket: &std::path::Path, dir: &std::path::Path) -> ServerGuard 
         "--tick-us",
         "1000",
     ]);
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::null());
-    let child = cmd.spawn().expect("spawn loam-server");
-    wait_until_listening(socket);
-    ServerGuard(child)
+    spawn_ready(cmd, "admin socket on").0
 }
 
 #[test]
@@ -235,10 +199,8 @@ fn block_volume_lifecycle() {
 // ── Admin authentication ──────────────────────────────────────────
 //
 // The admin surface can bind, read and delete anything in any
-// namespace. Until these tests existed it had no authentication of
-// any kind, which is precisely why `loam-client` had no TCP
-// transport: exposing that off-box would have been worse than having
-// no remote client at all. Both halves are checked here — that a
+// namespace, so who is on the far end of the connection is the
+// boundary that matters. Both halves are checked here — that a
 // configured server refuses the unauthenticated, and that it still
 // serves the authenticated.
 
@@ -246,7 +208,7 @@ fn spawn_server_with_token(
     socket: &std::path::Path,
     dir: &std::path::Path,
     token_file: &std::path::Path,
-) -> ServerGuard {
+) -> Proc {
     let mut cmd = Command::new(server_bin());
     cmd.args([
         "--socket",
@@ -262,11 +224,7 @@ fn spawn_server_with_token(
         "--tick-us",
         "1000",
     ]);
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::null());
-    let child = cmd.spawn().expect("spawn loam-server");
-    wait_until_listening(socket);
-    ServerGuard(child)
+    spawn_ready(cmd, "admin socket on").0
 }
 
 #[test]
@@ -349,10 +307,10 @@ fn a_wrong_token_is_refused_and_the_connection_is_closed() {
 
 #[test]
 fn an_anonymous_server_still_serves_without_a_token() {
-    // No --admin-token: the surface is anonymous, as it was before
-    // D-3. This is the compatibility that matters — every existing
-    // graph and script keeps working — and the server says so on
-    // stderr rather than leaving it to be discovered.
+    // No --admin-token: the surface is anonymous. That is a supported
+    // shape for a unix socket, whose filesystem permissions are the
+    // boundary, and the server says so on stderr rather than leaving
+    // it to be discovered.
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("admin.sock");
     let _g = spawn_server(&sock, dir.path());
@@ -544,63 +502,30 @@ fn a_manifest_round_trips_and_refuses_a_corrupt_one() {
 // ── Remote admin over TCP ─────────────────────────────────────────
 //
 // This is what a volume backend running off the storage node needs.
-// It exists only because D-3 landed first: the transport and the
-// authentication are the same feature, and shipping the transport
-// alone would have been the worse outcome the review named.
+// The transport and the authentication are one feature: a TCP admin
+// surface without a token is refused at startup, so these tests
+// always run authenticated.
 
-fn spawn_server_tcp(
-    dir: &std::path::Path,
-    token_file: Option<&std::path::Path>,
-) -> (ServerGuard, String) {
-    spawn_server_tcp_at(dir, token_file, 0)
-}
-
-/// `slot` distinguishes servers that must run at the same time —
-/// an export needs two. Slot 0 belongs to `spawn_server_tcp`, so a
-/// test that spawns its own pair must start at 1: these binaries
-/// run their tests in PARALLEL, and two servers on one port means
-/// one test silently talking to the other's store.
-fn spawn_server_tcp_at(
-    dir: &std::path::Path,
-    token_file: Option<&std::path::Path>,
-    slot: u16,
-) -> (ServerGuard, String) {
-    // Port 0 would be ideal, but the address has to be known to
-    // connect; pick a high port derived from the pid so parallel
-    // test binaries do not collide.
-    let port = 20000 + (std::process::id() % 9000) as u16 + slot * 100;
-    let addr = format!("127.0.0.1:{port}");
-    let mut args: Vec<String> = vec![
-        "--admin-listen".into(),
-        addr.clone(),
-        "--ns-wal".into(),
-        dir.join("ns.wal").to_str().unwrap().into(),
-        "--obj-wal".into(),
-        dir.join("obj.wal").to_str().unwrap().into(),
-        "--fleet".into(),
-        format!("dir:{}", dir.join("bodies").display()),
-        "--tick-us".into(),
-        "1000".into(),
-    ];
-    if let Some(t) = token_file {
-        args.push("--admin-token".into());
-        args.push(t.to_str().unwrap().into());
-    }
+/// A server whose admin surface is on TCP, at an address the OS picks.
+fn spawn_server_tcp(dir: &std::path::Path, token_file: Option<&std::path::Path>) -> (Proc, String) {
     let mut cmd = Command::new(server_bin());
-    cmd.args(&args);
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::null());
-    let child = cmd.spawn().expect("spawn loam-server");
-    let started = Instant::now();
-    while std::net::TcpStream::connect(&addr).is_err() {
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "loam-server didn't bind {addr} within 5s"
-        );
-        std::thread::sleep(Duration::from_millis(20));
+    cmd.args([
+        "--admin-listen",
+        "127.0.0.1:0",
+        "--ns-wal",
+        dir.join("ns.wal").to_str().unwrap(),
+        "--obj-wal",
+        dir.join("obj.wal").to_str().unwrap(),
+        "--fleet",
+        &format!("dir:{}", dir.join("bodies").display()),
+        "--tick-us",
+        "1000",
+    ]);
+    if let Some(t) = token_file {
+        cmd.args(["--admin-token", t.to_str().unwrap()]);
     }
-    std::thread::sleep(Duration::from_millis(50));
-    (ServerGuard(child), addr)
+    let (proc, line) = spawn_ready(cmd, "admin surface on tcp");
+    (proc, announced_addr(&line).to_string())
 }
 
 #[test]
@@ -626,11 +551,10 @@ fn tcp_admin_without_a_token_refuses_to_start() {
     // an open admin surface. The refusal is at startup so it cannot
     // be missed, and there is deliberately no --insecure override.
     let dir = tempfile::tempdir().unwrap();
-    let port = 20000 + (std::process::id() % 9000) as u16 + 1;
     let out = Command::new(server_bin())
         .args([
             "--admin-listen",
-            &format!("127.0.0.1:{port}"),
+            "127.0.0.1:0",
             "--ns-wal",
             dir.path().join("ns.wal").to_str().unwrap(),
             "--obj-wal",
@@ -667,8 +591,8 @@ fn a_snapshot_exports_to_a_second_cluster_sending_only_what_it_lacks() {
     let dtok = dst_dir.path().join("tok");
     std::fs::write(&stok, "src-secret").unwrap();
     std::fs::write(&dtok, "dst-secret").unwrap();
-    let (_gs, src_addr) = spawn_server_tcp_at(src_dir.path(), Some(&stok), 1);
-    let (_gd, dst_addr) = spawn_server_tcp_at(dst_dir.path(), Some(&dtok), 2);
+    let (_gs, src_addr) = spawn_server_tcp(src_dir.path(), Some(&stok));
+    let (_gd, dst_addr) = spawn_server_tcp(dst_dir.path(), Some(&dtok));
 
     let mut src = LoamClient::connect_tcp(&src_addr).expect("src connect");
     src.authenticate(b"src-secret").unwrap();
@@ -725,8 +649,8 @@ fn re_exporting_the_same_snapshot_sends_nothing() {
     let dtok = dst_dir.path().join("tok");
     std::fs::write(&stok, "s").unwrap();
     std::fs::write(&dtok, "d").unwrap();
-    let (_gs, src_addr) = spawn_server_tcp_at(src_dir.path(), Some(&stok), 3);
-    let (_gd, dst_addr) = spawn_server_tcp_at(dst_dir.path(), Some(&dtok), 4);
+    let (_gs, src_addr) = spawn_server_tcp(src_dir.path(), Some(&stok));
+    let (_gd, dst_addr) = spawn_server_tcp(dst_dir.path(), Some(&dtok));
     let mut src = LoamClient::connect_tcp(&src_addr).unwrap();
     src.authenticate(b"s").unwrap();
     let mut dst = LoamClient::connect_tcp(&dst_addr).unwrap();
@@ -761,8 +685,8 @@ fn an_export_whose_source_lost_a_body_fails_rather_than_arriving_short() {
     let dtok = dst_dir.path().join("tok");
     std::fs::write(&stok, "s").unwrap();
     std::fs::write(&dtok, "d").unwrap();
-    let (_gs, src_addr) = spawn_server_tcp_at(src_dir.path(), Some(&stok), 5);
-    let (_gd, dst_addr) = spawn_server_tcp_at(dst_dir.path(), Some(&dtok), 6);
+    let (_gs, src_addr) = spawn_server_tcp(src_dir.path(), Some(&stok));
+    let (_gd, dst_addr) = spawn_server_tcp(dst_dir.path(), Some(&dtok));
     let mut src = LoamClient::connect_tcp(&src_addr).unwrap();
     src.authenticate(b"s").unwrap();
     let mut dst = LoamClient::connect_tcp(&dst_addr).unwrap();

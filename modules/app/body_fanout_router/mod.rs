@@ -1,4 +1,8 @@
 #![no_std]
+#![allow(
+    dead_code,
+    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+)]
 
 // Loam's body_fanout_router PIC module. Step body in
 // `modules/common/replicated/body_fanout_router_body.rs`.

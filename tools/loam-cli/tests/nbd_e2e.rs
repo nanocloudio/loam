@@ -7,11 +7,13 @@
 //! matters is that a kernel WOULD be satisfied, and the way to know
 //! is to send exactly what one sends.
 
+mod support;
+
 use loam_client::LoamClient;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use support::{announced_addr, spawn_ready, Proc};
 
 const NBD_MAGIC: u64 = 0x4e42444d41474943;
 const IHAVEOPT: u64 = 0x49484156454F5054;
@@ -22,18 +24,6 @@ const NBD_CMD_READ: u16 = 0;
 const NBD_CMD_WRITE: u16 = 1;
 const NBD_CMD_DISC: u16 = 2;
 const NBD_CMD_FLUSH: u16 = 3;
-
-struct Guard(Child);
-impl Drop for Guard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn port_for(offset: u16) -> u16 {
-    22000 + (std::process::id() % 5000) as u16 + offset
-}
 
 /// Handshake as a client does, returning the export size.
 fn handshake(s: &mut TcpStream) -> u64 {
@@ -88,7 +78,7 @@ fn reply(s: &mut TcpStream) -> (u32, u64) {
     )
 }
 
-fn setup(offset: u16) -> (tempfile::TempDir, Guard, Guard, String) {
+fn setup() -> (tempfile::TempDir, Proc, Proc, String) {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("admin.sock");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_loam-server"));
@@ -104,21 +94,13 @@ fn setup(offset: u16) -> (tempfile::TempDir, Guard, Guard, String) {
         "--tick-us",
         "1000",
     ]);
-    cmd.stdout(Stdio::null()).stderr(Stdio::null());
-    let server = Guard(cmd.spawn().unwrap());
-    let start = Instant::now();
-    while !sock.exists() {
-        assert!(start.elapsed() < Duration::from_secs(5), "server start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    std::thread::sleep(Duration::from_millis(50));
+    let (server, _) = spawn_ready(cmd, "admin socket on");
 
     // Create the volume the device will front.
     let mut c = LoamClient::connect(&sock).unwrap();
     c.create_volume(b"vol", b"/disk", 64 * 1024, 4096).unwrap();
     drop(c);
 
-    let addr = format!("127.0.0.1:{}", port_for(offset));
     let mut ncmd = Command::new(env!("CARGO_BIN_EXE_loam-nbd"));
     ncmd.args([
         "--socket",
@@ -126,21 +108,15 @@ fn setup(offset: u16) -> (tempfile::TempDir, Guard, Guard, String) {
         "--volume",
         "vol:/disk",
         "--listen",
-        &addr,
+        "127.0.0.1:0",
     ]);
-    ncmd.stdout(Stdio::null()).stderr(Stdio::null());
-    let nbd = Guard(ncmd.spawn().unwrap());
-    let start = Instant::now();
-    while TcpStream::connect(&addr).is_err() {
-        assert!(start.elapsed() < Duration::from_secs(5), "nbd start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    (dir, server, nbd, addr)
+    let (nbd, line) = spawn_ready(ncmd, "[loam-nbd] serving");
+    (dir, server, nbd, announced_addr(&line).to_string())
 }
 
 #[test]
 fn the_handshake_reports_the_volume_size() {
-    let (_d, _s, _n, addr) = setup(0);
+    let (_d, _s, _n, addr) = setup();
     let mut c = TcpStream::connect(&addr).unwrap();
     assert_eq!(
         handshake(&mut c),
@@ -153,7 +129,7 @@ fn the_handshake_reports_the_volume_size() {
 
 #[test]
 fn a_write_then_read_round_trips_through_the_extent_plane() {
-    let (_d, _s, _n, addr) = setup(1);
+    let (_d, _s, _n, addr) = setup();
     let mut c = TcpStream::connect(&addr).unwrap();
     assert_eq!(handshake(&mut c), 64 * 1024);
 
@@ -191,7 +167,7 @@ fn a_write_then_read_round_trips_through_the_extent_plane() {
 
 #[test]
 fn flush_is_answered_because_a_loam_write_is_already_durable() {
-    let (_d, _s, _n, addr) = setup(2);
+    let (_d, _s, _n, addr) = setup();
     let mut c = TcpStream::connect(&addr).unwrap();
     handshake(&mut c);
     request(&mut c, NBD_CMD_FLUSH, 7, 0, 0);
@@ -203,7 +179,7 @@ fn flush_is_answered_because_a_loam_write_is_already_durable() {
 
 #[test]
 fn a_read_past_the_end_is_refused_rather_than_served() {
-    let (_d, _s, _n, addr) = setup(3);
+    let (_d, _s, _n, addr) = setup();
     let mut c = TcpStream::connect(&addr).unwrap();
     let size = handshake(&mut c);
     request(&mut c, NBD_CMD_READ, 9, size - 10, 4096);
@@ -218,7 +194,7 @@ fn a_write_past_the_end_is_refused_without_desynchronising_the_stream() {
     // The payload must be drained even when the write is refused, or
     // the next request header would be read out of the middle of it.
     // This test would hang or mis-parse if that were wrong.
-    let (_d, _s, _n, addr) = setup(4);
+    let (_d, _s, _n, addr) = setup();
     let mut c = TcpStream::connect(&addr).unwrap();
     let size = handshake(&mut c);
 

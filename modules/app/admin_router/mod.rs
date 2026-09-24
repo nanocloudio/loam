@@ -1,4 +1,8 @@
 #![no_std]
+#![allow(
+    dead_code,
+    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+)]
 
 // Loam's admin_router PIC module. Front-door for external admin
 // clients. Step body in `modules/common/mechanics/admin_router_body.rs`.

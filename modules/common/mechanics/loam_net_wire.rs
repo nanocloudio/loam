@@ -23,11 +23,6 @@
 // no_std vocabulary — host bridges (loam-server) and future
 // PIC-side transports both speak it.
 
-#![allow(
-    dead_code,
-    reason = "shared #[path]-included surface; each includer uses a subset"
-)]
-
 pub const MAGIC: u32 = u32::from_le_bytes(*b"LOAM");
 pub const HELLO_LEN: usize = 4 + 1;
 

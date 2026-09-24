@@ -1,4 +1,8 @@
 #![no_std]
+#![allow(
+    dead_code,
+    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+)]
 
 // Loam's block_log PIC. Channel-fronted append-only log. Step
 // body in `modules/common/mechanics/block_log_body.rs`. `log_path` is
