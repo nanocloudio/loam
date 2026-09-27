@@ -18,13 +18,20 @@ default-members = [".", "tools/loam-cli", "tools/loam-client"]
 version = "0.0.1"
 
 [workspace.lints.rust]
-# `loam_profile` is loam's capacity-profile selector — an explicit
-# input a build (or the fluxor pack step) sets, rather than the build
-# target standing in for the deployment. Declared here so rustc checks
-# the VALUES too: a `--cfg loam_profile="sever"` typo is then a build
-# warning instead of a silent fall-through to the target default.
+# The two cfgs the capacity-profile selector in loam_limits.rs reads.
+#
+# `loam_profile` is the explicit input a cargo build sets. Declaring its
+# values means a misspelt value in SOURCE is a build warning. It does not
+# check the command-line input: `--cfg loam_profile="sever"` compiles
+# silently and selects `node`. The profile matrix, the one producer of
+# that flag, passes each value as a literal from a fixed list.
+#
+# `fluxor_silicon` is the die fluxor's module build declares for every
+# PIC compile. A cargo build never sets it, but the selector names it,
+# so it is declared here with the one value loam maps.
 unexpected_cfgs = { level = "warn", check-cfg = [
   'cfg(loam_profile, values("minimal", "embedded", "node", "server"))',
+  'cfg(fluxor_silicon, values("bcm2712"))',
 ] }
 
 [workspace.lints.clippy]
@@ -53,12 +60,15 @@ path = "src/lib.rs"
 # and `tools/loam-cli/` drives those PIC bodies in-process.
 
 [features]
-default = ["std", "serde"]
-std = []
-# Activates the serde derives inside the mounted fluxor contracts source
-# (src/lib.rs `#[path]` mount): its `cfg(feature = "serde")` gates evaluate
-# against THIS crate's features. Default-on; loam itself uses serde
-# unconditionally.
+default = ["alloc", "serde"]
+# Both features exist for the mounted fluxor contracts source (src/lib.rs
+# `#[path]` mount): its `cfg(feature = "…")` gates evaluate against THIS
+# crate's features, so loam declares exactly the ones it reads.
+#
+#   alloc — the owned vocabulary: `Fence`, `FenceWitness`, `HashAlgo` and
+#           the log ring. Off, the prelude omits those three.
+#   serde — the derives on every contract type.
+alloc = []
 serde = []
 
 [dependencies]

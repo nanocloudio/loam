@@ -214,9 +214,10 @@ whether its cap is a ceiling:
   from the root directory by a cursor-0 `OP_SCAN`. It bounds
   working-set lookup, not bodies held.
 
-Caps are per capacity profile, selected by an explicit
-`--cfg loam_profile="…"` with the build target as the fallback
-(`target_os = "none"` → `embedded`, otherwise `node`):
+Caps are per capacity profile. A cargo build selects one with an
+explicit `--cfg loam_profile="…"` and is `node` without one; fluxor's
+module build selects by the die it declares, so a bcm2712 image is
+`embedded`:
 
 | Arena | `minimal` | `embedded` | `node` | `server` |
 |---|---|---|---|---|
@@ -229,8 +230,8 @@ Every profiled constant lives in
 [`common/mechanics/loam_limits.rs`](common/mechanics/loam_limits.rs)
 and nowhere else — a PIC body takes its `ARENA_CAPACITY` from that
 file rather than declaring a number. `tools/ci/limit_guard.sh` fails
-the build on a `cfg(target_os)` capacity constant anywhere outside
-it, and on a ceiling with no row in
+the build on a `cfg(target_os)` or `cfg(fluxor_silicon)` anywhere
+outside it, and on a ceiling with no row in
 [`docs/limit_register.md`](../docs/limit_register.md), which carries
 the reasoning behind each figure.
 

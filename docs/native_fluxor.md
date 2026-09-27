@@ -101,14 +101,14 @@ Shared primitives:
 [`modules/common/mechanics/wal_io.rs`](../modules/common/mechanics/wal_io.rs).
 Per-PIC bodies: `modules/common/mechanics/<surface>_pic_body.rs`.
 
-The arena is not a cache: it holds every committed record, and WAL
+The object and block arenas hold every committed record, and WAL
 replay restores full state on open. Caps come from the capacity
-profile the build target selects — bare-metal builds
-(`target_os = "none"`) get 256 bindings / 256 objects / 64 volumes /
-64 body slots, host-runtime builds get service-class 8192 / 8192 /
-1024 / 8192. The namespace arena is the exception: past its cap it
-becomes a hot cache over a compacted snapshot file
-([`modules/README.md`](../modules/README.md), "Namespace scale").
+profile: a bcm2712 module image is `embedded` — 256 bindings / 256
+objects / 64 volumes / 64 body slots — and a host build is `node`,
+at service-class 8192 / 8192 / 1024 / 8192. The namespace arena is
+the exception: past its cap it becomes a hot cache over a compacted
+snapshot file ([`modules/README.md`](../modules/README.md),
+"Namespace scale").
 Multi-PIC deployments shard further by partition.
 
 ## Both profiles, one write path

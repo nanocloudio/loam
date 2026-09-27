@@ -33,7 +33,11 @@ else
   RUNTIME="$SIBLING"
 fi
 SERVER="$ROOT/target/aarch64-unknown-linux-gnu/release/loam-server"
-S3_PORT=19100
+GRAPH="examples/s3/driven.yaml"
+# Rendered per run with the peer's address; `fluxor build` writes a
+# graph's artefacts under target/linux/<stem>/.
+RENDERED="target/loam_s3_driven.yaml"
+BUILT="$ROOT/target/linux/loam_s3_driven"
 BUCKET=registry
 KEY="blobs/sha256-driven"
 BODY="driven-through-the-graph"
@@ -51,18 +55,14 @@ need() { command -v "$1" >/dev/null 2>&1 || fail "$1 is not on PATH"; }
 need curl
 need python3
 need fluxor
-# Build the peer rather than requiring one. Nothing else in CI builds
-# `loam-server`, so demanding it as a prerequisite made this gate pass
-# or fail on whether somebody had happened to build it by hand — green
-# on a developer's machine, red on a fresh checkout, for reasons having
-# nothing to do with the connector under test. cargo is a no-op when the
-# binary is current, so the common case costs nothing.
-if [ ! -x "$SERVER" ]; then
-  echo "  building loam-server (no prebuilt binary)…"
-  (cd "$ROOT" && cargo build --release --bin loam-server \
-     --target aarch64-unknown-linux-gnu) \
-    || fail "could not build loam-server"
-fi
+# Build the peer on every run rather than using whatever binary is
+# lying in target/. Nothing else in CI builds this release
+# `loam-server`, so an existing one can be arbitrarily old, and a gate
+# that drives a stale server tests code that no longer exists. cargo is
+# a no-op when the binary is current, so the common case costs nothing.
+(cd "$ROOT" && cargo build --quiet --release --bin loam-server \
+   --target aarch64-unknown-linux-gnu) \
+  || fail "could not build loam-server"
 [ -x "$SERVER" ] || fail "no loam-server at $SERVER after building it"
 [ -x "$RUNTIME" ] || fail "no fluxor-linux at $RUNTIME
   Provision it:  cd $ROOT && fluxor run examples/linux/composed_node.yaml
@@ -71,21 +71,38 @@ fi
                    --target aarch64-unknown-linux-gnu"
 
 # ── the peer ──────────────────────────────────────────────────────────────
+#
+# Port 0, and the port read back from the server's own announcement. A
+# fixed port with a connect probe for readiness proves only that
+# SOMETHING listens there: if the port is already held, this server
+# fails to bind and exits, the probe connects to whatever holds it, and
+# the gate goes on testing a stranger. The announcement is printed only
+# after this process has bound, so it cannot be answered by anyone else.
 mkdir -p "$WORK/body"
-"$SERVER" --s3-listen "127.0.0.1:$S3_PORT" \
+"$SERVER" --s3-listen "127.0.0.1:0" \
   --ns-wal "$WORK/ns.wal" --obj-wal "$WORK/obj.wal" \
   --fleet "dir:$WORK/body" >"$WORK/loam.log" 2>&1 &
-PIDS="$PIDS $!"
-for _ in $(seq 60); do
-  (exec 3<>"/dev/tcp/127.0.0.1/$S3_PORT") 2>/dev/null && { exec 3<&- 3>&-; break; }
+SERVER_PID=$!
+PIDS="$PIDS $SERVER_PID"
+S3_ADDR=""
+for _ in $(seq 100); do
+  S3_ADDR=$(sed -n 's/^\[loam-server\] s3 gateway on \([0-9.]*:[0-9]*\)$/\1/p' \
+            "$WORK/loam.log" | head -1)
+  [ -n "$S3_ADDR" ] && break
+  kill -0 "$SERVER_PID" 2>/dev/null || fail "loam-server exited before binding"
   sleep 0.1
 done
-(exec 3<>"/dev/tcp/127.0.0.1/$S3_PORT") 2>/dev/null || fail "loam S3 gateway never bound"
-exec 3<&- 3>&-
+[ -n "$S3_ADDR" ] || fail "loam-server never announced its S3 gateway"
+S3_PORT="${S3_ADDR##*:}"
 
 # ── the graph ─────────────────────────────────────────────────────────────
-( cd "$ROOT" && fluxor build examples/s3/driven.yaml ) >/dev/null \
-  || fail "fluxor build examples/s3/driven.yaml"
+# The connector is pointed at the address this run's server bound.
+sed "s|authority: \"127\.0\.0\.1:[0-9]*\"|authority: \"$S3_ADDR\"|" \
+  "$ROOT/$GRAPH" > "$ROOT/$RENDERED"
+grep -q "authority: \"$S3_ADDR\"" "$ROOT/$RENDERED" \
+  || fail "could not point $GRAPH at $S3_ADDR"
+( cd "$ROOT" && fluxor build "$RENDERED" ) >/dev/null \
+  || fail "fluxor build $RENDERED"
 
 # An S3Request record. Built here rather than by a helper module so the test
 # depends on the WIRE FORMAT and not on someone else's encoder — if the record
@@ -101,8 +118,8 @@ PY
 
 # Run one record through the graph and return the raw S3Response bytes.
 drive() { # <record file> <out file>
-  timeout 25 "$RUNTIME" --config "$ROOT/target/linux/driven/config.bin" \
-    --modules "$ROOT/target/linux/driven/modules.bin" \
+  timeout 25 "$RUNTIME" --config "$BUILT/config.bin" \
+    --modules "$BUILT/modules.bin" \
     <"$1" >"$2" 2>"$WORK/graph.log" || true
 }
 

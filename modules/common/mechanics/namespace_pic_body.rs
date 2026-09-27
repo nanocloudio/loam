@@ -35,10 +35,9 @@
 // `docs/limit_register.md`, which carries the figures and the test
 // that pins them.
 //
-// Which cap applies is the capacity profile: an explicit
-// `--cfg loam_profile`, with the build target as the fallback. The
-// pack step passes no profile, so a bare-metal image takes the
-// `embedded` default.
+// Which cap applies is the capacity profile, chosen once in
+// `loam_limits.rs`: a bcm2712 module image is `embedded`, a cargo
+// build takes `--cfg loam_profile` or defaults to `node`.
 const ARENA_CAPACITY: usize = super::limits::NAMESPACE_SLOTS;
 /// Concurrent `LOOKUP` handles. Bounded like every other arena here:
 /// a provider that can be asked for unlimited handles is a provider

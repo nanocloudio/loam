@@ -32,9 +32,10 @@ extern crate alloc;
 
 /// Fluxor's public contracts, consumed as staged **source** rather than a
 /// cargo dependency (zero fluxor cargo edges). The mounted file's
-/// `#[cfg(feature = "serde")]` gates evaluate against *this* crate's
-/// features, so loam declares a default-on `serde` feature (Cargo.toml)
-/// and the derives resolve against loam's own `serde` dependency.
+/// `#[cfg(feature = …)]` gates evaluate against *this* crate's features,
+/// so loam declares the ones it reads (Cargo.toml): `alloc` brings in
+/// the owned vocabulary — `Fence`, `FenceWitness`, `HashAlgo` — and
+/// `serde` resolves the derives against loam's own `serde` dependency.
 // Staged by `fluxor sync` from the digest-pinned store artefact
 // (standards/dependencies.md). Run `fluxor sync` after a fresh clone
 // or an `update`; a missing path here means the sync has not run.
@@ -53,9 +54,9 @@ pub mod prelude {
     pub use crate::core::config::Config;
     pub use crate::core::error::{Error, Result};
     pub use crate::fluxor::{FluxorGraphProfile, FluxorTarget};
-    pub use crate::fluxor_contracts::{
-        Fence, FenceWitness, HashAlgo, StorageHandle, StorageSurface,
-    };
+    #[cfg(feature = "alloc")]
+    pub use crate::fluxor_contracts::{Fence, FenceWitness, HashAlgo};
+    pub use crate::fluxor_contracts::{StorageHandle, StorageSurface};
     pub use crate::storage::AchievableFence;
 }
 

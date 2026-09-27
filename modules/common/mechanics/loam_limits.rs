@@ -11,17 +11,15 @@
 // in the same change.
 //
 // PROFILE SELECTION. A deployment's capacity is a property of the
-// DEPLOYMENT, not of where the code happens to compile. So the
-// profile is an explicit input:
+// DEPLOYMENT, not of where the code happens to compile, so the profile
+// is an explicit input to each build that can carry one:
 //
-//     rustc --cfg 'loam_profile="server"' …
+//     rustc --cfg 'loam_profile="server"' …          (cargo builds)
+//     --cfg fluxor_silicon="bcm2712"                  (fluxor module builds)
 //
-// and the build target is only the FALLBACK when nothing says
-// otherwise — `target_os = "none"` means embedded, anything else
-// means node. Selecting on the target alone is what made a laptop
-// dev graph and a 64-core fleet member carry identical arenas, and
-// left no way to build a small host or a large bare-metal image at
-// all.
+// A cargo build given no profile is a single host node. Selecting on
+// the compile target alone is what made a laptop dev graph and a
+// 64-core fleet member carry identical arenas.
 //
 // Four profiles, in increasing order of what the machine affords:
 //
@@ -44,24 +42,48 @@
 
 // ── The selector ──────────────────────────────────────────────────
 //
-// An explicit ladder rather than a match, so an unrecognised
-// `--cfg loam_profile="typo"` falls through to the target default
-// instead of silently selecting whichever arm happened to be last.
+// Two builds compile this file, and each selects from the input it
+// can actually be given.
+//
+// FLUXOR'S MODULE BUILD compiles a PIC module for one die and says
+// which: `--cfg fluxor_silicon="…"`, declared and value-checked in
+// every module compile. That is fluxor's per-die capacity input, so a
+// bare-metal image takes its profile from the die it was built for.
+// Loam's modules target bcm2712 alone (each manifest's
+// `hardware_targets`), and a Pi 5 / CM5 is the `embedded` budget.
+//
+// CARGO compiles the host binaries, the tests and the profile matrix,
+// and reads `loam_profile`, which the workspace declares. An explicit
+// ladder rather than a match, so an unrecognised value falls through
+// to `node` instead of selecting whichever arm happened to be last.
+//
+// The arms are modules gated on the build, and a cfg-stripped module's
+// contents are never configured: a module build never evaluates
+// `loam_profile`, and a cargo build never needs a die. Each checks
+// exactly the names it declares, with nothing excused.
 
-/// The one place `loam_profile` is read, fenced so that only it is
-/// excused from cfg checking.
-///
-/// Cargo declares `loam_profile` and its values (see `Cargo.toml`), so
-/// a host build checks this ladder and would catch a misspelt value.
-/// The PIC build is raw `rustc`, and it declares only the cfgs fluxor
-/// itself defines, so there every arm here reads as an unknown name.
-/// The excuse is `allow` rather than `expect` because it is
-/// target-conditional: an `expect` would fail every cargo build, where
-/// the lint rightly does not fire.
-#[allow(
-    unexpected_cfgs,
-    reason = "the PIC build does not declare loam's own cfg; cargo builds do, and check it"
-)]
+#[cfg(fluxor_silicon = "bcm2712")]
+mod selector {
+    /// Human-readable profile name. Diagnostics and the health surface
+    /// read it; nothing parses it.
+    pub const PROFILE: &str = "embedded";
+}
+
+// A bare-metal build for a die the selector does not map. Refused by
+// name rather than defaulted: a capacity profile guessed for a die
+// nobody sized it for is the drift this file exists to prevent. The
+// module still names `PROFILE` so the refusal is the only error the
+// build reports, not the first of a cascade.
+#[cfg(all(target_os = "none", not(fluxor_silicon = "bcm2712")))]
+mod selector {
+    compile_error!(
+        "no loam capacity profile for this die: map its fluxor_silicon in \
+         the selector in modules/common/mechanics/loam_limits.rs"
+    );
+    pub const PROFILE: &str = "unmapped";
+}
+
+#[cfg(not(any(fluxor_silicon = "bcm2712", target_os = "none")))]
 mod selector {
     /// Human-readable profile name. Diagnostics and the health surface
     /// read it; nothing parses it.
@@ -73,28 +95,16 @@ mod selector {
     pub const PROFILE: &str = "node";
     #[cfg(loam_profile = "server")]
     pub const PROFILE: &str = "server";
-    /// Fallback: nothing was declared, so the build target decides.
-    #[cfg(all(
-        not(any(
-            loam_profile = "minimal",
-            loam_profile = "embedded",
-            loam_profile = "node",
-            loam_profile = "server"
-        )),
-        target_os = "none"
-    ))]
-    pub const PROFILE: &str = "embedded";
-    #[cfg(all(
-        not(any(
-            loam_profile = "minimal",
-            loam_profile = "embedded",
-            loam_profile = "node",
-            loam_profile = "server"
-        )),
-        not(target_os = "none")
-    ))]
+    /// Nothing was declared: a host build is a single node.
+    #[cfg(not(any(
+        loam_profile = "minimal",
+        loam_profile = "embedded",
+        loam_profile = "node",
+        loam_profile = "server"
+    )))]
     pub const PROFILE: &str = "node";
 }
+
 pub use selector::PROFILE;
 
 /// True on the two constrained profiles. Every profiled constant

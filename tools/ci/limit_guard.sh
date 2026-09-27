@@ -10,10 +10,11 @@
 #      class — the drift that lets a wire accept a key wider than
 #      the arena can store.
 #
-#   2. NO capacity constant outside loam_limits.rs is selected by
-#      `cfg(target_os)`. Profile selection lives in exactly one file;
-#      a second one is drift that makes the register's per-profile
-#      columns a lie.
+#   2. NO code outside loam_limits.rs selects on the profile's
+#      inputs — `loam_profile`, `fluxor_silicon`, or
+#      `target_os = "none"`. Profile selection lives in exactly one
+#      file; a second one is drift that makes the register's
+#      per-profile columns a lie.
 #
 # Wired as `[ci.test] scripts` in fluxor.toml.
 set -euo pipefail
@@ -57,10 +58,10 @@ if ((${#missing[@]})); then
 fi
 
 # ── (2) profile selection lives in exactly one file ───────────────
-strays=$(grep -rln 'cfg(target_os = "none")' --include='*.rs' modules/ \
-         | grep -v "^${LIMITS}$" || true)
+strays=$(grep -rlE 'cfg\(.*(loam_profile|fluxor_silicon|target_os = "none")' \
+         --include='*.rs' modules/ | grep -v "^${LIMITS}$" || true)
 if [[ -n $strays ]]; then
-  echo "limit_guard: cfg(target_os) outside $LIMITS:"
+  echo "limit_guard: profile selection outside $LIMITS:"
   printf '  %s\n' $strays
   echo "  Move the profiled value into the register's one selector."
   fail=1

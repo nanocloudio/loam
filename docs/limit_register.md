@@ -10,23 +10,26 @@ and inherits its rules:
   pool does** on any targeted deployment class. A ceiling found in
   source but absent here is a bug.
 - **A ceiling that is per-profile is stated per profile.** Loam has
-  four capacity profiles, selected by an explicit
-  `--cfg loam_profile="…"`, with the build target as the fallback
-  (`target_os = "none"` → `embedded`, otherwise `node`). Every
-  profiled constant lives in
+  four capacity profiles. A cargo build selects one with an explicit
+  `--cfg loam_profile="…"` and is `node` without one; fluxor's module
+  build selects by the die it declares (`fluxor_silicon`), and a
+  bcm2712 image is `embedded`. Every profiled constant lives in
   [`modules/common/mechanics/loam_limits.rs`](../modules/common/mechanics/loam_limits.rs)
-  and nowhere else — a `cfg(target_os)` on a capacity constant
-  anywhere else in the tree is drift, not a feature, and
-  `tools/ci/limit_guard.sh` fails the build on one.
+  and nowhere else — a `cfg(target_os)` or `cfg(fluxor_silicon)` on
+  a capacity constant anywhere else in the tree is drift, not a
+  feature, and `tools/ci/limit_guard.sh` fails the build on one.
 
 ## Profiles
 
 | Profile | Target machine | Selected by |
 |---|---|---|
 | `minimal` | MCU-class, ≤256 KiB arena | `--cfg loam_profile="minimal"` |
-| `embedded` | pi5 / CM5 bare metal | the flag, or `target_os = "none"` |
-| `node` | a single host daemon | the flag, or any other target |
+| `embedded` | pi5 / CM5 bare metal | `fluxor_silicon = "bcm2712"`, or the flag |
+| `node` | a single host daemon | a cargo build with no flag, or the flag |
 | `server` | a fleet member, server class | `--cfg loam_profile="server"` |
+
+A bare-metal build for a die the selector does not map is a compile
+error naming the file to edit, not a guessed profile.
 
 Capacity is not the only axis. Two FEATURE TIERS are compiled out
 on `minimal`, so the code shrinks rather than merely staying
@@ -166,16 +169,13 @@ implying they are settled:
   than a mechanism one — the axis is there to take — but no such
   decision has been made, and a number nobody has chosen per profile
   is recorded here rather than presented as a considered one.
-- **The pack step does not pass or declare a profile.** `fluxor
-  modules build` compiles with no `--cfg loam_profile`, so a
-  bare-metal image always takes the `embedded` fallback — the right
-  default, but `minimal` and `server` are reachable only in cargo
-  builds, through `RUSTFLAGS`. The same step declares no
-  `--check-cfg` for `loam_profile` either, so its strict build sees
-  the selector as an unknown name; `loam_limits.rs` fences that one
-  ladder with a scoped `allow`. A way for a project to pass and
-  declare its own cfg is an upstream ask on fluxor, not something
-  loam can settle in this tree.
+- **A bare-metal image's profile is fixed by its die.** Fluxor's
+  module build carries one per-die input, `fluxor_silicon`, and no
+  way for a project to pass a cfg of its own, so a bcm2712 image is
+  always `embedded`. `minimal` and `server` are reachable only in
+  cargo builds, through `RUSTFLAGS`. Choosing a profile per
+  deployment rather than per die would need that input from fluxor;
+  it is not something loam can settle in this tree.
 - **`DIGEST_LEN` is declared in eight places.** Const-equal, and a
   mismatch would surface at the first cross-wire round trip, but the
   width has no single home.
