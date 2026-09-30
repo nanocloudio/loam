@@ -9,8 +9,8 @@
 #     node-scoped (self_id in the high byte), so only the LEADER's
 #     proposer can match the committed bind it proposed. The two
 #     followers log "[meta_e2e] FAIL timeout" — their proposals
-#     queue at their local (non-draining) raft proposals port;
-#     follower→leader forwarding is the tracked follow-up.
+#     queue at their local (non-draining) raft proposals port, and
+#     nothing forwards a follower's proposal to the leader.
 #   - the three per-node WAL segments are BYTE-IDENTICAL: the
 #     replicated log converged on every replica
 #

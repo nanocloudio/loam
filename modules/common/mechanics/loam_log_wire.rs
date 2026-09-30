@@ -3,8 +3,8 @@
 // a request/response channel pair instead of doing fs syscalls
 // directly. This preserves the mesh discipline (channels are the
 // state-surface) and lets the same consumer code work over
-// different storage backends: the `fs` contract today, a block
-// device directly in a follow-up.
+// different storage backends: it is backed by the `fs` contract, and
+// nothing in this wire depends on that.
 //
 // Layouts (multi-byte ints LE):
 //

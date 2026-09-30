@@ -11,15 +11,11 @@ hardware_targets = ["bcm2712"]
 #     `clustor_commits` route back to `metadata_results` with the
 #     upstream witness preserved.
 
-# Port order matters for the PIC ABI's slot-0 convention: the
-# kernel hands `module_new` the first declared output as
-# `out_chan`. We don't actually use slot-0-only in this body
-# (Committed events go to `metadata_results`, the second
-# declared output) — the body looks up channels by name via
-# `dev_channel_port` when we add that wiring in a follow-up.
-# For now the manifest puts `metadata_results` first so the
-# fallback slot-0 write reaches the right consumer in
-# single-port test wirings.
+# Port order is the PIC ABI's: the kernel hands `module_new` the
+# first declared input and output as `in_chan` / `out_chan`
+# (`metadata_ops`, `metadata_results`), and the Clustor pair is found
+# by port index with `dev_channel_port` (output 1, input 1). Left
+# unwired they resolve to -1 and the body runs single-replica.
 
 [[ports]]
 name = "metadata_ops"

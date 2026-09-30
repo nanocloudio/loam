@@ -632,6 +632,30 @@ pub unsafe fn wal_rotate(
     fd: i32,
     path: &[u8],
 ) -> Result<RotateOutcome, i32> {
+    let mut none = [0u8; 0];
+    wal_rotate_seeded(syscalls, fd, path, 0, &mut none, |_, _| Some(0))
+}
+
+/// `wal_rotate` for a log that carries state no snapshot holds.
+///
+/// The replacement log is written with `seed_count` records before it
+/// is fenced and renamed into place, so the crash-visible outcomes stay
+/// exactly two — the old log, or the new one already holding them.
+/// Seeding after the rename instead would open a window in which a
+/// crash boots from a log that has lost that state.
+///
+/// `seed(i, payload)` writes record `i` into `payload` and answers its
+/// length: `Some(0)` skips it, `None` abandons the rotation (the old
+/// log stays in service, as for any other `Skipped`). `scratch` holds
+/// one framed record; `seed` receives it past the 8-byte header.
+pub unsafe fn wal_rotate_seeded<F: FnMut(usize, &mut [u8]) -> Option<usize>>(
+    syscalls: &SyscallTable,
+    fd: i32,
+    path: &[u8],
+    seed_count: usize,
+    scratch: &mut [u8],
+    mut seed: F,
+) -> Result<RotateOutcome, i32> {
     // Per-call, and nothing is recorded: an unanswered query skips this
     // rotation and the next one asks again.
     if super::fs_names::caps(syscalls.provider_call).unwrap_or(0) & super::fs_names::CAP_RENAME == 0
@@ -656,6 +680,15 @@ pub unsafe fn wal_rotate(
     if sfd < 0 {
         return Ok(RotateOutcome::Skipped);
     }
+    let mut i = 0usize;
+    while i < seed_count {
+        if !write_seed_record(syscalls, sfd, scratch, &mut seed, i) {
+            let _ = wal_close(syscalls, sfd);
+            let _ = super::fs_names::unlink(syscalls.provider_call, stage);
+            return Ok(RotateOutcome::Skipped);
+        }
+        i += 1;
+    }
     let fenced = (syscalls.provider_call)(sfd, FS_FSYNC, core::ptr::null_mut(), 0) >= 0;
     let _ = wal_close(syscalls, sfd);
     if !fenced || !super::fs_names::rename(syscalls.provider_call, stage, path) {
@@ -669,6 +702,54 @@ pub unsafe fn wal_rotate(
         Ok(new_fd) => Ok(RotateOutcome::Rotated(new_fd)),
         Err(_) => Err(-1),
     }
+}
+
+/// Frame seed record `i` into `scratch` and write it to the staging
+/// log. False abandons the rotation: the seed refused, the record does
+/// not fit a frame, or the write did not land whole.
+unsafe fn write_seed_record<F: FnMut(usize, &mut [u8]) -> Option<usize>>(
+    syscalls: &SyscallTable,
+    sfd: i32,
+    scratch: &mut [u8],
+    seed: &mut F,
+    i: usize,
+) -> bool {
+    let n = match scratch.get_mut(8..) {
+        Some(payload) => match seed(i, payload) {
+            Some(n) => n,
+            None => return false,
+        },
+        None => return false,
+    };
+    if n == 0 {
+        return true;
+    }
+    if n > MAX_WAL_REC {
+        return false;
+    }
+    let frame_len = 8 + n;
+    let crc = match scratch.get(8..frame_len) {
+        Some(payload) => crc32(payload),
+        None => return false,
+    };
+    scratch[0..4].copy_from_slice(&(n as u32).to_le_bytes());
+    scratch[4..8].copy_from_slice(&crc.to_le_bytes());
+    let mut written = 0usize;
+    while written < frame_len {
+        let rc = (syscalls.provider_call)(
+            sfd,
+            FS_WRITE,
+            scratch.as_mut_ptr().add(written),
+            frame_len - written,
+        );
+        if rc <= 0 {
+            return false;
+        }
+        // Clamped: a provider reporting more than it was offered must
+        // not walk the cursor past the frame.
+        written += (rc as usize).min(frame_len - written);
+    }
+    true
 }
 
 /// Room for a WAL path plus the rotation suffix.

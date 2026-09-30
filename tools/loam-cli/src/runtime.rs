@@ -181,8 +181,6 @@ pub mod body_store_scope {
     pub mod body;
     #[path = "../../../../../modules/common/mechanics/loam_ec_wire.rs"]
     pub mod ec_wire;
-    #[path = "../../../../../modules/common/mechanics/loam_extent_wire.rs"]
-    pub mod extent_wire;
 }
 pub use body_store_scope::body as body_store_body;
 
@@ -264,6 +262,8 @@ pub mod admin_scope {
     )]
     #[path = "../../../../../modules/common/mechanics/admin_router_body.rs"]
     pub mod body;
+    #[path = "../../../../../modules/common/mechanics/loam_volume_map_wire.rs"]
+    pub mod map_wire;
 }
 pub use admin_scope::body as admin_body;
 
@@ -411,6 +411,10 @@ const FS_UNLINK: u32 = 0x090A;
 const FS_RENAME: u32 = 0x090D;
 const FS_FSYNC_NAME: u32 = 0x0912;
 const FS_CAPS: u32 = 0x09FF;
+/// `TIMER::UNIX_MILLIS`. The admin router stamps lease requests with
+/// it, so a host runtime that answered nothing would refuse every
+/// lease as "no wall clock".
+const TIMER_UNIX_MILLIS: u32 = 0x0608;
 /// OPEN | OPENDIR | OPEN_CREATE | WRITE | FSYNC | UNLINK | MKDIR |
 /// RENAME | FSYNC_NAME — the Linux provider's surface, which is what
 /// this in-process dispatch mirrors.
@@ -438,6 +442,18 @@ fn fs_slot_for(file: File) -> i32 {
 
 unsafe extern "C" fn fs_provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
     match op {
+        TIMER_UNIX_MILLIS => {
+            if arg.is_null() || arg_len < 8 {
+                return -22;
+            }
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let out = unsafe { std::slice::from_raw_parts_mut(arg, 8) };
+            out.copy_from_slice(&ms.to_le_bytes());
+            0
+        }
         // Durable name publication. `FSYNC` fences a file's bytes, never
         // the directory entry that finds them, so the byte tier needs
         // its own name fence and an atomic rename.

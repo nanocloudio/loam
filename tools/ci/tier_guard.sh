@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Storage tier-boundary guard (rfc_storage_capability_symmetry §6).
+# Storage tier-boundary guard.
 #
 # Loam is two tiers named by FENCE CLASS, kept separable so a later
 # repo extraction of the mechanics tier is a `git mv`, not a rewrite:
@@ -28,8 +28,10 @@ namespace_router object_index telemetry_agg"
 # loam_load_gen and loam_throughput_counter drive and measure the
 # REPLICATED metadata plane: they speak loam_decision_wire, so they sit
 # with the tier whose vocabulary they carry.
+# loam_volume is a block source whose durability is the volume commit,
+# a bind the replicated namespace linearises.
 REPLICATED="body_fanout_router clustor_bridge ec_body_router \
-loam_load_gen loam_throughput_counter metadata_e2e_probe \
+loam_load_gen loam_throughput_counter loam_volume metadata_e2e_probe \
 placement_router raft_metadata_client"
 
 fail=0

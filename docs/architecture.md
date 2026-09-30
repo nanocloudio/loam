@@ -104,8 +104,12 @@ claim rather than being padded into the shape of one.
 `DELETE_FILE`, `LIST_FILES`, `STAT_FILE`, with revision-gated
 overwrite), the streaming form for anything past the 60 KiB
 single-shot cap (`PUT_FILE_OPEN` / `_CHUNK` / `_COMMIT` and
-`READ_FILE_RANGE`), and the raw body ops (`PUT_BODY`, `GET_BODY`,
-`PUT_BODY_KEYED`, `DELETE_BODY`), preceded where required by `AUTH`.
+`READ_FILE_RANGE`), `LOOKUP` (a path's object id, revision and kind
+without its body), the raw body ops (`PUT_BODY`, `GET_BODY`,
+`PUT_BODY_KEYED`, `DELETE_BODY`), and the volume ops (`LEASE`,
+`VOLUME`), preceded where required by `AUTH`. `loam-server` checks
+each request against the caller's grant before the router sees it
+([Transport security and authorisation](#transport-security-and-authorisation)).
 The router demuxes each to the right downstream PIC, runs a 3-stage state machine for the composed
 `PUT_FILE`, and hosts the lifecycle sweep that reclaims orphaned body
 blobs and unbound object descriptors. The composed write's crash
@@ -113,15 +117,40 @@ model — idempotent retry, unreachable intermediate state, and
 conservative reclamation, with the fault matrix behind it — is in
 [`durability.md`](durability.md).
 
-`AUTH` is connection-scoped, not per-request. The admin surface can
-bind, read and delete anything in any namespace, so the boundary
-that matters is who is on the far end of the socket, established
-once rather than re-argued per op. A unix socket is protected by its
-filesystem permissions; a TCP listener is not, so `loam-server`
-REFUSES `--admin-listen` without `--admin-token` rather than serving
-an anonymous surface off-box. The token is the one field an
-unauthenticated peer can make the server hold, which is why
-`MAX_TOKEN` is bounded low.
+`LEASE` gives a volume one writer at a time: acquire, renew or
+release a TTL lease keyed by (root, path), answered with a fence
+token that grows whenever the holder changes and is never reissued.
+The router stamps each request with its own wall clock — strictly
+increasing, and refused outright when there is no clock — and the
+namespace decides it in log order like any mutating record, so
+every replica and every replay reaches the same verdict. The lease
+table lives in the namespace WAL and is carried across a rotation
+by seeding the new log with it; a record stamped no later than the
+last one applied to its volume is a redelivered duplicate and
+changes nothing.
+
+`VOLUME` moves a volume's committed root forward. `BEGIN` opens a
+flush, `COMMIT` binds the volume's path to a new map root at
+`expected + 1`, `ABORT` closes a flush without binding, and `DELETE`
+unbinds the path under the same lease and revision check. It is the
+only way to change a volume binding: a plain `BIND`, `RENAME` or
+`UNBIND` — on the channel wire or the provider surface — that would
+create, replace, move or remove one is refused (`NAK_FENCED` 0xFC on
+the channel, `EPERM` on the surface), so no change to a volume
+escapes the fence. A commit
+is admitted only when the current revision is exactly `expected`
+(`CONFLICT` otherwise), the writer holds the live lease under the
+fence it names (`LEASE_LOST` otherwise), and it opened a flush first.
+The router stamps the record like a lease request and the namespace
+decides it in log order, so the bind is the one atomic point every
+replica agrees on. While any flush is open the namespace answers
+every `REFERENCED` question "referenced", and a `BEGIN` is refused
+while a GC reservation stands: together they keep the orphan GC off
+the bodies of a flush whose commit is not yet decided. A reservation
+carries the sweep's server time, and deciding one ends every open
+flush whose writer's lease has expired by then — that writer's commit
+is refused anyway — so a crashed writer holds the GC off only until
+its lease lapses.
 
 For multi-client production deployments the `loam-server` binary in
 [`tools/loam-cli/`](../tools/loam-cli/) hosts the full graph and
@@ -144,6 +173,66 @@ the bucket a tenancy boundary; without it the gateway is anonymous.
 Verification is loam's
 ([`tools/loam-cli/src/sigv4.rs`](../tools/loam-cli/src/sigv4.rs));
 signing belongs to wave, which owns the S3 protocol.
+
+## Transport security and authorisation
+
+Two ways in, one per kind of caller:
+
+- **The unix socket** is the local operator's: full authority,
+  reachable only by the host's own users, and optionally gated by
+  `AUTH` with the `--admin-token` secret. `AUTH` is
+  connection-scoped: the boundary is who is on the far end of the
+  socket, established once rather than re-argued per op. The token is
+  the one field an unauthenticated peer can make the server hold,
+  which is why `MAX_TOKEN` is bounded low.
+- **`--admin-listen`** is TLS 1.3 only (rustls, ring provider, no TLS
+  1.2 compiled in), and REFUSED at startup without a server
+  certificate, a client CA and a grant table. A client must present a
+  certificate chaining to the CA; its URI SAN, else DNS SAN, else
+  CommonName is its identity. Resumption is off, so each connection
+  is judged on the certificate it presents.
+
+**Every request is checked where it is framed: in `loam-server`, before
+it reaches `admin_router`.** The router is a PIC that sees channel
+frames and cannot know which certificate a request came under; the
+host terminates TLS, holds the identity for the connection's life,
+and already has to frame each request out of the byte stream
+(`loam_admin_wire::request_len`). The check decodes the opcode and
+the namespace root with the wire's own decoders and applies the grant
+table — identity → roots and classes (`read`, `write`, `lease`,
+`admin`). Default deny throughout: no grant, no access; an opcode the
+table does not name is refused and the connection closed. A refusal
+is `STATUS_FORBIDDEN`, distinct from `STATUS_NAK` because the remedy
+is a grant, not a retry, and it is encoded in the op's own ack shape
+so a client decodes it with the decoder it was already waiting on.
+The class of every op, and the file format, are in
+[running.md](running.md#remote-admin).
+
+Ops that name no root are judged by where their effect lands. A
+content-addressed `PUT_BODY` or `GET_BODY` needs its class on some
+root: a put cannot change bytes anyone else reads (one digest is one
+set of bytes), and what it stores stays an unreferenced orphan until
+a bind or a volume commit on a granted root names it. The keyed
+body plane (`PUT_BODY_KEYED`, `DELETE_BODY`) overwrites and deletes
+across every root and is `admin`. A streamed write's chunks and commit
+name only a stream id, so they are accepted only on the connection
+that opened the stream.
+
+**Lease holders are bound to identity.** For a TLS caller the server
+rewrites the holder in every `LEASE` and `VOLUME` request to a hash of
+the identity and the holder the caller chose. An identity cannot
+acquire, renew, release or commit under another's holder, even by
+sending its bytes, and one identity's writers still exclude each
+other. The local operator's holders pass through: it has authority
+over a stuck writer's lease.
+
+**Replies go only to the connection that asked.** The loop serves
+every open admin connection — a control plane holds one for its
+creates and deletes while each attached volume's node holds its own —
+and forwards each request under a server-assigned correlation id
+that names the connection, mapping the reply back to the client's.
+A reply that arrives after its connection closed is discarded, never
+delivered to another connection.
 
 ## block_log: channel-fronted durability
 
@@ -183,7 +272,7 @@ fixed-size binary records bounded under 4 KiB each.
 **Body plane** (out of Raft, addressed by content hash):
 
 - Object bytes
-- Block-volume extents
+- Block-volume extents and extent-map pages
 - Cache, page-backing, working sets
 
 Bodies live in `body_store`; metadata references them only by
@@ -199,10 +288,25 @@ targets locally by rendezvous hashing, so no PUT costs a round trip
 into the router.
 
 A block volume rides the same plane rather than getting one of its
-own: the volume descriptor is an ordinary content-addressed blob
-bound at a namespace path, and its extents are mutable keyed blobs
-under derived keys. Volume metadata therefore inherits binding,
-replication and GC unchanged.
+own. Every extent version is an ordinary content-addressed body, and
+so is every page of the copy-on-write map from extent index to digest
+([`loam_volume_map_wire.rs`](../modules/common/mechanics/loam_volume_map_wire.rs)):
+a root page holding the volume's geometry and up to 1024 child
+digests, and at depth 2 leaf pages of 1024 extent digests each. The
+volume's committed state is its path bound to the root's digest at a
+revision, as a `VOLUME` binding. A flush writes the changed extents,
+the leaves on the changed paths and a new root, then commits the
+bind; before it every reader resolves the old root, after it the new
+one, and a crash between leaves orphans rather than a mixed volume.
+A snapshot of a volume is a binding of its root digest, which pins
+exactly the extent versions that root reaches.
+
+The orphan GC follows the maps. A body no binding names may still be
+a page or an extent of a bound volume root, so before deleting one
+the body sweep walks every root the namespace lists as a `VOLUME`
+binding (`OP_VOLUME_ROOTS`, cursor-paged), reading one page per
+downstream round trip and keeping the body at the first page that
+names it, or at any page it cannot read.
 
 ## Scale past one arena
 

@@ -94,22 +94,24 @@ fn cli_surfaces_lists_public_and_internal_modules() {
         .collect();
     assert_eq!(
         public.len(),
-        1,
-        "one public surface: only namespace_router can answer the one it claims"
+        2,
+        "two public surfaces, each claimed by the module that answers it: \
+         namespace_router's provider dispatch and loam_volume's block channel"
     );
     assert!(!internal.is_empty(), "internal modules present");
 
     // Read from the manifests, so EVERY module appears — the table
     // this replaced covered 7 of 18 and had drifted from the rest.
-    assert_eq!(bindings.len(), 16, "every module in modules/app is listed");
-    let surfaces: Vec<&str> = public
+    assert_eq!(bindings.len(), 17, "every module in modules/app is listed");
+    let mut surfaces: Vec<&str> = public
         .iter()
         .flat_map(|b| b["surfaces"].as_array().unwrap())
         .map(|s| s.as_str().unwrap())
         .collect();
+    surfaces.sort_unstable();
     assert_eq!(
         surfaces,
-        vec!["storage.namespace"],
+        vec!["storage.block", "storage.namespace"],
         "the manifests declare exactly what loam can serve"
     );
 }

@@ -1,9 +1,9 @@
 // Wire format for the `body_store` PIC's channel protocol.
 //
 // Bodies are content-addressed by SHA-256; the 32-byte digest IS
-// the ObjectId. Single-shot put/get capped at MAX_BODY bytes per
-// op (channel-bounded). Streaming protocol for large bodies is a
-// follow-up phase.
+// the ObjectId. Single-shot put/get carries at most MAX_BODY bytes
+// per op (channel-bounded); larger bodies stream in bounded chunks —
+// see "Chunked (streaming) writes" below.
 //
 // Layouts (multi-byte ints LE):
 //
@@ -20,7 +20,8 @@
 //   DeleteResp(ok)  [op:u8=0x33][existed:u8]   // 1 if removed, 0 if absent
 //
 //   ScanReq         [op:u8=0x34][cursor:u32][max:u8]
-//   ScanResp(ok)    [op:u8=0x34][next_cursor:u32][count:u8][digests:count*32]
+//   ScanResp(ok)    [op:u8=0x34][next_cursor:u32][count:u8]
+//                   [keyed:u8][digest:32] × count   // keyed: 1 = PUT_KEYED blob
 //                   // next_cursor 0 = enumeration wrapped; resume from 0
 //
 //   PutKeyedReq     [op:u8=0x35][key:32][len:u32][bytes:len]
@@ -437,8 +438,7 @@ pub fn decode_scan_req(src: &[u8]) -> Result<(u32, u8), WireError> {
 /// Encode a ScanResp from a slice of digests. `digests.len()` must
 /// be at most MAX_SCAN_DIGESTS.
 /// Each scan entry carries a KEYED flag: 1 for blobs stored under
-/// an explicit key (volume extents, EC shards — lifecycle owned by
-/// their writers), 0 for content-addressed bodies (lifecycle owned
+/// an explicit key (EC shards — lifecycle owned by their writers), 0 for content-addressed bodies (lifecycle owned
 /// by namespace references / the orphan GC).
 pub fn encode_scan_resp(
     dst: &mut [u8],

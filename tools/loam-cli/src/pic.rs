@@ -193,8 +193,6 @@ pub mod body_store_scope {
     pub mod body;
     #[path = "../../../../../modules/common/mechanics/loam_ec_wire.rs"]
     pub mod ec_wire;
-    #[path = "../../../../../modules/common/mechanics/loam_extent_wire.rs"]
-    pub mod extent_wire;
 }
 pub use body_store_scope::body as body_store_body;
 

@@ -3,7 +3,11 @@
 //! Hosts a PIC graph and exposes it through up to three surfaces:
 //!
 //!   --socket PATH       admin channel over a unix socket (raw
-//!                       loam_admin_wire frames, one per read)
+//!                       loam_admin_wire frames): the local
+//!                       operator, under --admin-token
+//!   --admin-listen ADDR the same admin wire over mutually
+//!                       authenticated TLS 1.3, each request
+//!                       checked against --admin-grants
 //!   --s3-listen ADDR    minimal S3-compatible HTTP gateway:
 //!                       PUT/GET/HEAD/DELETE /bucket/key mapped to
 //!                       AdminPutFile/GetFile/DeleteFile; buckets
@@ -20,6 +24,8 @@
 //! message-per-frame channel bridging: a bridged channel pair is
 //! indistinguishable from a local one to the PICs on either end.
 
+mod admin_access;
+mod admin_tls;
 mod runtime;
 
 #[path = "../../../modules/common/mechanics/loam_net_wire.rs"]
@@ -94,65 +100,303 @@ struct Args {
     /// to an allowed bucket; without it the gateway is anonymous.
     #[arg(long)]
     s3_credentials: Option<PathBuf>,
-    /// TCP address for the admin surface, for a consumer that runs
-    /// somewhere other than the storage node (a volume backend, a
-    /// CSI plugin). REFUSED without --admin-token: the admin surface
-    /// can bind, read and delete anything in any namespace, so
-    /// exposing it off-box unauthenticated is worse than not
-    /// exposing it at all.
+    /// TCP address for the admin surface over TLS 1.3, for a consumer
+    /// that runs somewhere other than the storage node (a volume
+    /// backend, a CSI plugin). REFUSED without --admin-tls-cert,
+    /// --admin-tls-key, --admin-client-ca and --admin-grants: there
+    /// is no plaintext admin surface off-box.
     #[arg(long)]
     admin_listen: Option<String>,
-    /// File holding the shared secret an admin connection must
-    /// present before any op is accepted. Without it the admin
-    /// surface is ANONYMOUS — which is why it must never be exposed
-    /// off-box unauthenticated.
+    /// PEM certificate chain the TLS admin surface presents.
+    #[arg(long)]
+    admin_tls_cert: Option<PathBuf>,
+    /// PEM private key for --admin-tls-cert.
+    #[arg(long)]
+    admin_tls_key: Option<PathBuf>,
+    /// PEM CA certificate(s). A TLS admin client must present a
+    /// certificate chaining to one of them; its name is its identity.
+    #[arg(long)]
+    admin_client_ca: Option<PathBuf>,
+    /// JSON grant table: each identity's namespace roots and op
+    /// classes (read, write, lease, admin). An identity it does not
+    /// name can do nothing.
+    #[arg(long)]
+    admin_grants: Option<PathBuf>,
+    /// File holding the shared secret a unix-socket admin connection
+    /// must present before any op is accepted. Without it the socket
+    /// is ANONYMOUS, guarded only by its filesystem permissions.
     #[arg(long)]
     admin_token: Option<PathBuf>,
 }
 
-/// An admin connection, whichever transport carried it.
-///
-/// One at a time, as before. Admin correlation ids are chosen by the
-/// CLIENT, so two concurrent external clients could pick the same
-/// one and a reply would go to the wrong peer; keeping a single slot
-/// keeps that impossible rather than merely unlikely. Serving
-/// several at once needs a server-assigned cid space first, which is
-/// a wire change and not this one.
-enum AdminConn {
+/// What an admin connection is carried over.
+enum AdminLink {
     Unix(std::os::unix::net::UnixStream),
-    Tcp(TcpStream),
+    Tls(Box<admin_tls::TlsLink>),
 }
 
-impl Read for AdminConn {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            AdminConn::Unix(s) => s.read(buf),
-            AdminConn::Tcp(s) => s.read(buf),
+/// The largest request frame a connection may send. Past it the frame
+/// cannot be one the router reads (`MAX_BODY` plus headers), so the
+/// connection is refused rather than buffered without bound.
+const ADMIN_FRAME_MAX: usize = 128 * 1024;
+
+/// One admin connection, whichever transport carried it.
+///
+/// The loop serves every open connection: a control plane holds one
+/// for its creates and deletes while each attached volume's node graph
+/// holds its own for that volume's lease and blocks. Requests are
+/// forwarded under a server-assigned correlation id that names the
+/// connection, so a reply goes to the connection that asked, and one
+/// the router sends after its connection has gone is discarded.
+struct AdminSession {
+    link: AdminLink,
+    principal: admin_access::Principal,
+    /// Whether the connection may send more than `OP_AUTH`. A TLS
+    /// connection authenticated in its handshake.
+    authed: bool,
+    inbound: Vec<u8>,
+    /// Streamed writes (`pfid`s) this connection opened: only it may
+    /// send their chunks and commit.
+    streams: [u64; 4],
+}
+
+/// What the front of a connection's inbound bytes holds.
+enum Framed {
+    Frame(Vec<u8>),
+    Incomplete,
+    /// An opcode that names no request, or a length no request can
+    /// have: nothing after it can be framed.
+    Unframeable(u8),
+}
+
+impl AdminSession {
+    fn new(link: AdminLink, principal: admin_access::Principal, authed: bool) -> Self {
+        AdminSession {
+            link,
+            principal,
+            authed,
+            inbound: Vec::new(),
+            streams: [0; 4],
+        }
+    }
+
+    /// Read whatever has arrived without blocking. `Ok(false)` once the
+    /// peer has closed.
+    fn fill(&mut self) -> std::io::Result<bool> {
+        if self.inbound.len() >= ADMIN_FRAME_MAX {
+            return Ok(true);
+        }
+        match &mut self.link {
+            AdminLink::Unix(s) => {
+                let mut chunk = [0u8; 64 * 1024];
+                loop {
+                    match s.read(&mut chunk) {
+                        Ok(0) => return Ok(false),
+                        Ok(n) => self.inbound.extend_from_slice(&chunk[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(true),
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
+                    if self.inbound.len() >= ADMIN_FRAME_MAX {
+                        return Ok(true);
+                    }
+                }
+            }
+            AdminLink::Tls(t) => t.read_into(&mut self.inbound, ADMIN_FRAME_MAX),
+        }
+    }
+
+    fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        match &mut self.link {
+            AdminLink::Unix(s) => s.write_all(bytes),
+            AdminLink::Tls(t) => t.send(bytes),
+        }
+    }
+
+    fn next_frame(&mut self) -> Framed {
+        match admin_wire::request_len(&self.inbound) {
+            Ok(len) if len > ADMIN_FRAME_MAX => Framed::Unframeable(admin_wire::STATUS_NAK),
+            Ok(len) if len <= self.inbound.len() => {
+                Framed::Frame(self.inbound.drain(..len).collect())
+            }
+            Ok(_) | Err(admin_wire::WireError::Truncated) => Framed::Incomplete,
+            Err(_) => Framed::Unframeable(admin_wire::STATUS_FORBIDDEN),
+        }
+    }
+
+    fn owns_stream(&self, pfid: u8) -> bool {
+        self.streams[(pfid / 64) as usize] & (1u64 << (pfid % 64)) != 0
+    }
+
+    fn set_stream(&mut self, pfid: u8, owned: bool) {
+        let bit = 1u64 << (pfid % 64);
+        let word = &mut self.streams[(pfid / 64) as usize];
+        if owned {
+            *word |= bit;
+        } else {
+            *word &= !bit;
         }
     }
 }
 
-impl Write for AdminConn {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            AdminConn::Unix(s) => s.write(buf),
-            AdminConn::Tcp(s) => s.write(buf),
+/// Correlation ids the loop forwards the sessions' requests under: for
+/// each, the session that asked and the client's own id it answers to.
+struct CidMap {
+    next: u32,
+    client_cid: std::collections::HashMap<u32, (u64, u32)>,
+}
+
+impl CidMap {
+    /// A server cid below `S3_CID_BASE`, never zero, not in use.
+    fn assign(&mut self, session: u64, client_cid: u32) -> u32 {
+        loop {
+            let cid = self.next;
+            self.next = if self.next + 1 >= S3_CID_BASE {
+                1
+            } else {
+                self.next + 1
+            };
+            if let std::collections::hash_map::Entry::Vacant(slot) = self.client_cid.entry(cid) {
+                slot.insert((session, client_cid));
+                return cid;
+            }
         }
     }
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            AdminConn::Unix(s) => s.flush(),
-            AdminConn::Tcp(s) => s.flush(),
+
+    /// Forget a closed session's requests: their late replies are
+    /// discarded, never delivered to another connection.
+    fn forget(&mut self, session: u64) {
+        self.client_cid.retain(|_, (s, _)| *s != session);
+    }
+}
+
+/// Admin connections served at once; one more is refused until one
+/// closes.
+const MAX_ADMIN_SESSIONS: usize = 64;
+
+fn set_cid(frame: &mut [u8], cid: u32) {
+    if frame.len() >= 5 {
+        frame[1..5].copy_from_slice(&cid.to_le_bytes());
+    }
+}
+
+fn frame_cid(frame: &[u8]) -> u32 {
+    if frame.len() >= 5 {
+        u32::from_le_bytes([frame[1], frame[2], frame[3], frame[4]])
+    } else {
+        0
+    }
+}
+
+/// Serve every complete request in `session`'s inbound bytes. Returns
+/// false when the connection must close.
+fn serve_inbound(
+    session_id: u64,
+    session: &mut AdminSession,
+    server: &mut runtime::Server,
+    cids: &mut CidMap,
+    grants: &admin_access::Grants,
+    admin_auth: &AdminAuth,
+) -> bool {
+    loop {
+        if !session.authed {
+            // Until authenticated the ONLY frame that gets past here is
+            // a valid OP_AUTH, bounded by MAX_TOKEN before it is
+            // buffered. It is answered on this thread and never reaches
+            // the graph, so an unauthenticated peer can cause no work
+            // beyond one comparison.
+            let Some(&op) = session.inbound.first() else {
+                return true;
+            };
+            let auth_frame = op == admin_wire::OP_AUTH
+                && match admin_wire::request_len(&session.inbound) {
+                    Ok(len) => len <= 7 + admin_wire::MAX_TOKEN,
+                    Err(admin_wire::WireError::Truncated) => return true,
+                    Err(_) => false,
+                };
+            let frame = if auth_frame {
+                match session.next_frame() {
+                    Framed::Frame(f) => f,
+                    Framed::Incomplete => return true,
+                    Framed::Unframeable(_) => Vec::new(),
+                }
+            } else {
+                std::mem::take(&mut session.inbound)
+            };
+            let (cid, ok) = match admin_wire::decode_admin_auth(&frame) {
+                Ok((cid, token)) => (
+                    cid,
+                    admin_wire::tokens_match(token, admin_auth.as_deref().unwrap_or_default()),
+                ),
+                Err(_) => (0, false),
+            };
+            // A wrong token and a wrong op get the same answer and the
+            // same close: a caller learns "not authenticated", never
+            // which of the two it was. Closing bounds guessing to one
+            // attempt per connection.
+            let status = if ok {
+                admin_wire::STATUS_OK
+            } else {
+                admin_wire::STATUS_NAK
+            };
+            let mut ack = [0u8; 6];
+            if let Ok(n) = admin_wire::encode_admin_auth_ack(&mut ack, cid, status) {
+                if session.send(&ack[..n]).is_err() {
+                    return false;
+                }
+            }
+            if !ok {
+                return false;
+            }
+            session.authed = true;
+            continue;
+        }
+        let mut frame = match session.next_frame() {
+            Framed::Frame(f) => f,
+            Framed::Incomplete => return true,
+            Framed::Unframeable(status) => {
+                let head = std::mem::take(&mut session.inbound);
+                let _ = session.send(&admin_access::refusal(&head, status));
+                return false;
+            }
+        };
+        let verdict = admin_access::authorize(&session.principal, grants, &frame, |p| {
+            session.owns_stream(p)
+        });
+        match verdict {
+            admin_access::Verdict::Allow => {
+                if let Ok((_, pfid)) = admin_wire::decode_put_file_commit(&frame) {
+                    session.set_stream(pfid, false);
+                }
+                admin_access::bind_request_holder(&session.principal, &mut frame);
+                let cid = cids.assign(session_id, frame_cid(&frame));
+                set_cid(&mut frame, cid);
+                server.push_admin_request(frame);
+            }
+            admin_access::Verdict::Refuse(status) => {
+                if session
+                    .send(&admin_access::refusal(&frame, status))
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+            admin_access::Verdict::Close => {
+                let _ = session.send(&admin_access::refusal(&frame, admin_wire::STATUS_FORBIDDEN));
+                return false;
+            }
         }
     }
 }
 
-// ── Admin auth ─────────────────────────────────────────────────────
+// ── Admin auth (unix socket) ───────────────────────────────────────
 //
-// Connection-scoped, not per-request. The admin surface can bind,
-// read and delete anything in any namespace, so what matters is who
-// is on the far end of the socket, established once — a per-op token
-// would be the same secret repeated with more chances to leak it.
+// Connection-scoped, not per-request. The unix socket is the local
+// operator's, with authority over every namespace, so what matters is
+// who is on the far end of it, established once — a per-op token
+// would be the same secret repeated with more chances to leak it. A
+// TLS connection authenticates in its handshake instead, and each of
+// its requests is checked against the grant table.
 //
 // Until a connection has authenticated it may send exactly one kind
 // of frame: `OP_AUTH`. Anything else is refused and the connection is
@@ -1696,24 +1940,37 @@ fn main() -> Result<()> {
     };
     // The refusal is here rather than at the accept: a misconfigured
     // server should fail to START, loudly, not run happily and be
-    // wide open. There is no --insecure escape hatch, deliberately.
-    if args.admin_listen.is_some() && args.admin_token.is_none() {
-        return Err(anyhow!(
-            "--admin-listen requires --admin-token: the admin surface can \
-             bind, read and delete anything in any namespace, and exposing \
-             it over TCP unauthenticated is worse than not exposing it"
-        ));
-    }
-    let admin_tcp_listener = match &args.admin_listen {
+    // wide open. There is no plaintext or --insecure escape hatch,
+    // deliberately.
+    let admin_tls = match &args.admin_listen {
         Some(addr) => {
+            let (Some(cert), Some(key), Some(ca), Some(grants)) = (
+                &args.admin_tls_cert,
+                &args.admin_tls_key,
+                &args.admin_client_ca,
+                &args.admin_grants,
+            ) else {
+                return Err(anyhow!(
+                    "--admin-listen requires --admin-tls-cert, --admin-tls-key, \
+                     --admin-client-ca and --admin-grants: the admin surface is \
+                     served off-box only over mutually authenticated TLS, with \
+                     every request checked against a grant"
+                ));
+            };
+            let cfg = admin_tls::server_config(cert, key, ca)?;
+            let grants = admin_access::Grants::load(grants)?;
             let l = TcpListener::bind(addr)?;
-            l.set_nonblocking(true)?;
-            eprintln!("[loam-server] admin surface on tcp {}", l.local_addr()?);
-            Some(l)
+            eprintln!(
+                "[loam-server] admin surface on tls {} ({} grant(s))",
+                l.local_addr()?,
+                grants.len()
+            );
+            Some((l, cfg, grants))
         }
         None => None,
     };
-    if unix_listener.is_none() && s3_listener.is_none() && admin_tcp_listener.is_none() {
+    let admin_tcp_listener = admin_tls.is_some();
+    if unix_listener.is_none() && s3_listener.is_none() && !admin_tcp_listener {
         return Err(anyhow!(
             "no surface: pass --socket, --admin-listen and/or --s3-listen"
         ));
@@ -1751,12 +2008,21 @@ fn main() -> Result<()> {
         None => {
             if args.socket.is_some() {
                 eprintln!(
-                    "[loam-server] admin socket is ANONYMOUS — pass \
-                     --admin-token FILE before exposing it off-box"
+                    "[loam-server] admin socket is ANONYMOUS — guarded only by \
+                     its filesystem permissions; pass --admin-token FILE to \
+                     require a secret"
                 );
             }
             None
         }
+    };
+    let (tls_tx, tls_rx) = std::sync::mpsc::channel::<(admin_tls::TlsLink, String)>();
+    let grants = match admin_tls {
+        Some((listener, cfg, grants)) => {
+            std::thread::spawn(move || admin_tls::serve_handshakes(listener, cfg, tls_tx));
+            grants
+        }
+        None => admin_access::Grants::default(),
     };
     if let Some(l) = s3_listener {
         l.set_nonblocking(false)?;
@@ -1777,110 +2043,62 @@ fn main() -> Result<()> {
     drop(port);
 
     let tick = Duration::from_micros(args.tick_us);
-    let mut unix_conn: Option<AdminConn> = None;
-    // Whether the CURRENT connection has authenticated. Reset on
-    // every accept, so a dropped-and-reconnected peer starts over.
-    let mut unix_authed = admin_auth.is_none();
+    let mut sessions: std::collections::BTreeMap<u64, AdminSession> =
+        std::collections::BTreeMap::new();
+    let mut next_session: u64 = 1;
+    let mut cids = CidMap {
+        next: 1,
+        client_cid: std::collections::HashMap::new(),
+    };
     let mut pending: std::collections::HashMap<u32, std::sync::mpsc::Sender<Vec<u8>>> =
         std::collections::HashMap::new();
-    let mut read_buf = vec![0u8; 128 * 1024];
     loop {
-        if let Some(ref l) = unix_listener {
-            if unix_conn.is_none() {
+        if sessions.len() < MAX_ADMIN_SESSIONS {
+            if let Some(ref l) = unix_listener {
                 match l.accept() {
                     Ok((stream, _)) => {
                         stream.set_nonblocking(true).ok();
-                        unix_conn = Some(AdminConn::Unix(stream));
-                        unix_authed = admin_auth.is_none();
+                        sessions.insert(
+                            next_session,
+                            AdminSession::new(
+                                AdminLink::Unix(stream),
+                                admin_access::Principal::LocalOperator,
+                                admin_auth.is_none(),
+                            ),
+                        );
+                        next_session += 1;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(_) => {}
                 }
             }
         }
-        if let Some(ref l) = admin_tcp_listener {
-            if unix_conn.is_none() {
-                match l.accept() {
-                    Ok((stream, _)) => {
-                        stream.set_nonblocking(true).ok();
-                        stream.set_nodelay(true).ok();
-                        unix_conn = Some(AdminConn::Tcp(stream));
-                        // Startup refuses --admin-listen without a
-                        // token, so this is always false here; it is
-                        // written from the same expression as the
-                        // unix path so the two can never drift into
-                        // disagreeing about what "authenticated"
-                        // means.
-                        unix_authed = admin_auth.is_none();
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(_) => {}
-                }
+        while sessions.len() < MAX_ADMIN_SESSIONS {
+            let Ok((link, identity)) = tls_rx.try_recv() else {
+                break;
+            };
+            sessions.insert(
+                next_session,
+                AdminSession::new(
+                    AdminLink::Tls(Box::new(link)),
+                    admin_access::Principal::Remote(identity),
+                    true,
+                ),
+            );
+            next_session += 1;
+        }
+        let mut closed = Vec::new();
+        for (&id, s) in sessions.iter_mut() {
+            // A read error ends the connection like a close does.
+            let open = s.fill().unwrap_or(false);
+            let keep = serve_inbound(id, s, &mut server, &mut cids, &grants, &admin_auth);
+            if !open || !keep {
+                closed.push(id);
             }
         }
-        let mut drop_unix = false;
-        if let Some(ref mut c) = unix_conn {
-            match c.read(&mut read_buf) {
-                Ok(0) => drop_unix = true,
-                Ok(n) => {
-                    let frame = &read_buf[..n];
-                    if unix_authed {
-                        server.push_admin_request(frame.to_vec());
-                    } else {
-                        // Unauthenticated: the ONLY frame that gets
-                        // past here is a valid OP_AUTH. It is answered
-                        // on this thread and never reaches the graph,
-                        // so an unauthenticated peer cannot cause any
-                        // work beyond one comparison.
-                        match admin_wire::decode_admin_auth(frame) {
-                            Ok((cid, token))
-                                if admin_wire::tokens_match(
-                                    token,
-                                    admin_auth.as_deref().unwrap_or_default(),
-                                ) =>
-                            {
-                                unix_authed = true;
-                                let mut ack = [0u8; 6];
-                                if let Ok(n) = admin_wire::encode_admin_auth_ack(
-                                    &mut ack,
-                                    cid,
-                                    admin_wire::STATUS_OK,
-                                ) {
-                                    if c.write_all(&ack[..n]).is_err() {
-                                        drop_unix = true;
-                                    }
-                                }
-                            }
-                            other => {
-                                // A wrong token and a wrong op get the
-                                // same answer and the same close: a
-                                // caller learns "not authenticated",
-                                // never which of the two it was.
-                                let cid = match other {
-                                    Ok((cid, _)) => cid,
-                                    Err(_) => 0,
-                                };
-                                let mut ack = [0u8; 6];
-                                if let Ok(n) = admin_wire::encode_admin_auth_ack(
-                                    &mut ack,
-                                    cid,
-                                    admin_wire::STATUS_NAK,
-                                ) {
-                                    let _ = c.write_all(&ack[..n]);
-                                }
-                                // Closing bounds guessing to one
-                                // attempt per connection.
-                                drop_unix = true;
-                            }
-                        }
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => drop_unix = true,
-            }
-        }
-        if drop_unix {
-            unix_conn = None;
+        for id in closed {
+            sessions.remove(&id);
+            cids.forget(id);
         }
         while let Ok(job) = job_rx.try_recv() {
             pending.insert(job.cid, job.reply);
@@ -1890,23 +2108,28 @@ fn main() -> Result<()> {
             b.pump();
         }
         server.tick_once();
-        let mut drop_unix = false;
-        while let Some(frame) = runtime::pop_admin_out() {
-            let cid = if frame.len() >= 5 {
-                u32::from_le_bytes(frame[1..5].try_into().unwrap())
-            } else {
-                0
-            };
+        while let Some(mut frame) = runtime::pop_admin_out() {
+            let cid = frame_cid(&frame);
             if let Some(tx) = pending.remove(&cid) {
                 let _ = tx.send(frame);
-            } else if let Some(ref mut c) = unix_conn {
-                if c.write_all(&frame).is_err() {
-                    drop_unix = true;
-                }
+                continue;
             }
-        }
-        if drop_unix {
-            unix_conn = None;
+            let Some((id, client_cid)) = cids.client_cid.remove(&cid) else {
+                continue;
+            };
+            let Some(s) = sessions.get_mut(&id) else {
+                continue;
+            };
+            if let Ok((_, admin_wire::STATUS_OK, pfid)) =
+                admin_wire::decode_put_file_open_ack(&frame)
+            {
+                s.set_stream(pfid, true);
+            }
+            set_cid(&mut frame, client_cid);
+            if s.send(&frame).is_err() {
+                sessions.remove(&id);
+                cids.forget(id);
+            }
         }
         std::thread::sleep(tick);
     }

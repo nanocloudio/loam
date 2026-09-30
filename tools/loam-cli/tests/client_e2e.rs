@@ -2,11 +2,13 @@
 //! public call, over the actual unix admin socket. This is the
 //! contract a volume backend (nanocloud's CsiPlugin) builds on.
 
+#[path = "support/pki.rs"]
+mod pki;
 mod support;
 
 use loam_client::{ClientError, LoamClient, IO_CHUNK};
 use std::process::Command;
-use support::{announced_addr, spawn_ready, Proc};
+use support::{spawn_ready, Proc};
 
 fn server_bin() -> &'static str {
     env!("CARGO_BIN_EXE_loam-server")
@@ -112,88 +114,6 @@ fn client_covers_the_admin_surface() {
         again, large_digest,
         "content-addressed: same bytes, same digest"
     );
-}
-
-#[test]
-fn block_volume_lifecycle() {
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("admin.sock");
-    let server = spawn_server(&socket, dir.path());
-    let mut c = LoamClient::connect(&socket).expect("connect");
-
-    // 200 KiB volume, 32 KiB extents (7 extents, short tail).
-    let size = 200 * 1024u64;
-    let es = 32 * 1024u32;
-    let vol = c
-        .create_volume(b"tenant", b"/vols/db0", size, es)
-        .expect("create");
-
-    // Unwritten volume reads as zeros.
-    let mut buf = vec![0xFFu8; 8192];
-    c.volume_read(&vol, 50_000, &mut buf).expect("read fresh");
-    assert!(buf.iter().all(|&b| b == 0), "unwritten reads zero");
-
-    // Model the volume; write patterns that cross extent
-    // boundaries and land mid-extent, verifying RMW.
-    let mut model = vec![0u8; size as usize];
-    let mut write = |c: &mut LoamClient, off: usize, data: &[u8]| {
-        c.volume_write(&vol, off as u64, data).expect("write");
-        model[off..off + data.len()].copy_from_slice(data);
-    };
-    let pat = |seed: u8, len: usize| -> Vec<u8> {
-        (0..len)
-            .map(|i| ((i as u32 * 7 + seed as u32) % 251) as u8)
-            .collect()
-    };
-    write(&mut c, 0, &pat(1, 1000)); // head of extent 0
-    write(&mut c, 30_000, &pat(2, 40_000)); // spans extents 0..2
-    write(&mut c, 100_000, &pat(3, 5)); // tiny mid-extent RMW
-    write(&mut c, (size - 700) as usize, &pat(4, 700)); // tail extent
-
-    let check = |c: &mut LoamClient, model: &[u8]| {
-        // Whole-volume read, compared to the model.
-        let mut got = vec![0u8; model.len()];
-        c.volume_read(&vol, 0, &mut got).expect("read all");
-        assert!(got == model, "volume content matches model");
-        // And an unaligned window.
-        let mut win = vec![0u8; 60_000];
-        c.volume_read(&vol, 25_123, &mut win).expect("read window");
-        assert!(win[..] == model[25_123..25_123 + 60_000], "window matches");
-    };
-    check(&mut c, &model);
-
-    // Out-of-range I/O is refused.
-    assert!(c.volume_read(&vol, size - 10, &mut [0u8; 32]).is_err());
-    assert!(c.volume_write(&vol, size, b"x").is_err());
-
-    // ── Restart the server: extents + descriptor must persist. ──
-    drop(c);
-    drop(server);
-    let _server = spawn_server(&socket, dir.path());
-    let mut c = LoamClient::connect(&socket).expect("reconnect");
-    let vol2 = c
-        .open_volume(b"tenant", b"/vols/db0")
-        .expect("open")
-        .expect("descriptor bound");
-    assert_eq!(vol2.desc, vol.desc, "descriptor round-trips");
-    check(&mut c, &model);
-
-    // Overwrite after restart still works (mutable keyed blobs).
-    c.volume_write(&vol, 30_000, &pat(9, 10_000))
-        .expect("rewrite");
-    let mut got = vec![0u8; 10_000];
-    c.volume_read(&vol, 30_000, &mut got).expect("re-read");
-    assert_eq!(got, pat(9, 10_000));
-
-    // Delete: extents and the binding go away.
-    c.delete_volume(&vol).expect("delete");
-    assert!(c
-        .open_volume(b"tenant", b"/vols/db0")
-        .expect("gone")
-        .is_none());
-    // First extent's blob is gone from the body plane too.
-    let key0 = loam_client::extent_wire::derive_extent_key(&vol.desc.volume_id, 0);
-    assert_eq!(c.get_body(&key0).expect("extent gone"), None);
 }
 
 // ── Admin authentication ──────────────────────────────────────────
@@ -460,7 +380,11 @@ fn an_export_asks_only_for_the_digests_the_destination_lacks() {
     );
 
     // A manifest naming a digest nothing stored: exactly one gap.
-    let refs: Vec<(&[u8], [u8; 32])> = vec![(&b"/absent"[..], [0xAB; 32])];
+    let refs: Vec<loam_client::manifest_wire::Entry<'_>> = vec![(
+        &b"/absent"[..],
+        [0xAB; 32],
+        loam_client::manifest_wire::KIND_FILE,
+    )];
     let mut synthetic = vec![0u8; loam_client::manifest_wire::encoded_len(b"src", &refs)];
     let n = loam_client::manifest_wire::encode(&mut synthetic, b"src", &refs).unwrap();
     synthetic.truncate(n);
@@ -474,14 +398,16 @@ fn an_export_asks_only_for_the_digests_the_destination_lacks() {
 #[test]
 fn a_manifest_round_trips_and_refuses_a_corrupt_one() {
     use loam_client::manifest_wire as mw;
-    let refs: Vec<(&[u8], [u8; 32])> =
-        vec![(&b"/a"[..], [1u8; 32]), (&b"/nested/b"[..], [2u8; 32])];
+    let refs: Vec<mw::Entry<'_>> = vec![
+        (&b"/a"[..], [1u8; 32], mw::KIND_FILE),
+        (&b"/nested/b"[..], [2u8; 32], mw::KIND_FILE),
+    ];
     let mut buf = vec![0u8; mw::encoded_len(b"root", &refs)];
     let n = mw::encode(&mut buf, b"root", &refs).unwrap();
     assert_eq!(n, buf.len(), "encoded_len is exact, not an estimate");
 
     let mut seen = Vec::new();
-    let count = mw::for_each(&buf, |k, d| seen.push((k.to_vec(), *d))).unwrap();
+    let count = mw::for_each(&buf, |k, d, _| seen.push((k.to_vec(), *d))).unwrap();
     assert_eq!(count, 2);
     assert_eq!(seen[0].0, b"/a");
     assert_eq!(seen[1].1, [2u8; 32]);
@@ -493,83 +419,10 @@ fn a_manifest_round_trips_and_refuses_a_corrupt_one() {
 
     // A truncated manifest is refused, not silently short — the same
     // rule the change stream holds itself to.
-    assert!(mw::for_each(&buf[..buf.len() - 4], |_, _| {}).is_err());
+    assert!(mw::for_each(&buf[..buf.len() - 4], |_, _, _| {}).is_err());
     let mut bad = buf.clone();
     bad[0] ^= 0xFF;
     assert_eq!(mw::peek(&bad), Err(mw::ManifestError::BadMagic));
-}
-
-// ── Remote admin over TCP ─────────────────────────────────────────
-//
-// This is what a volume backend running off the storage node needs.
-// The transport and the authentication are one feature: a TCP admin
-// surface without a token is refused at startup, so these tests
-// always run authenticated.
-
-/// A server whose admin surface is on TCP, at an address the OS picks.
-fn spawn_server_tcp(dir: &std::path::Path, token_file: Option<&std::path::Path>) -> (Proc, String) {
-    let mut cmd = Command::new(server_bin());
-    cmd.args([
-        "--admin-listen",
-        "127.0.0.1:0",
-        "--ns-wal",
-        dir.join("ns.wal").to_str().unwrap(),
-        "--obj-wal",
-        dir.join("obj.wal").to_str().unwrap(),
-        "--fleet",
-        &format!("dir:{}", dir.join("bodies").display()),
-        "--tick-us",
-        "1000",
-    ]);
-    if let Some(t) = token_file {
-        cmd.args(["--admin-token", t.to_str().unwrap()]);
-    }
-    let (proc, line) = spawn_ready(cmd, "admin surface on tcp");
-    (proc, announced_addr(&line).to_string())
-}
-
-#[test]
-fn a_remote_client_works_over_tcp_once_authenticated() {
-    let dir = tempfile::tempdir().unwrap();
-    let tokf = dir.path().join("token");
-    std::fs::write(&tokf, "remote-secret").unwrap();
-    let (_g, addr) = spawn_server_tcp(dir.path(), Some(&tokf));
-
-    let mut c = LoamClient::connect_tcp(&addr).expect("tcp connect");
-    c.authenticate(b"remote-secret").expect("authenticate");
-    c.put_file(b"vol", b"/remote.txt", 1, b"written from off-box")
-        .expect("a remote authenticated client can write");
-    assert_eq!(
-        c.get_file(b"vol", b"/remote.txt").unwrap().as_deref(),
-        Some(&b"written from off-box"[..])
-    );
-}
-
-#[test]
-fn tcp_admin_without_a_token_refuses_to_start() {
-    // Not "starts and warns" — a misconfigured server that runs is
-    // an open admin surface. The refusal is at startup so it cannot
-    // be missed, and there is deliberately no --insecure override.
-    let dir = tempfile::tempdir().unwrap();
-    let out = Command::new(server_bin())
-        .args([
-            "--admin-listen",
-            "127.0.0.1:0",
-            "--ns-wal",
-            dir.path().join("ns.wal").to_str().unwrap(),
-            "--obj-wal",
-            dir.path().join("obj.wal").to_str().unwrap(),
-            "--fleet",
-            &format!("dir:{}", dir.path().join("bodies").display()),
-        ])
-        .output()
-        .expect("run loam-server");
-    assert!(!out.status.success(), "the server must refuse to start");
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("--admin-listen requires --admin-token"),
-        "the refusal must say why; got: {err}"
-    );
 }
 
 // ── Portable export between two clusters ──────────────────────────
@@ -580,24 +433,31 @@ fn tcp_admin_without_a_token_refuses_to_start() {
 // sides — which is what lets the whole export be ordinary reads and
 // writes rather than a protocol.
 
-#[test]
-fn a_snapshot_exports_to_a_second_cluster_sending_only_what_it_lacks() {
+/// Two TLS servers, each with its own CA, and a client of each granted
+/// everything.
+fn two_clusters() -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    pki::TlsServer,
+    pki::TlsServer,
+    LoamClient,
+    LoamClient,
+) {
     let src_dir = tempfile::tempdir().unwrap();
     let dst_dir = tempfile::tempdir().unwrap();
-    // A TCP admin surface REFUSES to start without a token, so
-    // an export between two clusters is authenticated on both ends
-    // by construction. There is no unauthenticated path to take.
-    let stok = src_dir.path().join("tok");
-    let dtok = dst_dir.path().join("tok");
-    std::fs::write(&stok, "src-secret").unwrap();
-    std::fs::write(&dtok, "dst-secret").unwrap();
-    let (_gs, src_addr) = spawn_server_tcp(src_dir.path(), Some(&stok));
-    let (_gd, dst_addr) = spawn_server_tcp(dst_dir.path(), Some(&dtok));
+    let src_srv = pki::spawn_tls_server(server_bin(), src_dir.path(), &pki::grant_all("exporter"));
+    let dst_srv = pki::spawn_tls_server(server_bin(), dst_dir.path(), &pki::grant_all("importer"));
+    let src = src_srv.connect(pki::Name::Cn("exporter"));
+    let dst = dst_srv.connect(pki::Name::Cn("importer"));
+    (src_dir, dst_dir, src_srv, dst_srv, src, dst)
+}
 
-    let mut src = LoamClient::connect_tcp(&src_addr).expect("src connect");
-    src.authenticate(b"src-secret").unwrap();
-    let mut dst = LoamClient::connect_tcp(&dst_addr).expect("dst connect");
-    dst.authenticate(b"dst-secret").unwrap();
+#[test]
+fn a_snapshot_exports_to_a_second_cluster_sending_only_what_it_lacks() {
+    // Two clusters, each with its own CA: the remote admin surface is
+    // TLS only, so an export between them is authenticated on both
+    // ends by construction. There is no plaintext path to take.
+    let (_src_dir, _dst_dir, _gs, _gd, mut src, mut dst) = two_clusters();
 
     // Three objects, two of them with IDENTICAL content — content
     // addressing should make that one body, on both sides.
@@ -643,18 +503,7 @@ fn re_exporting_the_same_snapshot_sends_nothing() {
     // The receiver is asked what it LACKS, and lacking is decided by
     // content digest — so a second export is metadata only. That is
     // the property that makes an incremental backup cheap.
-    let src_dir = tempfile::tempdir().unwrap();
-    let dst_dir = tempfile::tempdir().unwrap();
-    let stok = src_dir.path().join("tok");
-    let dtok = dst_dir.path().join("tok");
-    std::fs::write(&stok, "s").unwrap();
-    std::fs::write(&dtok, "d").unwrap();
-    let (_gs, src_addr) = spawn_server_tcp(src_dir.path(), Some(&stok));
-    let (_gd, dst_addr) = spawn_server_tcp(dst_dir.path(), Some(&dtok));
-    let mut src = LoamClient::connect_tcp(&src_addr).unwrap();
-    src.authenticate(b"s").unwrap();
-    let mut dst = LoamClient::connect_tcp(&dst_addr).unwrap();
-    dst.authenticate(b"d").unwrap();
+    let (_src_dir, _dst_dir, _gs, _gd, mut src, mut dst) = two_clusters();
 
     src.put_file(b"vol", b"/x", 1, b"payload").unwrap();
     let manifest = src.snapshot_create(b"vol", b"snap").unwrap();
@@ -679,18 +528,7 @@ fn an_export_whose_source_lost_a_body_fails_rather_than_arriving_short() {
     // A snapshot at the destination that silently contains less than
     // it claims is worse than a failed export: the failure is
     // visible and retryable, the short snapshot is neither.
-    let src_dir = tempfile::tempdir().unwrap();
-    let dst_dir = tempfile::tempdir().unwrap();
-    let stok = src_dir.path().join("tok");
-    let dtok = dst_dir.path().join("tok");
-    std::fs::write(&stok, "s").unwrap();
-    std::fs::write(&dtok, "d").unwrap();
-    let (_gs, src_addr) = spawn_server_tcp(src_dir.path(), Some(&stok));
-    let (_gd, dst_addr) = spawn_server_tcp(dst_dir.path(), Some(&dtok));
-    let mut src = LoamClient::connect_tcp(&src_addr).unwrap();
-    src.authenticate(b"s").unwrap();
-    let mut dst = LoamClient::connect_tcp(&dst_addr).unwrap();
-    dst.authenticate(b"d").unwrap();
+    let (_src_dir, _dst_dir, _gs, _gd, mut src, mut dst) = two_clusters();
 
     src.put_file(b"vol", b"/gone", 1, b"will be removed")
         .unwrap();
@@ -698,9 +536,12 @@ fn an_export_whose_source_lost_a_body_fails_rather_than_arriving_short() {
 
     // Forge a manifest naming a body no source holds. Same shape as
     // a source that lost one.
-    let mut refs: Vec<(&[u8], [u8; 32])> = Vec::new();
     let phantom = [0x5au8; 32];
-    refs.push((&b"/phantom"[..], phantom));
+    let refs: Vec<loam_client::manifest_wire::Entry<'_>> = vec![(
+        &b"/phantom"[..],
+        phantom,
+        loam_client::manifest_wire::KIND_FILE,
+    )];
     let mut forged = vec![0u8; loam_client::manifest_wire::encoded_len(b"vol", &refs)];
     let n = loam_client::manifest_wire::encode(&mut forged, b"vol", &refs).unwrap();
     forged.truncate(n);
@@ -716,4 +557,107 @@ fn an_export_whose_source_lost_a_body_fails_rather_than_arriving_short() {
         "and nothing was bound at the destination"
     );
     let _ = manifest;
+}
+
+/// One writer per volume. The lease is decided by the server's clock and
+/// its fence grows every time the writer changes — including across a
+/// restart, which replays the lease table from the namespace log.
+#[test]
+fn a_volume_lease_admits_one_writer_and_its_fence_only_grows() {
+    use loam_client::admin_wire;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("admin.sock");
+    let server = spawn_server(&socket, dir.path());
+    // The server serves one admin connection at a time, so one
+    // connection plays both writers: the lease is judged by holder id,
+    // not by who sent it.
+    let mut c = LoamClient::connect(&socket).expect("connect");
+    let a = [0xAA; admin_wire::LEASE_HOLDER_LEN];
+    let b = [0xBB; admin_wire::LEASE_HOLDER_LEN];
+    let (root, path) = (&b"tenant"[..], &b"/vols/leased"[..]);
+    let refused = |r: Result<loam_client::Lease, ClientError>| match r {
+        Err(ClientError::Nak(s)) => s,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+
+    let first = c.acquire_lease(root, path, &a, 60_000).expect("acquire");
+    assert_eq!(first.fence, 1, "the first writer holds the first fence");
+    assert!(first.expires_at_ms > 0, "expiry is on the server's clock");
+
+    let again = c.acquire_lease(root, path, &a, 60_000).expect("re-acquire");
+    assert_eq!(again.fence, first.fence, "the same writer keeps its fence");
+
+    assert_eq!(
+        refused(c.acquire_lease(root, path, &b, 60_000)),
+        admin_wire::STATUS_LEASE_HELD,
+        "a second writer is refused while the lease is live"
+    );
+    assert_eq!(
+        refused(c.renew_lease(root, path, &b, 60_000)),
+        admin_wire::STATUS_LEASE_LOST
+    );
+    assert!(
+        matches!(c.release_lease(root, path, &b), Err(ClientError::Nak(s)) if s == admin_wire::STATUS_LEASE_LOST),
+        "only the holder can release"
+    );
+
+    let renewed = c.renew_lease(root, path, &a, 60_000).expect("renew");
+    assert_eq!(renewed.fence, first.fence, "a renew keeps the fence");
+
+    c.release_lease(root, path, &a).expect("release");
+    assert!(
+        matches!(c.release_lease(root, path, &a), Err(ClientError::Nak(s)) if s == admin_wire::STATUS_LEASE_LOST),
+        "a released lease cannot be released again"
+    );
+    assert_eq!(
+        refused(c.renew_lease(root, path, &a, 60_000)),
+        admin_wire::STATUS_LEASE_LOST,
+        "nor renewed"
+    );
+
+    let second = c.acquire_lease(root, path, &b, 60_000).expect("b acquires");
+    assert_eq!(second.fence, first.fence + 1, "a new writer, a new fence");
+
+    // A TTL outside 1..=LEASE_TTL_MAX_MS is malformed, not contended.
+    assert_eq!(
+        refused(c.acquire_lease(root, b"/vols/other", &a, 0)),
+        admin_wire::STATUS_NAK
+    );
+    assert_eq!(
+        refused(c.acquire_lease(root, b"/vols/other", &a, 300_001)),
+        admin_wire::STATUS_NAK
+    );
+
+    // A lapsed lease is anyone's, under a new fence.
+    let short = c
+        .acquire_lease(root, b"/vols/short", &a, 50)
+        .expect("short");
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    let taken = c
+        .acquire_lease(root, b"/vols/short", &b, 60_000)
+        .expect("taken over after expiry");
+    assert_eq!(taken.fence, short.fence + 1);
+    assert_eq!(
+        refused(c.renew_lease(root, b"/vols/short", &a, 60_000)),
+        admin_wire::STATUS_LEASE_LOST,
+        "the lapsed holder learns it lost the lease"
+    );
+
+    // ── Restart: the lease table replays from the namespace WAL. ──
+    drop(c);
+    drop(server);
+    let _server = spawn_server(&socket, dir.path());
+    let mut c = LoamClient::connect(&socket).expect("reconnect");
+    assert_eq!(
+        refused(c.acquire_lease(root, path, &a, 60_000)),
+        admin_wire::STATUS_LEASE_HELD,
+        "b's lease is still live after the restart"
+    );
+    c.release_lease(root, path, &b).expect("b releases");
+    let third = c.acquire_lease(root, path, &a, 60_000).expect("a again");
+    assert_eq!(
+        third.fence,
+        second.fence + 1,
+        "the fence continues where it was, never reissued"
+    );
 }

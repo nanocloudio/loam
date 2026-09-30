@@ -1,4 +1,4 @@
-// Snapshot manifest — the `(key, digest)` listing that describes
+// Snapshot manifest — the `(key, digest, kind)` listing that describes
 // what a snapshot contains.
 //
 // This file owns the bytes and nothing else: no I/O, no allocation,
@@ -23,12 +23,23 @@
 // ## Layout
 //
 //   header  [magic u32 "LMAN"][count u32][root_len u16][root]
-//   record  [digest 32][key_len u16][key]      × count
+//   record  [digest 32][key_len u16][kind u8][key]      × count
+//
+// `kind` is the binding's namespace kind, so a restore binds each entry
+// as what it was. It matters for a volume: its entry is the digest of
+// its map root, and the orphan GC walks the maps of VOLUME bindings
+// only — a volume restored as a plain file would have its extents
+// collected.
 //
 // Little-endian throughout, like every other loam wire.
 //
 // Same include discipline as the other mechanics sources: no_std,
 // no dependencies, `#[path]`-included by every consumer.
+
+#![allow(
+    dead_code,
+    reason = "shared #[path]-included surface; each includer uses a subset"
+)]
 
 pub const MAGIC: u32 = u32::from_le_bytes(*b"LMAN");
 
@@ -39,7 +50,15 @@ pub const DIGEST_LEN: usize = 32;
 pub const HEADER: usize = 4 + 4 + 2;
 
 /// Fixed part of a record, before the key bytes.
-pub const REC_HEADER: usize = DIGEST_LEN + 2;
+pub const REC_HEADER: usize = DIGEST_LEN + 2 + 1;
+
+/// A plain file's kind (`loam_wire::KIND_FILE`). Restated so this
+/// wire stays includable on its own.
+pub const KIND_FILE: u8 = 0;
+
+/// Highest namespace kind a record may carry (`loam_wire::KIND_SYMLINK`).
+/// Restated so this wire stays includable on its own.
+pub const LAST_KIND: u8 = 4;
 
 /// Largest manifest this format can describe.
 ///
@@ -70,15 +89,21 @@ pub enum ManifestError {
     TooLong { len: usize, max: usize },
     /// More entries than the format can describe.
     TooManyEntries { count: usize, max: u32 },
+    /// A record carries a kind no binding can have.
+    BadKind { observed: u8 },
 }
 
-/// Exact encoded size for `root` and `refs`. A caller allocates this
-/// and passes it to `encode`; the two are kept in step by
+/// One manifest record: a key, the digest it was bound to, and the
+/// binding's namespace kind.
+pub type Entry<'a> = (&'a [u8], [u8; DIGEST_LEN], u8);
+
+/// Exact encoded size for `root` and `entries`. A caller allocates
+/// this and passes it to `encode`; the two are kept in step by
 /// construction rather than by an assertion, because they walk the
 /// same records the same way.
-pub fn encoded_len(root: &[u8], refs: &[(&[u8], [u8; DIGEST_LEN])]) -> usize {
+pub fn encoded_len(root: &[u8], entries: &[Entry<'_>]) -> usize {
     let mut n = HEADER + root.len();
-    for (key, _) in refs {
+    for (key, _, _) in entries {
         n += REC_HEADER + key.len();
     }
     n
@@ -90,32 +115,31 @@ pub fn encoded_len(root: &[u8], refs: &[(&[u8], [u8; DIGEST_LEN])]) -> usize {
 /// business: this format is read linearly, so nothing here depends
 /// on a sort, and imposing one would only invite a reader to rely on
 /// it.
-pub fn encode(
-    out: &mut [u8],
-    root: &[u8],
-    refs: &[(&[u8], [u8; DIGEST_LEN])],
-) -> Result<usize, ManifestError> {
+pub fn encode(out: &mut [u8], root: &[u8], entries: &[Entry<'_>]) -> Result<usize, ManifestError> {
     if root.len() > super::limits::MAX_ROOT {
         return Err(ManifestError::TooLong {
             len: root.len(),
             max: super::limits::MAX_ROOT,
         });
     }
-    if refs.len() > MAX_ENTRIES as usize {
+    if entries.len() > MAX_ENTRIES as usize {
         return Err(ManifestError::TooManyEntries {
-            count: refs.len(),
+            count: entries.len(),
             max: MAX_ENTRIES,
         });
     }
-    for (key, _) in refs {
+    for &(key, _, kind) in entries {
         if key.len() > super::limits::MAX_PATH {
             return Err(ManifestError::TooLong {
                 len: key.len(),
                 max: super::limits::MAX_PATH,
             });
         }
+        if kind > LAST_KIND {
+            return Err(ManifestError::BadKind { observed: kind });
+        }
     }
-    let needed = encoded_len(root, refs);
+    let needed = encoded_len(root, entries);
     if out.len() < needed {
         return Err(ManifestError::BufferTooSmall {
             needed,
@@ -124,17 +148,19 @@ pub fn encode(
     }
 
     out[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-    out[4..8].copy_from_slice(&(refs.len() as u32).to_le_bytes());
+    out[4..8].copy_from_slice(&(entries.len() as u32).to_le_bytes());
     out[8..10].copy_from_slice(&(root.len() as u16).to_le_bytes());
     let mut o = HEADER;
     out[o..o + root.len()].copy_from_slice(root);
     o += root.len();
 
-    for (key, digest) in refs {
-        out[o..o + DIGEST_LEN].copy_from_slice(digest);
+    for &(key, digest, kind) in entries {
+        out[o..o + DIGEST_LEN].copy_from_slice(&digest);
         o += DIGEST_LEN;
         out[o..o + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
         o += 2;
+        out[o] = kind;
+        o += 1;
         out[o..o + key.len()].copy_from_slice(key);
         o += key.len();
     }
@@ -181,7 +207,7 @@ fn split_header(manifest: &[u8]) -> Result<(&[u8], u32, usize), ManifestError> {
     ))
 }
 
-/// Visit every `(key, digest)` in order.
+/// Visit every `(key, digest, kind)` in order.
 ///
 /// The whole manifest is validated as it is walked: a record that
 /// runs past the end, or a declared count the bytes do not support,
@@ -191,7 +217,7 @@ fn split_header(manifest: &[u8]) -> Result<(&[u8], u32, usize), ManifestError> {
 /// second silently restores an incomplete volume.
 pub fn for_each(
     manifest: &[u8],
-    mut f: impl FnMut(&[u8], &[u8; DIGEST_LEN]),
+    mut f: impl FnMut(&[u8], &[u8; DIGEST_LEN], u8),
 ) -> Result<usize, ManifestError> {
     let (_, count, mut o) = split_header(manifest)?;
     for _ in 0..count {
@@ -203,16 +229,21 @@ pub fn for_each(
         o += DIGEST_LEN;
         let key_len = u16::from_le_bytes([manifest[o], manifest[o + 1]]) as usize;
         o += 2;
+        let kind = manifest[o];
+        o += 1;
         if key_len > super::limits::MAX_PATH {
             return Err(ManifestError::TooLong {
                 len: key_len,
                 max: super::limits::MAX_PATH,
             });
         }
+        if kind > LAST_KIND {
+            return Err(ManifestError::BadKind { observed: kind });
+        }
         if o + key_len > manifest.len() {
             return Err(ManifestError::Truncated);
         }
-        f(&manifest[o..o + key_len], &digest);
+        f(&manifest[o..o + key_len], &digest, kind);
         o += key_len;
     }
     Ok(count as usize)

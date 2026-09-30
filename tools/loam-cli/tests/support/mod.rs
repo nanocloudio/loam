@@ -22,6 +22,29 @@ const READY_WITHIN: Duration = Duration::from_secs(10);
 /// test cannot leave a server holding its socket.
 pub struct Proc(Child);
 
+#[allow(
+    dead_code,
+    reason = "mounted into every suite; only the NBD suite stops a process gracefully"
+)]
+impl Proc {
+    pub fn id(&self) -> u32 {
+        self.0.id()
+    }
+
+    /// Wait for the process to exit on its own, failing the test if it
+    /// has not within `within`.
+    pub fn wait_exit(mut self, within: Duration) {
+        let start = std::time::Instant::now();
+        loop {
+            if let Ok(Some(_)) = self.0.try_wait() {
+                return;
+            }
+            assert!(start.elapsed() < within, "did not exit within {within:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
 impl Drop for Proc {
     fn drop(&mut self) {
         let _ = self.0.kill();

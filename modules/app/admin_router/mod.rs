@@ -57,6 +57,9 @@ mod body_wire;
 #[path = "../../common/mechanics/loam_object_wire.rs"]
 mod obj_wire;
 
+#[path = "../../common/mechanics/loam_volume_map_wire.rs"]
+mod map_wire;
+
 #[allow(
     dead_code,
     reason = "shared PIC body; each module shim drives a subset"

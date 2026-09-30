@@ -46,11 +46,21 @@ pub const OP_LIST: u8 = 5;
 pub const OP_REFERENCED: u8 = 6;
 pub const OP_GC_RESERVE: u8 = 7;
 pub const OP_GC_RELEASE: u8 = 8;
+pub const OP_LEASE: u8 = 9;
+/// A lease-table entry carried verbatim into a rotated WAL. Never a
+/// request: the namespace writes it into its own log and refuses it
+/// on `requests`, so no producer can set a fence directly.
+pub const OP_LEASE_RESTORE: u8 = 10;
+pub const OP_VOLUME: u8 = 11;
+pub const OP_VOLUME_ROOTS: u8 = 12;
 
 /// Refusal bytes a public PIC answers with. Named here so the response
 /// splitter can recognise them as complete one-byte records.
 pub const NAK_GENERIC: u8 = 0xFF;
 pub const NAK_RESERVED_BYTE: u8 = 0xFD;
+/// A plain record refused because it would create, replace, move or
+/// remove a volume binding, which only a fenced VOLUME record may do.
+pub const NAK_FENCED: u8 = 0xFC;
 
 /// Max paths per OP_LIST response page.
 pub const MAX_LIST_PAGE: usize = 16;
@@ -582,9 +592,9 @@ pub fn decode_list_resp(
 
 // ── GC reservation (control op: fence a descriptor's deletion) ────
 //
-//   GcReserveReq   [op=7][oid_len:u16][oid]
+//   GcReserveReq   [op=7][oid_len:u16][now_ms:u64][oid]
 //   GcReserveResp  [op=7][flag:u8]     1 = reserved, 0 = refused
-//   GcReleaseReq   [op=8][oid_len:u16][oid]
+//   GcReleaseReq   [op=8][oid_len:u16][now_ms:u64][oid]
 //   GcReleaseResp  [op=8]
 //
 // A lifecycle sweep proves an object id unbound and then deletes what
@@ -595,46 +605,78 @@ pub fn decode_list_resp(
 // The refusal is transient and distinct, so a client retries rather
 // than failing.
 //
-// Reservations are arena-only and never logged: a crash clears every
-// one of them, which is the correct restart state — an unfinished
-// sweep leaves either the descriptor (collected on a later pass) or a
-// refused bind the client re-issues.
+// Reservations are logged and, in replicated mode, proposed like any
+// mutating record, so every replica admits or refuses a bind against
+// the same set. They are NOT reinstated on replay: a reservation belongs
+// to a sweep in the process that took it, and a restart has ended that
+// sweep. An unfinished sweep leaves either the descriptor (collected on
+// a later pass) or a refused bind the client re-issues.
+//
+// `now_ms` is the sweep's server clock, stamped by the admin router as
+// for leases (0: none). A reservation decided at `now` also ends every
+// volume flush whose writer's lease has expired by then: a deposed
+// writer's commit is refused anyway, and its open flush would otherwise
+// keep every body from the sweep for as long as nobody takes the volume
+// over. The stamp is in the record, so replay ends the same flushes.
+//
+//   GcReserve  [op=OP_GC_RESERVE][oid_len:u16][now_ms:u64][oid]
+//   GcRelease  [op=OP_GC_RELEASE][oid_len:u16][0:u64][oid]
 
+const GC_RESERVE_HDR: usize = 1 + 2 + 8;
+
+/// Reserve `object_id` for deletion, decided at the sweep's `now_ms`.
 pub fn encode_gc_reserve_req(
     dst: &mut [u8],
-    release: bool,
     object_id: &[u8],
+    now_ms: u64,
+) -> Result<usize, WireError> {
+    encode_gc_record(dst, OP_GC_RESERVE, object_id, now_ms)
+}
+
+/// Release a reservation. A release decides nothing about time, so it
+/// carries none.
+pub fn encode_gc_release_req(dst: &mut [u8], object_id: &[u8]) -> Result<usize, WireError> {
+    encode_gc_record(dst, OP_GC_RELEASE, object_id, 0)
+}
+
+fn encode_gc_record(
+    dst: &mut [u8],
+    op: u8,
+    object_id: &[u8],
+    now_ms: u64,
 ) -> Result<usize, WireError> {
     check_key(&[], &[], object_id)?;
-    let needed = 3 + object_id.len();
+    let needed = GC_RESERVE_HDR + object_id.len();
     if dst.len() < needed {
         return Err(WireError::BufferTooSmall {
             needed,
             actual: dst.len(),
         });
     }
-    dst[0] = if release {
-        OP_GC_RELEASE
-    } else {
-        OP_GC_RESERVE
-    };
+    dst[0] = op;
     dst[1..3].copy_from_slice(&(object_id.len() as u16).to_le_bytes());
-    dst[3..needed].copy_from_slice(object_id);
+    dst[3..11].copy_from_slice(&now_ms.to_le_bytes());
+    dst[GC_RESERVE_HDR..needed].copy_from_slice(object_id);
     Ok(needed)
 }
 
-pub fn decode_gc_reserve_req(src: &[u8]) -> Result<&[u8], WireError> {
-    if src.len() < 3 {
+/// Decode a reserve or release record. Returns `(object_id, now_ms)`;
+/// `now_ms` is 0 on a release.
+pub fn decode_gc_reserve_req(src: &[u8]) -> Result<(&[u8], u64), WireError> {
+    if src.len() < GC_RESERVE_HDR {
         return Err(WireError::Truncated);
     }
     if src[0] != OP_GC_RESERVE && src[0] != OP_GC_RELEASE {
         return Err(WireError::BadOpcode { observed: src[0] });
     }
     let len = u16::from_le_bytes([src[1], src[2]]) as usize;
-    if src.len() < 3 + len {
+    if src.len() < GC_RESERVE_HDR + len {
         return Err(WireError::Truncated);
     }
-    Ok(&src[3..3 + len])
+    Ok((
+        &src[GC_RESERVE_HDR..GC_RESERVE_HDR + len],
+        u64::from_le_bytes(src[3..11].try_into().unwrap()),
+    ))
 }
 
 pub fn encode_gc_reserve_resp(dst: &mut [u8], reserved: bool) -> Result<usize, WireError> {
@@ -727,6 +769,525 @@ pub fn decode_referenced_resp(src: &[u8]) -> Result<(bool, u32), WireError> {
     ))
 }
 
+// ── Volume writer lease (replicated control op) ───────────────────
+//
+//   LeaseReq      [op=9][mode:u8][root_len:u16][path_len:u16]
+//                 [holder:16][now_ms:u64][ttl_ms:u32][root][path]
+//   LeaseResp     [op=9][status:u8][fence:u64][expires_at_ms:u64]
+//   LeaseRestore  [op=10][root_len:u16][path_len:u16][holder:16]
+//                 [fence:u64][expires_at_ms:u64][stamp_ms:u64][flags:u8]
+//                 [fence_floor:u64][stamp_floor:u64][root][path]
+//                 flags: bit 0 live, bit 1 a volume flush is open
+//
+// One writer per volume, and a fence token that grows every time the
+// writer changes, so a store can refuse a write from a holder that has
+// since been replaced. The lease is decided where records are ORDERED —
+// applied in log order on every replica, like a GC reservation — so
+// two nodes cannot each grant it to a different holder.
+//
+// `now_ms` is part of the record because expiry is a comparison
+// against time, and a replica that consulted its own clock at apply
+// time would decide differently from the one that proposed it, and
+// differently again on replay. The admin router stamps it from the
+// server's wall clock; a client never supplies it.
+//
+// The response always has the same shape. On a refusal `fence` and
+// `expires_at_ms` describe the lease that stands (zero when there is
+// none), which is what a contender needs to know when to try again.
+
+pub const LEASE_ACQUIRE: u8 = 1;
+pub const LEASE_RENEW: u8 = 2;
+pub const LEASE_RELEASE: u8 = 3;
+
+/// Opaque identity of a lease holder, chosen by the writer.
+pub const LEASE_HOLDER_LEN: usize = 16;
+
+/// Lease response statuses.
+pub const LEASE_GRANTED: u8 = 0;
+/// Another holder's lease is live and unexpired.
+pub const LEASE_HELD: u8 = 1;
+/// The caller does not hold a live lease: never acquired, released,
+/// expired, or taken over. A writer told this must stop writing.
+pub const LEASE_LOST: u8 = 2;
+/// The lease table is full of live leases. Retry later.
+pub const LEASE_BUSY: u8 = 3;
+/// Malformed: unknown mode, a TTL outside `1..=LEASE_TTL_MAX_MS`, or
+/// no time to judge expiry against.
+pub const LEASE_BAD_REQ: u8 = 4;
+/// Stamped no later than a record already applied to this volume, so
+/// it is either a redelivered duplicate or was stamped by a clock
+/// behind the one that stamped its predecessor. Refused without effect;
+/// a fresh request carries a fresh stamp.
+pub const LEASE_STALE: u8 = 5;
+
+const LEASE_REQ_HDR: usize = 1 + 1 + 2 + 2 + LEASE_HOLDER_LEN + 8 + 4;
+pub const LEASE_RESP_LEN: usize = 1 + 1 + 8 + 8;
+const LEASE_RESTORE_HDR: usize = 1 + 2 + 2 + LEASE_HOLDER_LEN + 8 + 8 + 8 + 1 + 8 + 8;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedLeaseReq<'a> {
+    pub mode: u8,
+    pub namespace_root: &'a [u8],
+    pub path: &'a [u8],
+    pub holder: [u8; LEASE_HOLDER_LEN],
+    pub now_ms: u64,
+    pub ttl_ms: u32,
+}
+
+pub fn encode_lease_req(
+    dst: &mut [u8],
+    mode: u8,
+    namespace_root: &[u8],
+    path: &[u8],
+    holder: &[u8; LEASE_HOLDER_LEN],
+    now_ms: u64,
+    ttl_ms: u32,
+) -> Result<usize, WireError> {
+    check_key(namespace_root, path, &[])?;
+    let needed = LEASE_REQ_HDR + namespace_root.len() + path.len();
+    if dst.len() < needed {
+        return Err(WireError::BufferTooSmall {
+            needed,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = OP_LEASE;
+    dst[1] = mode;
+    dst[2..4].copy_from_slice(&(namespace_root.len() as u16).to_le_bytes());
+    dst[4..6].copy_from_slice(&(path.len() as u16).to_le_bytes());
+    dst[6..22].copy_from_slice(holder);
+    dst[22..30].copy_from_slice(&now_ms.to_le_bytes());
+    dst[30..34].copy_from_slice(&ttl_ms.to_le_bytes());
+    let mut cursor = LEASE_REQ_HDR;
+    dst[cursor..cursor + namespace_root.len()].copy_from_slice(namespace_root);
+    cursor += namespace_root.len();
+    dst[cursor..cursor + path.len()].copy_from_slice(path);
+    Ok(needed)
+}
+
+/// Decode a lease request. The mode and TTL are carried through
+/// unjudged: refusing them is the state machine's answer
+/// (`LEASE_BAD_REQ`), not a framing error.
+pub fn decode_lease_req(src: &[u8]) -> Result<DecodedLeaseReq<'_>, WireError> {
+    if src.len() < LEASE_REQ_HDR {
+        return Err(WireError::Truncated);
+    }
+    if src[0] != OP_LEASE {
+        return Err(WireError::BadOpcode { observed: src[0] });
+    }
+    let ns_len = u16::from_le_bytes([src[2], src[3]]) as usize;
+    let path_len = u16::from_le_bytes([src[4], src[5]]) as usize;
+    let total = LEASE_REQ_HDR + ns_len + path_len;
+    if src.len() < total {
+        return Err(WireError::Truncated);
+    }
+    let ns = &src[LEASE_REQ_HDR..LEASE_REQ_HDR + ns_len];
+    let path = &src[LEASE_REQ_HDR + ns_len..total];
+    check_key(ns, path, &[])?;
+    let mut holder = [0u8; LEASE_HOLDER_LEN];
+    holder.copy_from_slice(&src[6..22]);
+    Ok(DecodedLeaseReq {
+        mode: src[1],
+        namespace_root: ns,
+        path,
+        holder,
+        now_ms: u64::from_le_bytes(src[22..30].try_into().unwrap()),
+        ttl_ms: u32::from_le_bytes(src[30..34].try_into().unwrap()),
+    })
+}
+
+pub fn encode_lease_resp(
+    dst: &mut [u8],
+    status: u8,
+    fence: u64,
+    expires_at_ms: u64,
+) -> Result<usize, WireError> {
+    if dst.len() < LEASE_RESP_LEN {
+        return Err(WireError::BufferTooSmall {
+            needed: LEASE_RESP_LEN,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = OP_LEASE;
+    dst[1] = status;
+    dst[2..10].copy_from_slice(&fence.to_le_bytes());
+    dst[10..18].copy_from_slice(&expires_at_ms.to_le_bytes());
+    Ok(LEASE_RESP_LEN)
+}
+
+/// Returns `(status, fence, expires_at_ms)`.
+pub fn decode_lease_resp(src: &[u8]) -> Result<(u8, u64, u64), WireError> {
+    if src.len() < LEASE_RESP_LEN {
+        return Err(WireError::Truncated);
+    }
+    if src[0] != OP_LEASE {
+        return Err(WireError::BadOpcode { observed: src[0] });
+    }
+    Ok((
+        src[1],
+        u64::from_le_bytes(src[2..10].try_into().unwrap()),
+        u64::from_le_bytes(src[10..18].try_into().unwrap()),
+    ))
+}
+
+/// One lease-table entry plus the table's floors, as the record that
+/// reinstates them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedLeaseRestore<'a> {
+    pub namespace_root: &'a [u8],
+    pub path: &'a [u8],
+    pub holder: [u8; LEASE_HOLDER_LEN],
+    pub fence: u64,
+    pub expires_at_ms: u64,
+    pub stamp_ms: u64,
+    pub live: bool,
+    pub fence_floor: u64,
+    pub stamp_floor: u64,
+}
+
+pub fn encode_lease_restore(
+    dst: &mut [u8],
+    r: &DecodedLeaseRestore<'_>,
+) -> Result<usize, WireError> {
+    check_key(r.namespace_root, r.path, &[])?;
+    let needed = LEASE_RESTORE_HDR + r.namespace_root.len() + r.path.len();
+    if dst.len() < needed {
+        return Err(WireError::BufferTooSmall {
+            needed,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = OP_LEASE_RESTORE;
+    dst[1..3].copy_from_slice(&(r.namespace_root.len() as u16).to_le_bytes());
+    dst[3..5].copy_from_slice(&(r.path.len() as u16).to_le_bytes());
+    dst[5..21].copy_from_slice(&r.holder);
+    dst[21..29].copy_from_slice(&r.fence.to_le_bytes());
+    dst[29..37].copy_from_slice(&r.expires_at_ms.to_le_bytes());
+    dst[37..45].copy_from_slice(&r.stamp_ms.to_le_bytes());
+    dst[45] = u8::from(r.live);
+    dst[46..54].copy_from_slice(&r.fence_floor.to_le_bytes());
+    dst[54..62].copy_from_slice(&r.stamp_floor.to_le_bytes());
+    let mut cursor = LEASE_RESTORE_HDR;
+    dst[cursor..cursor + r.namespace_root.len()].copy_from_slice(r.namespace_root);
+    cursor += r.namespace_root.len();
+    dst[cursor..cursor + r.path.len()].copy_from_slice(r.path);
+    Ok(needed)
+}
+
+/// Restore-record flag bits (byte 45).
+pub const LEASE_RESTORE_LIVE: u8 = 1;
+pub const LEASE_RESTORE_FLUSHING: u8 = 2;
+
+/// Mark an encoded restore record as carrying an open volume flush.
+/// A flush open when the log rotates must still be open on replay: a
+/// commit after the rotation was admitted because of it, and replay
+/// must admit it too or the log would rebuild a different volume.
+pub fn mark_lease_restore_flushing(record: &mut [u8]) -> bool {
+    if record.first() != Some(&OP_LEASE_RESTORE) {
+        return false;
+    }
+    match record.get_mut(45) {
+        Some(b) => {
+            *b |= LEASE_RESTORE_FLUSHING;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Does a restore record carry an open volume flush?
+pub fn lease_restore_flushing(src: &[u8]) -> bool {
+    src.first() == Some(&OP_LEASE_RESTORE)
+        && src.get(45).is_some_and(|b| b & LEASE_RESTORE_FLUSHING != 0)
+}
+
+pub fn decode_lease_restore(src: &[u8]) -> Result<DecodedLeaseRestore<'_>, WireError> {
+    if src.len() < LEASE_RESTORE_HDR {
+        return Err(WireError::Truncated);
+    }
+    if src[0] != OP_LEASE_RESTORE {
+        return Err(WireError::BadOpcode { observed: src[0] });
+    }
+    let ns_len = u16::from_le_bytes([src[1], src[2]]) as usize;
+    let path_len = u16::from_le_bytes([src[3], src[4]]) as usize;
+    let total = LEASE_RESTORE_HDR + ns_len + path_len;
+    if src.len() < total {
+        return Err(WireError::Truncated);
+    }
+    let ns = &src[LEASE_RESTORE_HDR..LEASE_RESTORE_HDR + ns_len];
+    let path = &src[LEASE_RESTORE_HDR + ns_len..total];
+    check_key(ns, path, &[])?;
+    let mut holder = [0u8; LEASE_HOLDER_LEN];
+    holder.copy_from_slice(&src[5..21]);
+    Ok(DecodedLeaseRestore {
+        namespace_root: ns,
+        path,
+        holder,
+        fence: u64::from_le_bytes(src[21..29].try_into().unwrap()),
+        expires_at_ms: u64::from_le_bytes(src[29..37].try_into().unwrap()),
+        stamp_ms: u64::from_le_bytes(src[37..45].try_into().unwrap()),
+        live: src[45] & LEASE_RESTORE_LIVE != 0,
+        fence_floor: u64::from_le_bytes(src[46..54].try_into().unwrap()),
+        stamp_floor: u64::from_le_bytes(src[54..62].try_into().unwrap()),
+    })
+}
+
+// ── Volume commit (replicated control op) ─────────────────────────
+//
+//   VolumeReq   [op=11][mode:u8][root_len:u16][path_len:u16][oid_len:u16]
+//               [holder:16][fence:u64][expected:u64][now_ms:u64]
+//               [root][path][oid]
+//   VolumeResp  [op=11][status:u8][revision:u64]
+//
+// A volume's committed state is its path bound to a map root digest
+// (`loam_volume_map_wire.rs`). A writer moves it forward in three
+// steps, each a record ordered with every bind, lease and GC
+// reservation:
+//
+//   BEGIN   opens a flush: from here until COMMIT or ABORT the orphan
+//           GC treats every body as referenced, because the flush is
+//           writing bodies no bound root reaches yet. Refused while a
+//           GC reservation stands, so a sweep that has proven a body
+//           unreferenced deletes it before any flush can begin.
+//   COMMIT  binds the path to `oid` at `expected + 1`, only if the
+//           current revision is exactly `expected` (0: unbound), and
+//           only for the holder of the volume's live lease under
+//           `fence` with a flush open. Ends the flush either way.
+//   ABORT   ends the holder's flush without binding.
+//   DELETE  unbinds the path, under the same lease and CAS as COMMIT.
+//
+// A plain BIND, RENAME or UNBIND is refused when it would create,
+// replace, move or remove a volume binding: those records carry no
+// fence, and every change to a volume is fenced.
+//
+// `now_ms` is stamped by the admin router, as for leases: lease expiry
+// is judged against it, so every replica and every replay agrees.
+//
+// `revision` in the response is the new revision on a commit, and the
+// current one otherwise — on a CONFLICT it is what the writer lost to.
+
+pub const VOLUME_BEGIN: u8 = 1;
+pub const VOLUME_COMMIT: u8 = 2;
+pub const VOLUME_ABORT: u8 = 3;
+/// Unbind the volume's path, under its live lease and exact fence, only
+/// if the current revision is `expected`. A plain UNBIND of a volume is
+/// refused: deletion is fenced like any other change to a volume.
+pub const VOLUME_DELETE: u8 = 4;
+
+pub const VOLUME_OK: u8 = 0;
+/// The current revision is not the one the commit was prepared on:
+/// another commit landed first. The writer must reopen; its flush is
+/// orphaned.
+pub const VOLUME_CONFLICT: u8 = 1;
+/// No live lease for this holder under this fence (never held,
+/// expired, released, or taken over). The writer must stop.
+pub const VOLUME_LEASE_LOST: u8 = 2;
+/// A GC reservation is in force; retry the BEGIN shortly.
+pub const VOLUME_RESERVED: u8 = 3;
+/// Malformed: unknown mode, no stamped time, a commit with no flush
+/// open, or a commit naming no object.
+pub const VOLUME_BAD_REQ: u8 = 4;
+
+const VOLUME_REQ_HDR: usize = 1 + 1 + 2 + 2 + 2 + LEASE_HOLDER_LEN + 8 + 8 + 8;
+pub const VOLUME_RESP_LEN: usize = 1 + 1 + 8;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedVolumeReq<'a> {
+    pub mode: u8,
+    pub namespace_root: &'a [u8],
+    pub path: &'a [u8],
+    pub object_id: &'a [u8],
+    pub holder: [u8; LEASE_HOLDER_LEN],
+    pub fence: u64,
+    pub expected: u64,
+    pub now_ms: u64,
+}
+
+pub fn encode_volume_req(dst: &mut [u8], r: &DecodedVolumeReq<'_>) -> Result<usize, WireError> {
+    check_key(r.namespace_root, r.path, r.object_id)?;
+    let needed = VOLUME_REQ_HDR + r.namespace_root.len() + r.path.len() + r.object_id.len();
+    if dst.len() < needed {
+        return Err(WireError::BufferTooSmall {
+            needed,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = OP_VOLUME;
+    dst[1] = r.mode;
+    dst[2..4].copy_from_slice(&(r.namespace_root.len() as u16).to_le_bytes());
+    dst[4..6].copy_from_slice(&(r.path.len() as u16).to_le_bytes());
+    dst[6..8].copy_from_slice(&(r.object_id.len() as u16).to_le_bytes());
+    dst[8..24].copy_from_slice(&r.holder);
+    dst[24..32].copy_from_slice(&r.fence.to_le_bytes());
+    dst[32..40].copy_from_slice(&r.expected.to_le_bytes());
+    dst[40..48].copy_from_slice(&r.now_ms.to_le_bytes());
+    let mut cursor = VOLUME_REQ_HDR;
+    dst[cursor..cursor + r.namespace_root.len()].copy_from_slice(r.namespace_root);
+    cursor += r.namespace_root.len();
+    dst[cursor..cursor + r.path.len()].copy_from_slice(r.path);
+    cursor += r.path.len();
+    dst[cursor..cursor + r.object_id.len()].copy_from_slice(r.object_id);
+    Ok(needed)
+}
+
+/// Decode a volume request. The mode is carried through unjudged:
+/// refusing it is the namespace's verdict (`VOLUME_BAD_REQ`).
+pub fn decode_volume_req(src: &[u8]) -> Result<DecodedVolumeReq<'_>, WireError> {
+    if src.len() < VOLUME_REQ_HDR {
+        return Err(WireError::Truncated);
+    }
+    if src[0] != OP_VOLUME {
+        return Err(WireError::BadOpcode { observed: src[0] });
+    }
+    let ns_len = u16::from_le_bytes([src[2], src[3]]) as usize;
+    let path_len = u16::from_le_bytes([src[4], src[5]]) as usize;
+    let oid_len = u16::from_le_bytes([src[6], src[7]]) as usize;
+    let total = VOLUME_REQ_HDR + ns_len + path_len + oid_len;
+    if src.len() < total {
+        return Err(WireError::Truncated);
+    }
+    let ns = &src[VOLUME_REQ_HDR..VOLUME_REQ_HDR + ns_len];
+    let path = &src[VOLUME_REQ_HDR + ns_len..VOLUME_REQ_HDR + ns_len + path_len];
+    let oid = &src[VOLUME_REQ_HDR + ns_len + path_len..total];
+    check_key(ns, path, oid)?;
+    let mut holder = [0u8; LEASE_HOLDER_LEN];
+    holder.copy_from_slice(&src[8..24]);
+    Ok(DecodedVolumeReq {
+        mode: src[1],
+        namespace_root: ns,
+        path,
+        object_id: oid,
+        holder,
+        fence: u64::from_le_bytes(src[24..32].try_into().unwrap()),
+        expected: u64::from_le_bytes(src[32..40].try_into().unwrap()),
+        now_ms: u64::from_le_bytes(src[40..48].try_into().unwrap()),
+    })
+}
+
+pub fn encode_volume_resp(dst: &mut [u8], status: u8, revision: u64) -> Result<usize, WireError> {
+    if dst.len() < VOLUME_RESP_LEN {
+        return Err(WireError::BufferTooSmall {
+            needed: VOLUME_RESP_LEN,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = OP_VOLUME;
+    dst[1] = status;
+    dst[2..10].copy_from_slice(&revision.to_le_bytes());
+    Ok(VOLUME_RESP_LEN)
+}
+
+/// Returns `(status, revision)`.
+pub fn decode_volume_resp(src: &[u8]) -> Result<(u8, u64), WireError> {
+    if src.len() < VOLUME_RESP_LEN {
+        return Err(WireError::Truncated);
+    }
+    if src[0] != OP_VOLUME {
+        return Err(WireError::BadOpcode { observed: src[0] });
+    }
+    Ok((src[1], u64::from_le_bytes(src[2..10].try_into().unwrap())))
+}
+
+// ── Volume roots (read op: the orphan GC's map walk) ──────────────
+//
+//   VolumeRootsReq   [op=12][cursor:u32]
+//   VolumeRootsResp  [op=12][next_cursor:u32][view:u64][count:u8]
+//                    [digest:32 × count]
+//
+// One page of the root digests every volume binding names, in any
+// root — live volumes and snapshots alike, since a snapshot of a
+// volume is a binding of its root digest. `next_cursor` 0 ends the
+// walk. `view` names the on-disk snapshot generation the cursor walks;
+// a walk whose pages disagree on it crossed a compaction and must not
+// be trusted to have seen every binding. Each page examines a bounded
+// number of slots, so it may come back empty with a cursor to resume.
+
+/// Root digests per response page. Kept small enough that a page fits
+/// the namespace's 256-byte reply.
+pub const MAX_VOLUME_ROOTS: usize = 6;
+pub const VOLUME_ROOTS_HDR: usize = 1 + 4 + 8 + 1;
+const VOLUME_ROOT_DIGEST: usize = 32;
+
+pub fn encode_volume_roots_req(dst: &mut [u8], cursor: u32) -> Result<usize, WireError> {
+    if dst.len() < 5 {
+        return Err(WireError::BufferTooSmall {
+            needed: 5,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = OP_VOLUME_ROOTS;
+    dst[1..5].copy_from_slice(&cursor.to_le_bytes());
+    Ok(5)
+}
+
+pub fn decode_volume_roots_req(src: &[u8]) -> Result<u32, WireError> {
+    if src.len() < 5 {
+        return Err(WireError::Truncated);
+    }
+    if src[0] != OP_VOLUME_ROOTS {
+        return Err(WireError::BadOpcode { observed: src[0] });
+    }
+    Ok(u32::from_le_bytes([src[1], src[2], src[3], src[4]]))
+}
+
+pub fn encode_volume_roots_resp(
+    dst: &mut [u8],
+    next_cursor: u32,
+    view: u64,
+    digests: &[[u8; VOLUME_ROOT_DIGEST]],
+) -> Result<usize, WireError> {
+    if digests.len() > MAX_VOLUME_ROOTS {
+        return Err(WireError::StringTooLong {
+            len: digests.len(),
+            max: MAX_VOLUME_ROOTS,
+        });
+    }
+    let needed = VOLUME_ROOTS_HDR + digests.len() * VOLUME_ROOT_DIGEST;
+    if dst.len() < needed {
+        return Err(WireError::BufferTooSmall {
+            needed,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = OP_VOLUME_ROOTS;
+    dst[1..5].copy_from_slice(&next_cursor.to_le_bytes());
+    dst[5..13].copy_from_slice(&view.to_le_bytes());
+    dst[13] = digests.len() as u8;
+    let mut at = VOLUME_ROOTS_HDR;
+    for d in digests {
+        dst[at..at + VOLUME_ROOT_DIGEST].copy_from_slice(d);
+        at += VOLUME_ROOT_DIGEST;
+    }
+    Ok(needed)
+}
+
+/// Returns `(next_cursor, view, digests)`, `digests` being
+/// `count × 32` bytes.
+pub fn decode_volume_roots_resp(src: &[u8]) -> Result<(u32, u64, &[u8]), WireError> {
+    if src.len() < VOLUME_ROOTS_HDR {
+        return Err(WireError::Truncated);
+    }
+    if src[0] != OP_VOLUME_ROOTS {
+        return Err(WireError::BadOpcode { observed: src[0] });
+    }
+    let count = src[13] as usize;
+    if count > MAX_VOLUME_ROOTS {
+        return Err(WireError::StringTooLong {
+            len: count,
+            max: MAX_VOLUME_ROOTS,
+        });
+    }
+    let total = VOLUME_ROOTS_HDR + count * VOLUME_ROOT_DIGEST;
+    if src.len() < total {
+        return Err(WireError::Truncated);
+    }
+    Ok((
+        u32::from_le_bytes([src[1], src[2], src[3], src[4]]),
+        u64::from_le_bytes(src[5..13].try_into().unwrap()),
+        &src[VOLUME_ROOTS_HDR..total],
+    ))
+}
+
 // ── Opcode peek ────────────────────────────────────────────────────
 
 pub fn peek_opcode(src: &[u8]) -> Option<u8> {
@@ -779,11 +1340,19 @@ pub fn response_record_len(src: &[u8]) -> Result<Option<usize>, WireError> {
     };
     match opcode {
         // Bare acks: the applied opcode echoed back, or a refusal.
-        OP_BIND | OP_RENAME | OP_UNBIND | OP_GC_RELEASE | NAK_GENERIC | NAK_RESERVED_BYTE => {
-            complete(1)
-        }
+        OP_BIND | OP_RENAME | OP_UNBIND | OP_GC_RELEASE | NAK_GENERIC | NAK_RESERVED_BYTE
+        | NAK_FENCED => complete(1),
         // [op][flag]
         OP_GC_RESERVE => complete(2),
+        // [op][status][fence:u64][expires_at:u64]
+        OP_LEASE => complete(LEASE_RESP_LEN),
+        // [op][status][revision:u64]
+        OP_VOLUME => complete(VOLUME_RESP_LEN),
+        // [op][next:u32][view:u64][count][digest:32 × count]
+        OP_VOLUME_ROOTS => match src.get(13) {
+            None => Ok(None),
+            Some(&count) => complete(VOLUME_ROOTS_HDR + count as usize * VOLUME_ROOT_DIGEST),
+        },
         // [op][status], and when FOUND: [oid_len][oid][rev:u64][kind]
         OP_LOOKUP => match src.get(1) {
             None => Ok(None),
@@ -843,8 +1412,15 @@ pub fn request_record_len(src: &[u8]) -> Result<Option<usize>, WireError> {
         OP_LIST => (8, [1, 0, 0]),
         // [op][cursor:u32][oid_len:u16]
         OP_REFERENCED => (7, [5, 0, 0]),
-        // [op][oid_len:u16]
-        OP_GC_RESERVE | OP_GC_RELEASE => (3, [1, 0, 0]),
+        // [op][oid_len:u16][now:u64]
+        OP_GC_RESERVE | OP_GC_RELEASE => (GC_RESERVE_HDR, [1, 0, 0]),
+        // [op][mode][root_len:u16][path_len:u16][holder:16][now:u64][ttl:u32]
+        OP_LEASE => (LEASE_REQ_HDR, [2, 4, 0]),
+        // [op][mode][root_len:u16][path_len:u16][oid_len:u16][holder:16]
+        // [fence:u64][expected:u64][now:u64]
+        OP_VOLUME => (VOLUME_REQ_HDR, [2, 4, 6]),
+        // [op][cursor:u32]
+        OP_VOLUME_ROOTS => (5, [0, 0, 0]),
         observed => return Err(WireError::BadOpcode { observed }),
     };
     if src.len() < header {

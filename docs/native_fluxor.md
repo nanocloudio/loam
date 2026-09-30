@@ -17,11 +17,12 @@ a public module. The declaration is the module's own
 it internal. `loam surfaces --modules modules` reads those manifests
 and prints the result, so there is no second table to drift.
 
-ONE module declares a surface, and it is the one that can answer it:
+Two modules declare a surface, and each is the one that can answer it:
 
 | Module | Fluxor surface | Ops | Fence it returns |
 | --- | --- | --- | --- |
-| `namespace_router` | `storage.namespace` | `LOOKUP` `STAT` `CLOSE` `BIND` `RENAME` `DELETE` `SUBSCRIBE` `CHANGES` `CAPS` | `ReplicatedDurable` on the quorum path, `LocalDurable` WAL-only, `Volatile` with no WAL |
+| `namespace_router` | `storage.namespace` | `LOOKUP` `STAT` `CLOSE` `BIND` `RENAME` `DELETE` `SUBSCRIBE` `CHANGES` `CAPS`, by provider dispatch | `ReplicatedDurable` on the quorum path, `LocalDurable` WAL-only, `Volatile` with no WAL |
+| `loam_volume` | `storage.block` | `CAPS` `EXEC` `SUBMIT` `REAP` on its `blocks` channel; `READ`, `WRITE`, `FLUSH`, with `FUA` and `PREFLUSH`. `DISCARD` is not advertised and is refused | `Volatile` for a staged write; `RevisionMonotone` at the volume's committed revision for a flush, a `FUA` write or a `PREFLUSH` |
 
 `LIST` (0x1302) is the one surface op the provider dispatch answers
 `ENOSYS` to. It is served on the channel wire instead
@@ -40,8 +41,8 @@ Two nearby modules deliberately claim NOTHING. `object_index`
 holds descriptors, so it cannot answer `storage.object`, which is
 whole-blob byte access — it has no bytes to return.
 `block_allocator` does volume accounting, so it cannot answer
-`storage.block`, which is raw block I/O owned by fluxor's `sd` /
-`nvme` / `flash_rp`. Either claim would be one nothing could
+`storage.block`, which is raw block I/O — in loam that is
+`loam_volume`, which serves a volume's bytes. Either claim would be one nothing could
 honour, and by-contract resolution is precisely the mechanism that
 would route a real consumer to it. The `storage.object` surface is a
 composition — descriptors here, bytes from the body plane — which

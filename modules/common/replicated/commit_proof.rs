@@ -9,8 +9,8 @@
 // functions rather than about any graph they run in.
 //
 // The includer's scope must provide `super::sha256::Sha256` — the
-// same discipline `loam_extent_wire.rs` uses, so a consumer that
-// needs no witness pays for no hash.
+// same discipline `loam_ec_wire.rs` uses, so a consumer that needs no
+// witness pays for no hash.
 
 /// Domain separator, so a commit witness can never collide with a
 /// digest this store computed for some other purpose over the same

@@ -56,8 +56,14 @@ fn handshake(s: &mut TcpStream) -> u64 {
 }
 
 fn request(s: &mut TcpStream, cmd: u16, handle: u64, offset: u64, len: u32) {
+    request_flagged(s, 0, cmd, handle, offset, len)
+}
+
+const NBD_CMD_FLAG_FUA: u16 = 1;
+
+fn request_flagged(s: &mut TcpStream, flags: u16, cmd: u16, handle: u64, offset: u64, len: u32) {
     s.write_all(&NBD_REQUEST_MAGIC.to_be_bytes()).unwrap();
-    s.write_all(&0u16.to_be_bytes()).unwrap(); // command flags
+    s.write_all(&flags.to_be_bytes()).unwrap();
     s.write_all(&cmd.to_be_bytes()).unwrap();
     s.write_all(&handle.to_be_bytes()).unwrap();
     s.write_all(&offset.to_be_bytes()).unwrap();
@@ -76,6 +82,30 @@ fn reply(s: &mut TcpStream) -> (u32, u64) {
         u32::from_be_bytes(hdr[4..8].try_into().unwrap()),
         u64::from_be_bytes(hdr[8..16].try_into().unwrap()),
     )
+}
+
+fn nbd_command(sock: &std::path::Path) -> Command {
+    let mut ncmd = Command::new(env!("CARGO_BIN_EXE_loam-nbd"));
+    ncmd.args([
+        "--socket",
+        sock.to_str().unwrap(),
+        "--volume",
+        "vol:/disk",
+        "--listen",
+        "127.0.0.1:0",
+    ]);
+    ncmd
+}
+
+/// The whole volume, read through a fresh admin connection — which the
+/// server grants only once the NBD server holding its one connection
+/// has gone.
+fn read_back(sock: &std::path::Path) -> Vec<u8> {
+    let mut c = LoamClient::connect(sock).unwrap();
+    let mut vol = c.open_volume(b"vol", b"/disk").unwrap().unwrap();
+    let mut out = vec![0u8; vol.size_bytes as usize];
+    c.volume_read(&mut vol, 0, &mut out).unwrap();
+    out
 }
 
 fn setup() -> (tempfile::TempDir, Proc, Proc, String) {
@@ -101,16 +131,7 @@ fn setup() -> (tempfile::TempDir, Proc, Proc, String) {
     c.create_volume(b"vol", b"/disk", 64 * 1024, 4096).unwrap();
     drop(c);
 
-    let mut ncmd = Command::new(env!("CARGO_BIN_EXE_loam-nbd"));
-    ncmd.args([
-        "--socket",
-        sock.to_str().unwrap(),
-        "--volume",
-        "vol:/disk",
-        "--listen",
-        "127.0.0.1:0",
-    ]);
-    let (nbd, line) = spawn_ready(ncmd, "[loam-nbd] serving");
+    let (nbd, line) = spawn_ready(nbd_command(&sock), "[loam-nbd] serving");
     (dir, server, nbd, announced_addr(&line).to_string())
 }
 
@@ -128,7 +149,7 @@ fn the_handshake_reports_the_volume_size() {
 }
 
 #[test]
-fn a_write_then_read_round_trips_through_the_extent_plane() {
+fn a_write_then_read_round_trips_through_the_volume() {
     let (_d, _s, _n, addr) = setup();
     let mut c = TcpStream::connect(&addr).unwrap();
     assert_eq!(handshake(&mut c), 64 * 1024);
@@ -165,16 +186,116 @@ fn a_write_then_read_round_trips_through_the_extent_plane() {
     c.flush().unwrap();
 }
 
+/// FLUSH is the durability point: it is answered only after the commit,
+/// so what was written before it is there for a fresh reader even if the
+/// server dies the instant after — and what was written after it, never
+/// flushed, is simply not there, rather than half there.
 #[test]
-fn flush_is_answered_because_a_loam_write_is_already_durable() {
-    let (_d, _s, _n, addr) = setup();
+fn a_flush_commits_so_a_fresh_reader_sees_the_write() {
+    let (dir, _server, nbd, addr) = setup();
+    let sock = dir.path().join("admin.sock");
     let mut c = TcpStream::connect(&addr).unwrap();
     handshake(&mut c);
-    request(&mut c, NBD_CMD_FLUSH, 7, 0, 0);
+
+    let flushed = vec![0x5Au8; 6000];
+    request(&mut c, NBD_CMD_WRITE, 1, 1000, flushed.len() as u32);
+    c.write_all(&flushed).unwrap();
     c.flush().unwrap();
-    let (err, handle) = reply(&mut c);
-    assert_eq!(err, 0, "flush is answered OK, not refused");
-    assert_eq!(handle, 7);
+    assert_eq!(reply(&mut c), (0, 1));
+    request(&mut c, NBD_CMD_FLUSH, 2, 0, 0);
+    c.flush().unwrap();
+    assert_eq!(
+        reply(&mut c),
+        (0, 2),
+        "the flush is answered once committed"
+    );
+
+    let unflushed = vec![0xA5u8; 4096];
+    request(&mut c, NBD_CMD_WRITE, 3, 32_768, unflushed.len() as u32);
+    c.write_all(&unflushed).unwrap();
+    c.flush().unwrap();
+    assert_eq!(reply(&mut c), (0, 3));
+
+    // The server dies without warning (SIGKILL), mid-session.
+    drop(nbd);
+    let all = read_back(&sock);
+    assert_eq!(
+        &all[1000..7000],
+        &flushed[..],
+        "the flushed write is durable"
+    );
+    assert!(all[..1000].iter().all(|&b| b == 0));
+    assert!(
+        all[32_768..32_768 + 4096].iter().all(|&b| b == 0),
+        "the write after the last flush was never committed"
+    );
+}
+
+#[test]
+fn a_fua_write_is_durable_when_it_is_answered() {
+    let (dir, _server, nbd, addr) = setup();
+    let sock = dir.path().join("admin.sock");
+    let mut c = TcpStream::connect(&addr).unwrap();
+    handshake(&mut c);
+    let data = vec![0x3Cu8; 5000];
+    request_flagged(
+        &mut c,
+        NBD_CMD_FLAG_FUA,
+        NBD_CMD_WRITE,
+        4,
+        20_000,
+        data.len() as u32,
+    );
+    c.write_all(&data).unwrap();
+    c.flush().unwrap();
+    assert_eq!(reply(&mut c), (0, 4));
+    drop(nbd);
+    assert_eq!(&read_back(&sock)[20_000..25_000], &data[..]);
+}
+
+/// The server holds the volume's writer lease for as long as it runs,
+/// so a second server on the same volume is refused rather than allowed
+/// to write beside the first — even after the first died without giving
+/// the lease back, until its lease lapses.
+#[test]
+fn a_second_server_on_the_same_volume_is_refused_by_the_lease() {
+    let (dir, _server, nbd, _addr) = setup();
+    let sock = dir.path().join("admin.sock");
+    drop(nbd); // SIGKILL: the lease is not released
+    let out = nbd_command(&sock).output().expect("run a second loam-nbd");
+    assert!(!out.status.success(), "the second server must not start");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("lease held"),
+        "refused for the lease, not something else: {stderr}"
+    );
+}
+
+/// An orderly stop commits what is staged and gives the lease back, so
+/// the next server starts at once.
+#[test]
+fn a_stopped_server_releases_the_lease_for_the_next() {
+    let (dir, _server, nbd, addr) = setup();
+    let sock = dir.path().join("admin.sock");
+    let mut c = TcpStream::connect(&addr).unwrap();
+    handshake(&mut c);
+    request(&mut c, NBD_CMD_WRITE, 1, 0, 3);
+    c.write_all(b"abc").unwrap();
+    c.flush().unwrap();
+    assert_eq!(reply(&mut c), (0, 1));
+    request(&mut c, NBD_CMD_DISC, 2, 0, 0);
+    c.flush().unwrap();
+    drop(c);
+
+    // SIGTERM, then wait for the process to exit on its own.
+    let rc = Command::new("kill")
+        .args(["-TERM", &nbd.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(rc.success());
+    nbd.wait_exit(std::time::Duration::from_secs(10));
+    assert_eq!(&read_back(&sock)[..3], b"abc", "committed on the way out");
+    let (_next, _) = spawn_ready(nbd_command(&sock), "[loam-nbd] serving");
 }
 
 #[test]

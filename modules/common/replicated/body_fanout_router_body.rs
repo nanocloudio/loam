@@ -108,9 +108,9 @@ pub struct JoinSlot {
     /// PUT: digest from the first replica OK. GET/HEAD: the
     /// requested digest (needed to re-encode fallback requests).
     pub digest: [u8; super::body_wire::DIGEST_LEN],
-    /// The blob this join is about is KEYED — a block extent or an
-    /// EC shard — so `digest` above is its KEY, not a content hash,
-    /// and a repair must re-PUT it under that key.
+    /// The blob this join is about is KEYED — an EC shard — so
+    /// `digest` above is its KEY, not a content hash, and a repair must
+    /// re-PUT it under that key.
     ///
     /// Carried through probe → fetch → repair because the repair is
     /// where it matters and the scan is where it is known.
@@ -1540,13 +1540,11 @@ unsafe fn scrub_apply_scan(
         scrub_next_target(s);
     }
     for (i, d) in digests.iter().take(count).enumerate() {
-        // Keyed blobs — block extents and EC shards — are scrubbed
-        // like any other. `keyed` has to travel with the join for
-        // that to work: without it the repair re-PUT would store the
-        // blob under a content hash instead of its key, which is why
-        // the flag is carried rather than recomputed. It is also the
-        // difference between the block data path having
-        // replication-level repair and having none.
+        // Keyed blobs — EC shards — are scrubbed like any other.
+        // `keyed` has to travel with the join for that to work: without
+        // it the repair re-PUT would store the blob under a content hash
+        // instead of its key, which is why the flag is carried rather
+        // than recomputed.
         //
         // Placement needs no special case: a keyed blob ranks by its
         // KEY, and `rank_targets` hashes whatever it is given.

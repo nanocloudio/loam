@@ -1,20 +1,22 @@
 //! NBD server over a loam block volume — the device protocol that
 //! makes the block plane mountable.
 //!
-//! The extent plane already has volume descriptors, derived-key
-//! mutable extents, read-modify-write and replication. What NBD adds
-//! is a peer a kernel can talk to, and it is the shortest honest
-//! path to that: a small, stable, well-specified protocol
-//! whose read / write / flush / trim map almost one-to-one onto the
-//! extent API, with `nbd-client` and qemu as ready-made peers. ublk
-//! is the higher-performance follow-up and needs none of this
-//! rewritten — it replaces the transport, not the mapping.
+//! A loam volume is a copy-on-write map of content-addressed extents,
+//! committed by a fenced, revisioned bind (`loam-client`'s
+//! `VolumeWriter`). What NBD adds is a peer a kernel can talk to, and
+//! it maps almost one-to-one: READ reads through the writer, WRITE
+//! stages, FLUSH commits. A write is durable, and visible to any other
+//! reader, once a FLUSH (or a FUA write) has been answered — the
+//! answer is sent only after the commit — and until then a crash
+//! loses it without tearing anything already committed. The mapping
+//! is independent of the transport: a faster kernel interface such as
+//! ublk would replace the socket and keep all of this.
 //!
-//! What this is NOT: a multi-writer device. Loam's extents follow a
-//! one-publisher discipline, so a volume served here is
-//! single-writer, and that is a property of the storage rather than
-//! of this server. Two NBD clients on one volume will corrupt it,
-//! which is why `--allow-multi` does not exist.
+//! What this is NOT: a multi-writer device. The server holds the
+//! volume's writer lease for as long as it runs, renewing it in the
+//! background, so a second server on the same volume is refused the
+//! lease at start, and a server whose lease has passed on is refused
+//! at its next commit. That is why `--allow-multi` does not exist.
 //!
 //! Protocol: fixed-newstyle handshake. `NBD_OPT_EXPORT_NAME` is the
 //! only option honoured; anything else is answered `ERR_UNSUP` and
@@ -25,9 +27,12 @@
 //! the device does.
 
 use anyhow::{anyhow, Result};
-use loam_client::{LoamClient, Volume};
+use loam_client::{LoamClient, VolumeWriter};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 // ── Handshake constants (nbd protocol "fixed newstyle") ───────────
 
@@ -43,14 +48,17 @@ const NBD_REP_ERR_UNSUP: u32 = 0x8000_0001;
 
 /// Transmission flags advertised for the export.
 ///
-/// `SEND_FLUSH` is advertised even though a loam write is durable by
-/// the time it is acked: a client that believes flush is unsupported
-/// may refuse to mount, and answering a flush with "done" is
-/// truthful here rather than a stub. `SEND_TRIM` is NOT advertised —
-/// an extent has no sparse representation to punch, and claiming
-/// trim we cannot honour would be a lie a filesystem acts on.
+/// `SEND_FLUSH` and `SEND_FUA`: a write is staged until a flush
+/// commits it, so a client must be told it has to ask. `SEND_TRIM` is
+/// NOT advertised — a trim would be a write of zeros to every extent
+/// it covers, not a hole, and claiming a trim we would honour that way
+/// is a performance promise a filesystem acts on.
 const NBD_FLAG_HAS_FLAGS: u16 = 1 << 0;
 const NBD_FLAG_SEND_FLUSH: u16 = 1 << 2;
+const NBD_FLAG_SEND_FUA: u16 = 1 << 3;
+
+/// Command flag: this write must be durable before it is answered.
+const NBD_CMD_FLAG_FUA: u16 = 1 << 0;
 
 // ── Transmission constants ────────────────────────────────────────
 
@@ -75,45 +83,113 @@ const NBD_ENOSPC: u32 = 28;
 /// that hurts.
 const MAX_IO: usize = 32 * 1024 * 1024;
 
+/// How often an idle session looks up from its socket to see whether
+/// the server is shutting down.
+const IDLE_POLL: Duration = Duration::from_millis(200);
+
 fn read_exact(s: &mut TcpStream, buf: &mut [u8]) -> Result<()> {
     s.read_exact(buf).map_err(|e| anyhow!("nbd read: {e}"))
 }
 
-/// Serve `volume` over NBD on `listen`, one client at a time.
+/// The admin connection and the volume's one writer. Shared between the
+/// session and the lease renewer; each takes it for one request.
+pub struct Device {
+    pub client: LoamClient,
+    pub writer: VolumeWriter,
+}
+
+pub type Shared = Arc<Mutex<Device>>;
+
+fn lock(dev: &Shared) -> std::sync::MutexGuard<'_, Device> {
+    // A panic while holding it leaves nothing half-applied that a
+    // later request could observe: staged writes are all or nothing
+    // until a commit, so the poison is not worth a second failure.
+    dev.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Renew the lease every third of its TTL until `stop`. A renewal the
+/// server refuses ends the writer, so every later request fails rather
+/// than being accepted and then refused at its commit.
+pub fn spawn_renewer(dev: Shared, ttl_ms: u32, stop: &'static AtomicBool) {
+    let every = Duration::from_millis((ttl_ms / 3).max(1) as u64);
+    std::thread::spawn(move || {
+        let mut slept = Duration::ZERO;
+        while !stop.load(Ordering::SeqCst) {
+            std::thread::sleep(IDLE_POLL.min(every));
+            slept += IDLE_POLL.min(every);
+            if slept < every {
+                continue;
+            }
+            slept = Duration::ZERO;
+            let mut d = lock(&dev);
+            let Device { client, writer } = &mut *d;
+            if let Err(e) = writer.renew(client) {
+                eprintln!("[loam-nbd] lease renewal failed: {e}");
+            }
+        }
+    });
+}
+
+/// Serve the device over NBD on `listen`, one client at a time, until
+/// `stop` is set.
 ///
 /// Serial by construction, and that is the correct shape: the volume
 /// is single-writer, so a second concurrent client is a corruption
 /// waiting to happen rather than a throughput opportunity.
-pub fn serve(mut client: LoamClient, volume: Volume, listen: &str) -> Result<()> {
+pub fn serve(dev: &Shared, listen: &str, stop: &'static AtomicBool) -> Result<()> {
     let listener = TcpListener::bind(listen)?;
+    listener.set_nonblocking(true)?;
+    let size = lock(dev).writer.volume().size_bytes;
     eprintln!(
-        "[loam-nbd] serving {} bytes on {} (single-writer)",
-        volume.desc.size_bytes,
+        "[loam-nbd] serving {} bytes on {} (single-writer, lease held)",
+        size,
         listener.local_addr()?
     );
-    for conn in listener.incoming() {
-        let mut s = match conn {
-            Ok(s) => s,
+    while !stop.load(Ordering::SeqCst) {
+        let mut s = match listener.accept() {
+            Ok((s, _)) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
             Err(e) => {
                 eprintln!("[loam-nbd] accept: {e}");
                 continue;
             }
         };
+        s.set_nonblocking(false).ok();
         s.set_nodelay(true).ok();
-        if let Err(e) = session(&mut client, &volume, &mut s) {
+        if let Err(e) = session(dev, &mut s, stop) {
             eprintln!("[loam-nbd] session ended: {e}");
         }
+        // A client that went away without flushing has lost nothing it
+        // was promised; committing here anyway means a disconnect never
+        // throws away what an orderly shutdown would have kept.
+        flush_quietly(dev, "after the session");
     }
     Ok(())
 }
 
-/// One client: handshake, then transmission until it disconnects.
-fn session(client: &mut LoamClient, vol: &Volume, s: &mut TcpStream) -> Result<()> {
-    handshake(vol, s)?;
-    transmission(client, vol, s)
+/// Commit whatever is staged, logging rather than failing.
+pub fn flush_quietly(dev: &Shared, when: &str) {
+    let mut d = lock(dev);
+    let Device { client, writer } = &mut *d;
+    if writer.staged_extents() == 0 {
+        return;
+    }
+    if let Err(e) = writer.flush(client) {
+        eprintln!("[loam-nbd] flush {when}: {e}");
+    }
 }
 
-fn handshake(vol: &Volume, s: &mut TcpStream) -> Result<()> {
+/// One client: handshake, then transmission until it disconnects.
+fn session(dev: &Shared, s: &mut TcpStream, stop: &AtomicBool) -> Result<()> {
+    let size = lock(dev).writer.volume().size_bytes;
+    handshake(size, s)?;
+    transmission(dev, size, s, stop)
+}
+
+fn handshake(size: u64, s: &mut TcpStream) -> Result<()> {
     // Server greeting.
     s.write_all(&NBD_MAGIC.to_be_bytes())?;
     s.write_all(&IHAVEOPT.to_be_bytes())?;
@@ -148,8 +224,10 @@ fn handshake(vol: &Volume, s: &mut TcpStream) -> Result<()> {
                 // started against ONE volume, so answering any name
                 // with a different device would be a surprise. The
                 // volume is chosen by the operator, not the client.
-                s.write_all(&vol.desc.size_bytes.to_be_bytes())?;
-                s.write_all(&(NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH).to_be_bytes())?;
+                s.write_all(&size.to_be_bytes())?;
+                s.write_all(
+                    &(NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH | NBD_FLAG_SEND_FUA).to_be_bytes(),
+                )?;
                 // NO_ZEROES was advertised and the client acknowledged
                 // the handshake, so the 124-byte pad is omitted.
                 s.flush()?;
@@ -180,9 +258,50 @@ fn reply(s: &mut TcpStream, error: u32, handle: u64) -> Result<()> {
     Ok(())
 }
 
-fn transmission(client: &mut LoamClient, vol: &Volume, s: &mut TcpStream) -> Result<()> {
-    let size = vol.desc.size_bytes;
+/// Wait for the next request to start arriving, looking up every
+/// `IDLE_POLL` to see whether the server is stopping. False when it is,
+/// or when the client has gone.
+fn await_request(s: &mut TcpStream, stop: &AtomicBool) -> Result<bool> {
+    s.set_read_timeout(Some(IDLE_POLL))?;
+    let mut probe = [0u8; 1];
+    let ready = loop {
+        if stop.load(Ordering::SeqCst) {
+            break false;
+        }
+        match s.peek(&mut probe) {
+            Ok(0) => break false,
+            Ok(_) => break true,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(anyhow!("nbd read: {e}")),
+        }
+    };
+    // A request is read whole once it starts: a timeout part-way through
+    // one would lose the bytes already taken off the socket.
+    s.set_read_timeout(None)?;
+    Ok(ready)
+}
+
+/// Commit the staged writes and answer the result as an NBD error.
+fn commit(dev: &Shared, what: &str) -> u32 {
+    let mut d = lock(dev);
+    let Device { client, writer } = &mut *d;
+    match writer.flush(client) {
+        Ok(_) => NBD_OK,
+        Err(e) => {
+            eprintln!("[loam-nbd] {what}: {e}");
+            NBD_EIO
+        }
+    }
+}
+
+fn transmission(dev: &Shared, size: u64, s: &mut TcpStream, stop: &AtomicBool) -> Result<()> {
     loop {
+        if !await_request(s, stop)? {
+            return Ok(());
+        }
         let mut hdr = [0u8; 4 + 2 + 2 + 8 + 8 + 4];
         match s.read_exact(&mut hdr) {
             Ok(()) => {}
@@ -194,6 +313,7 @@ fn transmission(client: &mut LoamClient, vol: &Volume, s: &mut TcpStream) -> Res
         if u32::from_be_bytes(hdr[0..4].try_into().unwrap()) != NBD_REQUEST_MAGIC {
             return Err(anyhow!("bad request magic — stream is desynchronised"));
         }
+        let flags = u16::from_be_bytes(hdr[4..6].try_into().unwrap());
         let cmd = u16::from_be_bytes(hdr[6..8].try_into().unwrap());
         let handle = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
         let offset = u64::from_be_bytes(hdr[16..24].try_into().unwrap());
@@ -209,10 +329,10 @@ fn transmission(client: &mut LoamClient, vol: &Volume, s: &mut TcpStream) -> Res
             NBD_CMD_DISC => return Ok(()),
 
             NBD_CMD_FLUSH => {
-                // A loam write is durable by the time it is acked, so
-                // there is nothing outstanding to force. Answering OK
-                // is the truth, not a stub.
-                reply(s, NBD_OK, handle)?;
+                // Answered only once the commit has landed: OK means
+                // every write before it is durable and visible.
+                let err = commit(dev, "flush");
+                reply(s, err, handle)?;
                 s.flush()?;
             }
 
@@ -223,7 +343,12 @@ fn transmission(client: &mut LoamClient, vol: &Volume, s: &mut TcpStream) -> Res
                     continue;
                 }
                 let mut buf = vec![0u8; length];
-                match client.volume_read(vol, offset, &mut buf) {
+                let read = {
+                    let mut d = lock(dev);
+                    let Device { client, writer } = &mut *d;
+                    writer.read(client, offset, &mut buf)
+                };
+                match read {
                     Ok(()) => {
                         reply(s, NBD_OK, handle)?;
                         s.write_all(&buf)?;
@@ -254,13 +379,20 @@ fn transmission(client: &mut LoamClient, vol: &Volume, s: &mut TcpStream) -> Res
                     s.flush()?;
                     continue;
                 }
-                match client.volume_write(vol, offset, &data) {
-                    Ok(()) => reply(s, NBD_OK, handle)?,
+                let staged = {
+                    let mut d = lock(dev);
+                    let Device { client, writer } = &mut *d;
+                    writer.write(client, offset, &data)
+                };
+                let err = match staged {
+                    Ok(()) if flags & NBD_CMD_FLAG_FUA != 0 => commit(dev, "fua write"),
+                    Ok(()) => NBD_OK,
                     Err(e) => {
                         eprintln!("[loam-nbd] write {offset}+{length}: {e}");
-                        reply(s, NBD_EIO, handle)?;
+                        NBD_EIO
                     }
-                }
+                };
+                reply(s, err, handle)?;
                 s.flush()?;
             }
 

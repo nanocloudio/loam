@@ -79,7 +79,7 @@ dependency versions, run `fluxor update` and commit the lockfile.
 | `Makefile` | Thin alias layer over the `fluxor` CLI; `make help` lists the targets. |
 
 [`modules/README.md`](modules/README.md) documents the wire formats,
-arena sizing, snapshots, erasure coding, and keyed extents.
+arena sizing, snapshots, erasure coding, and block volumes.
 [`tools/README.md`](tools/README.md) says what each script and crate
 is for.
 
@@ -87,17 +87,18 @@ is for.
 
 | Module | Surface | What it does |
 |---|---|---|
-| `namespace_router` | `storage.namespace` | Path bindings — BIND / RENAME / UNBIND / LOOKUP / LIST, WAL-backed over a compacted snapshot file. The graph's one registered provider: it answers the canonical surface by dispatch, including `SUBSCRIBE` / `CHANGES`, which is what a level-triggered consumer reconciles against. `LIST` is served on the channel wire rather than by dispatch, being cursor-paged |
+| `namespace_router` | `storage.namespace` | Path bindings — BIND / RENAME / UNBIND / LOOKUP / LIST, WAL-backed over a compacted snapshot file. It answers the canonical surface by provider dispatch, including `SUBSCRIBE` / `CHANGES`, which is what a level-triggered consumer reconciles against. `LIST` is served on the channel wire rather than by dispatch, being cursor-paged |
+| `loam_volume` | `storage.block` | One Loam volume as a block device: reads through the committed extent map, stages writes, and completes a flush after the fenced commit. Holds the volume's writer lease, so one instance writes a volume at a time |
 | `object_index` | — (internal) | Object descriptors — OBJ_PUT / UPDATE / REMOVE / GET, WAL-backed. Declares no surface: descriptors are not object bytes |
-| `block_allocator` | — (internal) | Block volume metadata, WAL-backed. Declares no surface: volume accounting is not a block device, and `storage.block` is fluxor's `sd`/`nvme` |
+| `block_allocator` | — (internal) | Block volume metadata, WAL-backed. Declares no surface: volume accounting is not a block device; a volume's bytes are `loam_volume`'s |
 | `raft_metadata_client` | — (internal) | Proposes metadata decisions through a replica group; single and replicated modes |
 | `clustor_bridge` | — (internal) | Carries loam decision records across the replica group's channel envelope |
-| `body_store` | — (internal) | Content-addressed blobs on disk, with streamed writes and keyed extents |
+| `body_store` | — (internal) | Content-addressed blobs on disk, with streamed writes and keyed EC shards |
 | `placement_router` | — (internal) | Fleet membership; broadcasts a FleetEpoch snapshot on every change |
 | `body_fanout_router` | — (internal) | Replicated bodies: all-must-succeed PUT, ranked GET/HEAD fallback with read repair, full-set DELETE, background scrub |
 | `ec_body_router` | — (internal) | Erasure-coded bodies: k+m Reed-Solomon shards, reconstructing GET, scrub with re-placement and repair |
 | `admin_router` | — (internal) | Front-door admin RPC; demuxes the file and body lifecycle and runs the orphan-body GC |
-| `block_log` | — (internal) | Channel-fronted append-only log over an fs or block backend |
+| `block_log` | — (internal) | Channel-fronted append-only log over the fluxor `fs` contract |
 | `loam_load_gen` | — (probe) | Offers Propose records at a controlled rate, reporting offered against emitted |
 | `loam_throughput_counter` | — (probe) | Counts resolved operations per window, committed split from refused |
 | `metadata_e2e_probe` | — (probe) | Single-shot metadata round trip |

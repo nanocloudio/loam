@@ -82,13 +82,11 @@ pub const MEMBER_DRAINING: u8 = 1 << 0;
 /// member can also be drained, and a scheme that made them
 /// exclusive would have no way to say that.
 ///
-/// Tiering is deliberately NOT a third router. This docket first
-/// proposed one and called it "nearly free once A-2 lands" — but
-/// A-2's remaining extraction is only worth doing for a real third
-/// consumer, so a third router justified by a trait justified by a
-/// third router is circular. A member CLASS breaks that: placement
-/// already ranks by key and already filters by state, so the whole
-/// feature is one flag and one function.
+/// Tiering is deliberately NOT a third router. Placement already ranks
+/// by key and already filters by state, so a member CLASS makes the
+/// whole feature one flag and one function — where a router would add
+/// a module, a channel pair and a second place for placement to be
+/// decided.
 ///
 /// What makes a body cold is a POLICY question and is not answered
 /// here. It belongs with lifecycle (`expired_page` is the same

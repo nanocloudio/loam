@@ -126,32 +126,110 @@ descriptors every N ticks — see [durability.md](durability.md).
 
 ## Remote admin
 
-The admin surface can also be reached over TCP, for a consumer that
-runs somewhere other than the storage node — a volume backend, a CSI
-plugin. It carries no per-op authorization: a connection that
-authenticates can bind, read and delete anything in any namespace,
-so `--admin-listen` is REFUSED without `--admin-token` rather than
-quietly serving an anonymous surface off-box.
+The admin surface is reached off-box over TLS 1.3 with mutual
+authentication, for a consumer that runs somewhere other than the
+storage node — a volume backend, a CSI plugin. There is no plaintext
+TCP admin surface: `--admin-listen` is REFUSED at startup unless all
+four of its flags are given.
+
+| Flag | Holds |
+|---|---|
+| `--admin-tls-cert` | PEM certificate chain the server presents |
+| `--admin-tls-key` | PEM private key for it |
+| `--admin-client-ca` | PEM CA certificate(s); a client must present a certificate chaining to one |
+| `--admin-grants` | JSON grant table, below |
 
 ```sh
-head -c 32 /dev/urandom | xxd -p -c 64 > /etc/loam.token
 loam-server --socket /tmp/loam.sock --admin-listen 0.0.0.0:7788 \
-            --admin-token /etc/loam.token \
+            --admin-tls-cert /etc/loam/server.pem \
+            --admin-tls-key /etc/loam/server.key \
+            --admin-client-ca /etc/loam/clients-ca.pem \
+            --admin-grants /etc/loam/grants.json \
             --ns-wal data/srv/ns.wal --obj-wal data/srv/obj.wal \
             --fleet dir:data/srv/bodies
 ```
 
-Authentication is connection-scoped, not per-request: a client
-presents the token once, and the boundary that matters is who is on
-the far end of the socket. `loam-client`'s `connect_tcp` pairs with
-`authenticate` for exactly that reason.
+A client's **identity** is read from its verified leaf certificate:
+the first URI subject alternative name, else the first DNS SAN, else
+the subject CommonName. A certificate naming none, or an identity
+longer than 256 bytes, is refused at the handshake. Session
+resumption is off, so every connection is judged on the certificate
+it presents.
+
+The **grant table** maps each identity to namespace roots and op
+classes. An identity it does not name can do nothing:
+
+```json
+{
+  "grants": [
+    { "identity": "spiffe://site/node/7", "roots": ["tenant-a"], "ops": ["read", "write", "lease"] },
+    { "identity": "backup.site.example", "roots": ["*"], "ops": ["read"] },
+    { "identity": "operator.site.example", "roots": ["*"], "ops": ["read", "write", "lease", "admin"] }
+  ]
+}
+```
+
+- `roots` are exact namespace-root strings, or `"*"` for every root.
+- `ops` are classes, and a grant's classes apply to all its roots.
+  Classes are independent: `admin` is the keyed body plane and
+  nothing more, so a grant wanting everything lists all four.
+
+| Class | Admin ops |
+|---|---|
+| `read` | `GET_FILE`, `STAT_FILE`, `READ_FILE_RANGE`, `LIST_FILES`, `LOOKUP`; `GET_BODY` |
+| `write` | `BIND`, `PUT_FILE`, `DELETE_FILE`, `PUT_FILE_OPEN`, `VOLUME` (begin, commit, abort, delete); `PUT_BODY` |
+| `lease` | `LEASE` (acquire, renew, release) |
+| `admin` | `PUT_BODY_KEYED`, `DELETE_BODY` |
+
+- An op that names a root needs its class on that root.
+  Content-addressed `PUT_BODY` and `GET_BODY` name none and need the
+  class on some root: an extent is an unreferenced orphan until a
+  bind or a volume commit on a granted root names it.
+- The keyed body plane overwrites and deletes by key across every
+  root, so it is `admin`.
+- A streamed write's `PUT_FILE_CHUNK` and `PUT_FILE_COMMIT` are
+  accepted only on the connection that opened the stream.
+- A volume writer needs `lease` and `write`: the lease to hold the
+  volume, `write` to commit it.
+- `AUTH` over TLS, and any opcode the table does not name, is
+  refused; an unknown opcode also closes the connection.
+
+A refusal is `STATUS_FORBIDDEN` (`0x08`) in the op's own ack shape,
+and the connection stays open: the remedy is a grant, not a retry.
+The file is checked at startup, and a server with a malformed entry,
+an unknown class, a duplicate identity, an empty root list, or an
+entry for the reserved name `local-operator` does not start. At most
+1024 identities and 256 roots per identity.
+
+**Lease holders are bound to the identity.** The server replaces the
+16-byte holder in every `LEASE` and `VOLUME` request from a TLS
+client with `SHA-256("loam-lease-holder\0" ‖ u16le(len) ‖ identity ‖ holder)`
+truncated to 16 bytes. No identity can name another's holder, even
+by sending its bytes, while one identity's writers still tell each
+other apart by the holders they choose. The mapping is the server's:
+a client names its writer with the holder it chose, every time.
+
+`loam-client` connects with `connect_tls(addr, server_name, ca_pem,
+cert_pem, key_pem)`. A certificate the server refuses fails the first
+request rather than the connect: in TLS 1.3 the client finishes its
+handshake before the server has judged its certificate.
+
+The **unix socket** stays the local operator's path, with full
+authority and holders passed through unchanged. It is reachable only
+by the host's own users; `--admin-token FILE` additionally requires a
+secret there, presented once per connection with `authenticate`.
 
 ## Block volumes over NBD
 
-A volume is N fixed-size extents in the body plane, replicated like
-any other body. `loam-nbd` exports one as an NBD device, so a kernel
-(`nbd-client`) or a hypervisor (qemu's `nbd:` driver) can mount what
-loam already stores:
+A volume is a copy-on-write map of fixed-size extents, each an
+ordinary body replicated like any other, committed by binding the
+volume's path to the map's root. `loam-nbd` exports one as an NBD
+device, so a kernel (`nbd-client`) or a hypervisor (qemu's `nbd:`
+driver) can mount it. The volume must already exist — `loam-client`'s
+`create_volume` makes one, with any extent size up to 60 KiB. A volume
+a node's `loam_volume` module will serve needs a power-of-two extent
+of at most 32 KiB, since that module moves through a volume by
+shifts:
 
 ```sh
 loam-nbd --socket /tmp/loam.sock --volume vol:/disks/data \
@@ -161,14 +239,31 @@ loam-nbd --socket /tmp/loam.sock --volume vol:/disks/data \
 Against a remote node, which is the shape a volume backend runs in:
 
 ```sh
-loam-nbd --admin tcp://storage-node:7788 --token-file /etc/loam.token \
+loam-nbd --admin storage-node:7788 \
+         --tls-ca /etc/loam/ca.pem --tls-cert /etc/loam/nbd.pem \
+         --tls-key /etc/loam/nbd.key \
          --volume vol:/disks/data --listen 127.0.0.1:10809
 ```
 
+The server's certificate is checked for `--tls-server-name`, or the
+host part of `--admin` without it. The device's identity needs
+`read`, `write` and `lease` on the volume's root. Against a unix
+socket started with `--admin-token`, pass `--token-file`.
+
+The server takes the volume's writer lease at start
+(`--lease-ttl-ms`, default 30000) and renews it every third of the
+TTL. A second server on the same volume is refused the lease and
+exits; one whose lease has passed on is refused at its next commit.
+Writes are staged: `FLUSH`, and a write carrying `FUA`, is answered
+only once the commit has landed, and until then a crash loses the
+staged writes without tearing anything committed. `SIGINT` or
+`SIGTERM` commits what is staged and releases the lease; a server
+killed outright holds the volume until its lease lapses.
+
 ## Snapshots, clones and export
 
-A snapshot is a manifest — a `(key, digest)` listing — and nothing
-more. It pins its bodies by BINDING them under a root the caller
+A snapshot is a manifest — a `(key, digest, kind)` listing — and
+nothing more. It pins its bodies by BINDING them under a root the caller
 names, so they are protected by the same reachability answer the
 orphan GC already computes for ordinary bindings: no per-body
 refcount appears, and the collector needs no snapshot-shaped query.
@@ -180,10 +275,14 @@ manifest, `snapshot_restore` binds its entries under a new root (a
 clone — bodies are shared, not copied), and `snapshot_delete` drops
 it, after which the GC reclaims whatever nothing else references.
 
+Each manifest entry carries its binding's kind, so a volume restores
+as a volume — the GC walks the maps of volume bindings only.
+
 Export between two clusters is a function over two clients rather
 than a protocol. `export_snapshot` asks the destination which
-digests it lacks (`manifest_missing_here`), sends only those, then
-binds the manifest's entries — so deduplication is free and the
+digests it lacks — every entry's, and for a volume every page and
+extent its root reaches — sends only those, then binds the
+manifest's entries — so deduplication is free and the
 transfer is ordinary reads and writes. The manifest is
 encryption-agnostic and its digests are over plaintext, so it means
 the same thing on both sides whatever keys each cluster holds.

@@ -1,16 +1,13 @@
 version = "0.1.0"
 hardware_targets = ["bcm2712"]
 
-# Channel-fronted append-only log. Consumer PICs (namespace_router,
-# object_index, etc.) talk to block_log over its request/response
-# pair instead of doing fs syscalls directly. This preserves the
-# mesh discipline and lets the bare-metal build swap in a
-# block-device backing without touching consumers.
-#
-# First-cut backing: the fluxor `fs` contract via FS_OPEN_CREATE /
-# FS_WRITE / FS_FSYNC. The block-device alternative
-# backing — direct block-device channels — is a sibling PIC body
-# (`block_log_block_body.rs`) tracked as a follow-up.
+# Channel-fronted append-only log: a consumer PIC gets durability over
+# a request/response pair rather than through fs syscalls, so the
+# backing storage can change without the consumer changing. The
+# backing is the fluxor `fs` contract (FS_OPEN_CREATE / FS_WRITE /
+# FS_FSYNC). The WAL-using PICs — namespace_router, object_index,
+# block_allocator, raft_metadata_client — do not route through it;
+# they include `wal_io.rs` directly (see docs/architecture.md).
 
 [[ports]]
 name = "log_requests"

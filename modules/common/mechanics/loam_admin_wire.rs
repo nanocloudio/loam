@@ -49,6 +49,14 @@ pub const OP_DELETE_BODY: u8 = 0x4D;
 /// the boundary that matters is who is on the far end of the socket,
 /// established once.
 pub const OP_AUTH: u8 = 0x4E;
+/// Acquire, renew or release a volume's writer lease.
+pub const OP_LEASE: u8 = 0x4F;
+/// Begin, commit or abort a volume flush: the fenced, revisioned bind
+/// of a volume's path to its map root.
+pub const OP_VOLUME: u8 = 0x50;
+/// Resolve a path to its binding — object id, revision and kind —
+/// without reading the body.
+pub const OP_LOOKUP: u8 = 0x51;
 
 /// Longest accepted auth token. Long enough for a 512-bit secret in
 /// hex with room to spare, short enough that an unauthenticated peer
@@ -80,6 +88,35 @@ pub const STATUS_BUSY: u8 = 0x03;
 /// exactly what a client told "busy" would do. The gateway maps this
 /// to 507 Insufficient Storage.
 pub const STATUS_QUOTA: u8 = 0x04;
+
+/// A volume commit prepared against a revision that is no longer the
+/// current one: another commit landed first.
+///
+/// Separate from `STATUS_NAK` because the remedy is the caller's:
+/// reopen the volume at its current revision and decide again.
+/// Retrying the same commit will never succeed.
+pub const STATUS_CONFLICT: u8 = 0x05;
+
+/// A lease acquire refused because another holder's lease is live.
+///
+/// The remedy is to wait for it to lapse or be released — the ack
+/// carries its expiry — not to retry at once, and never to write.
+pub const STATUS_LEASE_HELD: u8 = 0x06;
+
+/// A renew, release or volume flush from a caller that no longer holds
+/// the lease: it expired, was released, or passed to another holder. A
+/// writer told this must stop writing; its fence is no longer the
+/// newest.
+pub const STATUS_LEASE_LOST: u8 = 0x07;
+
+/// The caller's identity holds no grant for this operation: the op
+/// class on the namespace root it names, or a write stream it did not
+/// open.
+///
+/// Separate from `STATUS_NAK` because the remedy is an operator's, not
+/// the caller's: a grant has to change before the same request can
+/// succeed, so retrying it is pointless.
+pub const STATUS_FORBIDDEN: u8 = 0x08;
 
 /// Per-field key ceilings, from the single register in
 /// `loam_limits.rs` — the same numbers the namespace wire, the
@@ -343,7 +380,21 @@ pub fn encode_admin_put_body(
     correlation_id: u32,
     body: &[u8],
 ) -> Result<usize, WireError> {
-    let needed = 1 + 4 + 4 + body.len();
+    let at = encode_admin_put_body_header(dst, correlation_id, body.len())?;
+    dst[at..at + body.len()].copy_from_slice(body);
+    Ok(at + body.len())
+}
+
+/// The fixed part of an AdminPutBody, for a caller that builds the body
+/// in place at `dst[n..n + body_len]`, where `n` is the length returned.
+/// A body assembled in the frame (a map page patched as it is written)
+/// then needs no second buffer to be copied from.
+pub fn encode_admin_put_body_header(
+    dst: &mut [u8],
+    correlation_id: u32,
+    body_len: usize,
+) -> Result<usize, WireError> {
+    let needed = 1 + 4 + 4 + body_len;
     if dst.len() < needed {
         return Err(WireError::BufferTooSmall {
             needed,
@@ -352,9 +403,8 @@ pub fn encode_admin_put_body(
     }
     dst[0] = OP_PUT_BODY;
     dst[1..5].copy_from_slice(&correlation_id.to_le_bytes());
-    dst[5..9].copy_from_slice(&(body.len() as u32).to_le_bytes());
-    dst[9..9 + body.len()].copy_from_slice(body);
-    Ok(needed)
+    dst[5..9].copy_from_slice(&(body_len as u32).to_le_bytes());
+    Ok(9)
 }
 
 pub fn decode_admin_put_body(src: &[u8]) -> Result<(u32, &[u8]), WireError> {
@@ -1420,13 +1470,195 @@ pub fn peek_opcode(src: &[u8]) -> Option<u8> {
     src.first().copied()
 }
 
+/// The length of the request frame at the front of `src`, read from its
+/// header alone.
+///
+/// A stream transport delivers bytes, not frames, so a receiver has to
+/// know where each request ends before it can check or forward it.
+/// `Truncated` means the header is not all here yet; `BadOpcode` means
+/// the byte in front names no request, and nothing after it can be
+/// framed.
+pub fn request_len(src: &[u8]) -> Result<usize, WireError> {
+    let op = match src.first() {
+        Some(op) => *op,
+        None => return Err(WireError::Truncated),
+    };
+    let u16_at = |at: usize| -> Result<usize, WireError> {
+        if src.len() < at + 2 {
+            return Err(WireError::Truncated);
+        }
+        Ok(u16::from_le_bytes([src[at], src[at + 1]]) as usize)
+    };
+    let u32_at = |at: usize| -> Result<usize, WireError> {
+        if src.len() < at + 4 {
+            return Err(WireError::Truncated);
+        }
+        Ok(u32::from_le_bytes([src[at], src[at + 1], src[at + 2], src[at + 3]]) as usize)
+    };
+    match op {
+        OP_AUTH => Ok(7 + u16_at(5)?),
+        OP_BIND => Ok(20 + u16_at(5)? + u16_at(7)? + u16_at(9)?),
+        OP_PUT_BODY => Ok(9 + u32_at(5)?),
+        OP_GET_BODY => Ok(5 + DIGEST_LEN),
+        OP_PUT_FILE => Ok(22 + u16_at(5)? + u16_at(7)? + u32_at(18)?),
+        OP_GET_FILE | OP_DELETE_FILE | OP_STAT_FILE | OP_LOOKUP => Ok(9 + u16_at(5)? + u16_at(7)?),
+        OP_LIST_FILES => Ok(12 + u16_at(5)?),
+        OP_PUT_FILE_OPEN => Ok(1 + 4 + 2 + 2 + 1 + 8 + DIGEST_LEN + 8 + u16_at(5)? + u16_at(7)?),
+        OP_PUT_FILE_CHUNK => Ok(10 + u32_at(6)?),
+        OP_PUT_FILE_COMMIT => Ok(6),
+        OP_READ_FILE_RANGE => Ok(21 + u16_at(17)? + u16_at(19)?),
+        OP_PUT_BODY_KEYED => Ok(1 + 4 + DIGEST_LEN + 4 + u32_at(37)?),
+        OP_DELETE_BODY => Ok(1 + 4 + DIGEST_LEN),
+        OP_LEASE => Ok(LEASE_REQ_HDR + u16_at(6)? + u16_at(8)?),
+        OP_VOLUME => Ok(VOLUME_REQ_HDR + u16_at(6)? + u16_at(8)? + u16_at(10)?),
+        observed => Err(WireError::BadOpcode { observed }),
+    }
+}
+
+// ── AdminLease (volume writer lease) ──────────────────────────────
+//
+//   LeaseReq  [op=0x4F][cid:u32][mode:u8][root_len:u16][path_len:u16]
+//             [holder:16][ttl_ms:u32][root][path]
+//   LeaseAck  [op=0x4F][cid:u32][status:u8][fence:u64][expires_at_ms:u64]
+//
+// `mode` is `LEASE_ACQUIRE` / `LEASE_RENEW` / `LEASE_RELEASE`. There is
+// deliberately no time field: expiry is judged against the time the
+// server stamps on the request, never one a client asserts — a client
+// that could name `now` could name a moment at which any lease has
+// lapsed.
+//
+// Status: `STATUS_OK` (granted; fence and expiry are the caller's),
+// `STATUS_LEASE_HELD` / `STATUS_LEASE_LOST` (fence and expiry describe
+// the lease that stands, zero when none does), `STATUS_BUSY` (the
+// lease table is full, or the request was stamped no later than one
+// already applied — retry), `STATUS_NAK` (malformed, a TTL out of
+// range, or a server with no wall clock to judge expiry by).
+
+/// Lease modes and holder width: the namespace wire's values, restated
+/// because this wire is compiled without it. A test pins the two.
+pub const LEASE_ACQUIRE: u8 = 1;
+pub const LEASE_RENEW: u8 = 2;
+pub const LEASE_RELEASE: u8 = 3;
+pub const LEASE_HOLDER_LEN: usize = 16;
+/// Where the holder sits in a `LeaseReq`.
+pub const LEASE_HOLDER_AT: usize = 1 + 4 + 1 + 2 + 2;
+const LEASE_REQ_HDR: usize = LEASE_HOLDER_AT + LEASE_HOLDER_LEN + 4;
+const LEASE_ACK_LEN: usize = 1 + 4 + 1 + 8 + 8;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedAdminLease<'a> {
+    pub correlation_id: u32,
+    pub mode: u8,
+    pub namespace_root: &'a [u8],
+    pub path: &'a [u8],
+    pub holder: [u8; LEASE_HOLDER_LEN],
+    pub ttl_ms: u32,
+}
+
+pub fn encode_admin_lease(
+    dst: &mut [u8],
+    correlation_id: u32,
+    mode: u8,
+    namespace_root: &[u8],
+    path: &[u8],
+    holder: &[u8; LEASE_HOLDER_LEN],
+    ttl_ms: u32,
+) -> Result<usize, WireError> {
+    check_key(namespace_root, path, &[])?;
+    let needed = LEASE_REQ_HDR + namespace_root.len() + path.len();
+    if dst.len() < needed {
+        return Err(WireError::BufferTooSmall {
+            needed,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = OP_LEASE;
+    dst[1..5].copy_from_slice(&correlation_id.to_le_bytes());
+    dst[5] = mode;
+    dst[6..8].copy_from_slice(&(namespace_root.len() as u16).to_le_bytes());
+    dst[8..10].copy_from_slice(&(path.len() as u16).to_le_bytes());
+    dst[LEASE_HOLDER_AT..LEASE_HOLDER_AT + LEASE_HOLDER_LEN].copy_from_slice(holder);
+    dst[LEASE_HOLDER_AT + LEASE_HOLDER_LEN..LEASE_REQ_HDR].copy_from_slice(&ttl_ms.to_le_bytes());
+    let mut cursor = LEASE_REQ_HDR;
+    dst[cursor..cursor + namespace_root.len()].copy_from_slice(namespace_root);
+    cursor += namespace_root.len();
+    dst[cursor..cursor + path.len()].copy_from_slice(path);
+    Ok(needed)
+}
+
+pub fn decode_admin_lease(src: &[u8]) -> Result<DecodedAdminLease<'_>, WireError> {
+    if src.len() < LEASE_REQ_HDR {
+        return Err(WireError::Truncated);
+    }
+    if src[0] != OP_LEASE {
+        return Err(WireError::BadOpcode { observed: src[0] });
+    }
+    let ns_len = u16::from_le_bytes([src[6], src[7]]) as usize;
+    let path_len = u16::from_le_bytes([src[8], src[9]]) as usize;
+    let total = LEASE_REQ_HDR + ns_len + path_len;
+    if src.len() < total {
+        return Err(WireError::Truncated);
+    }
+    let ns = &src[LEASE_REQ_HDR..LEASE_REQ_HDR + ns_len];
+    let path = &src[LEASE_REQ_HDR + ns_len..total];
+    check_key(ns, path, &[])?;
+    let mut holder = [0u8; LEASE_HOLDER_LEN];
+    holder.copy_from_slice(&src[LEASE_HOLDER_AT..LEASE_HOLDER_AT + LEASE_HOLDER_LEN]);
+    let ttl_at = LEASE_HOLDER_AT + LEASE_HOLDER_LEN;
+    Ok(DecodedAdminLease {
+        correlation_id: u32::from_le_bytes(src[1..5].try_into().unwrap()),
+        mode: src[5],
+        namespace_root: ns,
+        path,
+        holder,
+        ttl_ms: u32::from_le_bytes(src[ttl_at..LEASE_REQ_HDR].try_into().unwrap()),
+    })
+}
+
+pub fn encode_admin_lease_ack(
+    dst: &mut [u8],
+    correlation_id: u32,
+    status: u8,
+    fence: u64,
+    expires_at_ms: u64,
+) -> Result<usize, WireError> {
+    if dst.len() < LEASE_ACK_LEN {
+        return Err(WireError::BufferTooSmall {
+            needed: LEASE_ACK_LEN,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = OP_LEASE;
+    dst[1..5].copy_from_slice(&correlation_id.to_le_bytes());
+    dst[5] = status;
+    dst[6..14].copy_from_slice(&fence.to_le_bytes());
+    dst[14..22].copy_from_slice(&expires_at_ms.to_le_bytes());
+    Ok(LEASE_ACK_LEN)
+}
+
+/// Returns `(cid, status, fence, expires_at_ms)`.
+pub fn decode_admin_lease_ack(src: &[u8]) -> Result<(u32, u8, u64, u64), WireError> {
+    if src.len() < LEASE_ACK_LEN {
+        return Err(WireError::Truncated);
+    }
+    if src[0] != OP_LEASE {
+        return Err(WireError::BadOpcode { observed: src[0] });
+    }
+    Ok((
+        u32::from_le_bytes(src[1..5].try_into().unwrap()),
+        src[5],
+        u64::from_le_bytes(src[6..14].try_into().unwrap()),
+        u64::from_le_bytes(src[14..22].try_into().unwrap()),
+    ))
+}
+
 // ── AdminPutBodyKeyed / AdminDeleteBody (raw keyed body plane) ────
 //
-// The block-volume extent surface: extents live in the body plane
-// under DERIVED keys (see loam_extent_wire.rs), never bound in the
-// namespace. PutBodyKeyed stores (overwrites — keyed blobs are
-// mutable); DeleteBody removes a blob by key/digest, the volume
-// delete path's per-extent cleanup.
+// The raw body plane by key: a keyed blob (an EC shard, whose key is
+// derived from its body's digest and shard index) is stored under the
+// key it names rather than its content hash, and never bound in the
+// namespace. PutBodyKeyed stores (a re-put overwrites); DeleteBody
+// removes a blob by key or digest.
 //
 //   PutBodyKeyedReq  [op=0x4C][cid:u32][key:32][len:u32][bytes]
 //   PutBodyKeyedAck  [op=0x4C][cid:u32][status:u8]
@@ -1560,5 +1792,261 @@ pub fn decode_admin_delete_body_ack(src: &[u8]) -> Result<(u32, u8, bool), WireE
         u32::from_le_bytes(src[1..5].try_into().unwrap()),
         src[5],
         src[6] != 0,
+    ))
+}
+
+// ── AdminVolume (volume flush: begin / commit / abort / delete) ───
+//
+//   VolumeReq  [op=0x50][cid:u32][mode:u8][root_len:u16][path_len:u16]
+//              [oid_len:u16][holder:16][fence:u64][expected:u64]
+//              [root][path][oid]
+//   VolumeAck  [op=0x50][cid:u32][status:u8][revision:u64]
+//
+// `mode` is `VOLUME_BEGIN` / `VOLUME_COMMIT` / `VOLUME_ABORT` /
+// `VOLUME_DELETE` (unbind the path, fenced and CAS'd like a commit). A COMMIT
+// binds the path to `oid` (the map root's `sha256:` id) at
+// `expected + 1`, only when the current revision is `expected` (0:
+// unbound) and the caller holds the volume's live lease under `fence`
+// with a flush open. As with leases there is no time field: the server
+// stamps it.
+//
+// Status: `STATUS_OK` (revision is the new one on a commit, the current
+// one otherwise), `STATUS_CONFLICT` (another commit landed first;
+// revision is the current one), `STATUS_LEASE_LOST`, `STATUS_BUSY`
+// (a GC sweep holds a reservation — retry the BEGIN), `STATUS_NAK`.
+
+/// Volume modes: the namespace wire's values, restated because this
+/// wire is compiled without it. A test pins the two.
+pub const VOLUME_BEGIN: u8 = 1;
+pub const VOLUME_COMMIT: u8 = 2;
+pub const VOLUME_ABORT: u8 = 3;
+pub const VOLUME_DELETE: u8 = 4;
+/// Where the holder sits in a `VolumeReq`.
+pub const VOLUME_HOLDER_AT: usize = 1 + 4 + 1 + 2 + 2 + 2;
+const VOLUME_REQ_HDR: usize = VOLUME_HOLDER_AT + LEASE_HOLDER_LEN + 8 + 8;
+
+/// The holder bytes of a lease or volume request, for a host that has
+/// to rewrite them without decoding the rest. `None` for any other op,
+/// or a frame too short to carry one.
+pub fn request_holder_mut(frame: &mut [u8]) -> Option<&mut [u8; LEASE_HOLDER_LEN]> {
+    let at = match frame.first() {
+        Some(&OP_LEASE) => LEASE_HOLDER_AT,
+        Some(&OP_VOLUME) => VOLUME_HOLDER_AT,
+        _ => return None,
+    };
+    frame
+        .get_mut(at..at + LEASE_HOLDER_LEN)
+        .and_then(|h| h.try_into().ok())
+}
+const VOLUME_ACK_LEN: usize = 1 + 4 + 1 + 8;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedAdminVolume<'a> {
+    pub correlation_id: u32,
+    pub mode: u8,
+    pub namespace_root: &'a [u8],
+    pub path: &'a [u8],
+    pub object_id: &'a [u8],
+    pub holder: [u8; LEASE_HOLDER_LEN],
+    pub fence: u64,
+    pub expected: u64,
+}
+
+pub fn encode_admin_volume(dst: &mut [u8], r: &DecodedAdminVolume<'_>) -> Result<usize, WireError> {
+    check_key(r.namespace_root, r.path, r.object_id)?;
+    let needed = VOLUME_REQ_HDR + r.namespace_root.len() + r.path.len() + r.object_id.len();
+    if dst.len() < needed {
+        return Err(WireError::BufferTooSmall {
+            needed,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = OP_VOLUME;
+    dst[1..5].copy_from_slice(&r.correlation_id.to_le_bytes());
+    dst[5] = r.mode;
+    dst[6..8].copy_from_slice(&(r.namespace_root.len() as u16).to_le_bytes());
+    dst[8..10].copy_from_slice(&(r.path.len() as u16).to_le_bytes());
+    dst[10..12].copy_from_slice(&(r.object_id.len() as u16).to_le_bytes());
+    let h = VOLUME_HOLDER_AT + LEASE_HOLDER_LEN;
+    dst[VOLUME_HOLDER_AT..h].copy_from_slice(&r.holder);
+    dst[h..h + 8].copy_from_slice(&r.fence.to_le_bytes());
+    dst[h + 8..VOLUME_REQ_HDR].copy_from_slice(&r.expected.to_le_bytes());
+    let mut cursor = VOLUME_REQ_HDR;
+    dst[cursor..cursor + r.namespace_root.len()].copy_from_slice(r.namespace_root);
+    cursor += r.namespace_root.len();
+    dst[cursor..cursor + r.path.len()].copy_from_slice(r.path);
+    cursor += r.path.len();
+    dst[cursor..cursor + r.object_id.len()].copy_from_slice(r.object_id);
+    Ok(needed)
+}
+
+pub fn decode_admin_volume(src: &[u8]) -> Result<DecodedAdminVolume<'_>, WireError> {
+    if src.len() < VOLUME_REQ_HDR {
+        return Err(WireError::Truncated);
+    }
+    if src[0] != OP_VOLUME {
+        return Err(WireError::BadOpcode { observed: src[0] });
+    }
+    let ns_len = u16::from_le_bytes([src[6], src[7]]) as usize;
+    let path_len = u16::from_le_bytes([src[8], src[9]]) as usize;
+    let oid_len = u16::from_le_bytes([src[10], src[11]]) as usize;
+    let total = VOLUME_REQ_HDR + ns_len + path_len + oid_len;
+    if src.len() < total {
+        return Err(WireError::Truncated);
+    }
+    let ns = &src[VOLUME_REQ_HDR..VOLUME_REQ_HDR + ns_len];
+    let path = &src[VOLUME_REQ_HDR + ns_len..VOLUME_REQ_HDR + ns_len + path_len];
+    let oid = &src[VOLUME_REQ_HDR + ns_len + path_len..total];
+    check_key(ns, path, oid)?;
+    let mut holder = [0u8; LEASE_HOLDER_LEN];
+    let h = VOLUME_HOLDER_AT + LEASE_HOLDER_LEN;
+    holder.copy_from_slice(&src[VOLUME_HOLDER_AT..h]);
+    Ok(DecodedAdminVolume {
+        correlation_id: u32::from_le_bytes(src[1..5].try_into().unwrap()),
+        mode: src[5],
+        namespace_root: ns,
+        path,
+        object_id: oid,
+        holder,
+        fence: u64::from_le_bytes(src[h..h + 8].try_into().unwrap()),
+        expected: u64::from_le_bytes(src[h + 8..VOLUME_REQ_HDR].try_into().unwrap()),
+    })
+}
+
+pub fn encode_admin_volume_ack(
+    dst: &mut [u8],
+    correlation_id: u32,
+    status: u8,
+    revision: u64,
+) -> Result<usize, WireError> {
+    if dst.len() < VOLUME_ACK_LEN {
+        return Err(WireError::BufferTooSmall {
+            needed: VOLUME_ACK_LEN,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = OP_VOLUME;
+    dst[1..5].copy_from_slice(&correlation_id.to_le_bytes());
+    dst[5] = status;
+    dst[6..14].copy_from_slice(&revision.to_le_bytes());
+    Ok(VOLUME_ACK_LEN)
+}
+
+/// Returns `(cid, status, revision)`.
+pub fn decode_admin_volume_ack(src: &[u8]) -> Result<(u32, u8, u64), WireError> {
+    if src.len() < VOLUME_ACK_LEN {
+        return Err(WireError::Truncated);
+    }
+    if src[0] != OP_VOLUME {
+        return Err(WireError::BadOpcode { observed: src[0] });
+    }
+    Ok((
+        u32::from_le_bytes(src[1..5].try_into().unwrap()),
+        src[5],
+        u64::from_le_bytes(src[6..14].try_into().unwrap()),
+    ))
+}
+
+// ── AdminLookup (a path's binding, without its body) ──────────────
+//
+//   LookupReq  [op=0x51][cid:u32][root_len:u16][path_len:u16][root][path]
+//   LookupAck  [op=0x51][cid:u32][status:u8]
+//              then, on STATUS_OK: [revision:u64][kind:u8][oid_len:u8][oid]
+//
+// What a volume opener needs — the root digest and the revision a
+// commit must name — and what a snapshot needs to bind an entry under
+// the same kind.
+
+pub fn encode_admin_lookup(
+    dst: &mut [u8],
+    correlation_id: u32,
+    namespace_root: &[u8],
+    path: &[u8],
+) -> Result<usize, WireError> {
+    encode_path_req(dst, OP_LOOKUP, correlation_id, namespace_root, path)
+}
+
+pub fn decode_admin_lookup(src: &[u8]) -> Result<DecodedAdminPathReq<'_>, WireError> {
+    decode_path_req(src, OP_LOOKUP)
+}
+
+/// A binding as the lookup ack carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdminBinding<'a> {
+    pub revision: u64,
+    pub kind: u8,
+    pub object_id: &'a [u8],
+}
+
+pub fn encode_admin_lookup_ack(
+    dst: &mut [u8],
+    correlation_id: u32,
+    status: u8,
+    binding: Option<&AdminBinding<'_>>,
+) -> Result<usize, WireError> {
+    let tail = match binding {
+        Some(b) if status == STATUS_OK => {
+            if b.object_id.len() > MAX_OBJECT_ID {
+                return Err(WireError::StringTooLong {
+                    len: b.object_id.len(),
+                    max: MAX_OBJECT_ID,
+                });
+            }
+            8 + 1 + 1 + b.object_id.len()
+        }
+        _ => 0,
+    };
+    let needed = 1 + 4 + 1 + tail;
+    if dst.len() < needed {
+        return Err(WireError::BufferTooSmall {
+            needed,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = OP_LOOKUP;
+    dst[1..5].copy_from_slice(&correlation_id.to_le_bytes());
+    dst[5] = status;
+    if let Some(b) = binding {
+        if tail != 0 {
+            dst[6..14].copy_from_slice(&b.revision.to_le_bytes());
+            dst[14] = b.kind;
+            dst[15] = b.object_id.len() as u8;
+            dst[16..16 + b.object_id.len()].copy_from_slice(b.object_id);
+        }
+    }
+    Ok(needed)
+}
+
+/// Returns `(cid, status, binding)`; the binding is present exactly
+/// when the status is `STATUS_OK`.
+pub fn decode_admin_lookup_ack(
+    src: &[u8],
+) -> Result<(u32, u8, Option<AdminBinding<'_>>), WireError> {
+    if src.len() < 6 {
+        return Err(WireError::Truncated);
+    }
+    if src[0] != OP_LOOKUP {
+        return Err(WireError::BadOpcode { observed: src[0] });
+    }
+    let cid = u32::from_le_bytes(src[1..5].try_into().unwrap());
+    let status = src[5];
+    if status != STATUS_OK {
+        return Ok((cid, status, None));
+    }
+    if src.len() < 16 {
+        return Err(WireError::Truncated);
+    }
+    let oid_len = src[15] as usize;
+    if src.len() < 16 + oid_len {
+        return Err(WireError::Truncated);
+    }
+    Ok((
+        cid,
+        status,
+        Some(AdminBinding {
+            revision: u64::from_le_bytes(src[6..14].try_into().unwrap()),
+            kind: src[14],
+            object_id: &src[16..16 + oid_len],
+        }),
     ))
 }

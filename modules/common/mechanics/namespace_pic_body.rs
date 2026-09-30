@@ -166,9 +166,23 @@ pub struct ModuleState {
     /// Object ids a lifecycle sweep has reserved for deletion, by
     /// hash. A BIND naming a reserved id is refused with
     /// `NAK_RESERVED` so the sweep's absence proof holds up to the
-    /// deletion. Arena-only and never logged — see
-    /// `loam_wire::encode_gc_reserve_req`.
+    /// deletion. Logged with the binds they exclude, and not
+    /// reinstated on replay — see `loam_wire::encode_gc_reserve_req`.
     pub gc_reserved: [u64; GC_RESERVE_MAX],
+    /// Volume writer leases. Logged and, in replicated mode, proposed
+    /// like any mutating record, so every replica applies the same
+    /// verdicts in the same order. Carried across a WAL rotation by
+    /// seeding the new log with the table (`OP_LEASE_RESTORE`): no
+    /// snapshot holds it, and a fence forgotten is a fence reissued.
+    pub leases: super::state::LeaseTable<{ super::limits::LEASE_SLOTS }>,
+    /// The verdict `apply_op` reached on the lease record it just
+    /// applied, encoded for `respond_applied`. A verdict cannot be
+    /// re-derived from the table afterwards the way a reservation can:
+    /// a refused acquire and a granted one can leave it identical.
+    pub lease_resp: [u8; super::wire::LEASE_RESP_LEN],
+    /// The verdict on the volume record `apply_op` just applied, for the
+    /// same reason as `lease_resp`.
+    pub volume_resp: [u8; super::wire::VOLUME_RESP_LEN],
     /// Inline WAL path, populated by the TLV `wal_path` param
     /// handler in the PIC mod.rs. `wal_path_len == 0` means
     /// channel-only mode (no WAL).
@@ -364,6 +378,21 @@ pub unsafe fn open_and_replay_wal(state_ptr: *mut u8, wal_path: &[u8]) -> i32 {
     let sptr = state_ptr as *mut ModuleState;
     let mut replay_errors: u32 = 0;
     let replay_rc = super::wal::wal_replay(sys, fd, &mut scratch, |payload| {
+        // A deletion reservation belongs to a sweep in THIS process, and
+        // a restart has ended it. Reinstating one the sweep never got to
+        // release would refuse every volume flush from then on.
+        // What a reservation decided about expired flushes is part of
+        // the log's history, though, and replays.
+        let op = super::wire::peek_opcode(payload);
+        if op == Some(super::wire::OP_GC_RESERVE) {
+            if let Ok((_, now)) = super::wire::decode_gc_reserve_req(payload) {
+                let _ = (*sptr).leases.end_expired_flushes(now);
+            }
+            return true;
+        }
+        if op == Some(super::wire::OP_GC_RELEASE) {
+            return true;
+        }
         if apply_op(&mut *sptr, sys, payload).is_err() {
             replay_errors = replay_errors.wrapping_add(1);
         }
@@ -483,6 +512,15 @@ unsafe fn init_state(
         core::mem::size_of::<super::wal::WalAppender>(),
     );
     s.gc_reserved = [0u64; GC_RESERVE_MAX];
+    // All-zero is the empty table; in place for the same reason as
+    // the binding arena.
+    core::ptr::write_bytes(
+        core::ptr::addr_of_mut!(s.leases) as *mut u8,
+        0,
+        core::mem::size_of::<super::state::LeaseTable<{ super::limits::LEASE_SLOTS }>>(),
+    );
+    s.lease_resp = [0u8; super::wire::LEASE_RESP_LEN];
+    s.volume_resp = [0u8; super::wire::VOLUME_RESP_LEN];
     s.snap_fd = -1;
     s.cmp_writer_fd = -1;
     s.wal_path_len = 0;
@@ -606,7 +644,10 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                 | super::wire::OP_LIST
                 | super::wire::OP_REFERENCED
                 | super::wire::OP_GC_RESERVE
-                | super::wire::OP_GC_RELEASE),
+                | super::wire::OP_GC_RELEASE
+                | super::wire::OP_LEASE
+                | super::wire::OP_VOLUME
+                | super::wire::OP_VOLUME_ROOTS),
             ) => op,
             _ => {
                 s.apply_errors = s.apply_errors.wrapping_add(1);
@@ -628,6 +669,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         if op == super::wire::OP_LOOKUP
             || op == super::wire::OP_LIST
             || op == super::wire::OP_REFERENCED
+            || op == super::wire::OP_VOLUME_ROOTS
         {
             if s.replicated != 0 && s.read_ready == 0 {
                 // Replay hasn't converged: answering now could serve a
@@ -639,6 +681,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
             match op {
                 super::wire::OP_LOOKUP => handle_lookup(s, syscalls, bytes),
                 super::wire::OP_LIST => handle_list(s, syscalls, bytes),
+                super::wire::OP_VOLUME_ROOTS => handle_volume_roots(s, syscalls, bytes),
                 _ => handle_referenced(s, syscalls, bytes),
             }
             handled = handled.wrapping_add(1);
@@ -813,7 +856,10 @@ unsafe fn drain_committed(s: &mut ModuleState, syscalls: &super::SyscallTable) {
                 }
             };
         // Copy the inner out so the arena/WAL calls don't alias cmt_asm.
-        let mut inner_buf = [0u8; READ_BUF];
+        // Sized to the largest record the WAL takes: a commit is logged
+        // before it applies, so no smaller bound is one a request of this
+        // module's can exceed and still be answered.
+        let mut inner_buf = [0u8; STAGED_REC];
         if inner_len > inner_buf.len() {
             s.apply_errors = s.apply_errors.wrapping_add(1);
             off += rec_len;
@@ -822,6 +868,14 @@ unsafe fn drain_committed(s: &mut ModuleState, syscalls: &super::SyscallTable) {
         let hdr = super::decision::COMMITTED_HDR;
         inner_buf[..inner_len].copy_from_slice(&s.cmt_asm[off + hdr..off + hdr + inner_len]);
         let inner = &inner_buf[..inner_len];
+        // A restore record is this module's own log entry, never a
+        // proposal. One arriving as a commit could set a fence
+        // directly, so it is refused; it answers no request of ours.
+        if inner.first() == Some(&super::wire::OP_LEASE_RESTORE) {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            off += rec_len;
+            continue;
+        }
         let live = s.outstanding > 0;
         // The local WAL is this PIC's recovery authority (see
         // `docs/architecture.md`), so a committed record that cannot
@@ -935,9 +989,7 @@ unsafe fn resolve_staged(s: &mut ModuleState, syscalls: &super::SyscallTable, du
         s.apply_errors = s.apply_errors.wrapping_add(1);
     }
     if owes_ack {
-        let mut echo = [0u8; READ_BUF];
-        echo[..n].copy_from_slice(&payload[..n]);
-        respond_applied(s, syscalls, &echo[..n], result);
+        respond_applied(s, syscalls, &payload[..n], result);
     }
 }
 
@@ -1127,7 +1179,11 @@ unsafe fn handle_referenced(s: &mut ModuleState, syscalls: &super::SyscallTable,
     // conservative direction survives: hash-only records (no
     // inline oid bytes) count as referenced.
     const REF_SCAN_PER_CALL: u32 = 128;
-    let mut referenced = cursor == 0 && s.bindings.object_id_referenced(oid);
+    // An open volume flush is writing bodies that no binding names yet
+    // and that its commit is about to make reachable. Nothing can be
+    // proven unreferenced until it ends, on any page of the proof.
+    let mut referenced =
+        s.leases.any_flushing() || (cursor == 0 && s.bindings.object_id_referenced(oid));
     let mut next_cursor = 0u32;
     if !referenced && s.snap_active != 0 {
         let snap = super::snapshot::OpenSnapshot {
@@ -1183,7 +1239,7 @@ unsafe fn respond_applied(
     match result {
         Ok(op) if op == super::wire::OP_GC_RESERVE => {
             let held = match super::wire::decode_gc_reserve_req(payload) {
-                Ok(id) => s.gc_reserved.contains(&super::state::fnv1a64(id)),
+                Ok((id, _)) => s.gc_reserved.contains(&super::state::fnv1a64(id)),
                 Err(_) => false,
             };
             let mut buf = [0u8; 2];
@@ -1193,8 +1249,21 @@ unsafe fn respond_applied(
                 }
             }
         }
+        Ok(op) if op == super::wire::OP_LEASE => {
+            if s.out_chan >= 0 {
+                let resp = s.lease_resp;
+                let _ = s.reply.send(syscalls.channel_write, s.out_chan, &resp);
+            }
+        }
+        Ok(op) if op == super::wire::OP_VOLUME => {
+            if s.out_chan >= 0 {
+                let resp = s.volume_resp;
+                let _ = s.reply.send(syscalls.channel_write, s.out_chan, &resp);
+            }
+        }
         Ok(op) => respond(s, syscalls, op),
         Err(ApplyFault::Reserved) => respond(s, syscalls, NAK_RESERVED),
+        Err(ApplyFault::Fenced) => respond(s, syscalls, super::wire::NAK_FENCED),
         Err(ApplyFault::Rejected) => respond(s, syscalls, 0xFF),
     }
 }
@@ -1206,6 +1275,10 @@ unsafe fn respond_applied(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ApplyFault {
     Reserved,
+    /// A plain record that would change a volume binding: deterministic,
+    /// like `Reserved`, and answered distinctly so a caller can tell a
+    /// fenced refusal from an absent key.
+    Fenced,
     Rejected,
 }
 
@@ -1233,8 +1306,11 @@ unsafe fn apply_op(
     // decision about a globally ordered stream — the leader could
     // admit a bind that a follower refuses.
     if op == super::wire::OP_GC_RESERVE || op == super::wire::OP_GC_RELEASE {
-        let object_id =
+        let (object_id, now) =
             super::wire::decode_gc_reserve_req(payload).map_err(|_| ApplyFault::Rejected)?;
+        if op == super::wire::OP_GC_RESERVE {
+            let _ = s.leases.end_expired_flushes(now);
+        }
         let oid_h = super::state::fnv1a64(object_id);
         if op == super::wire::OP_GC_RELEASE {
             for slot in s.gc_reserved.iter_mut() {
@@ -1252,6 +1328,60 @@ unsafe fn apply_op(
         }
         return Ok(op);
     }
+    // Leases are decided here for the same reason reservations are:
+    // this is where records are ordered. A refusal is a verdict, not a
+    // fault — it answers with a status and replays to the same one.
+    if op == super::wire::OP_LEASE {
+        let req = super::wire::decode_lease_req(payload).map_err(|_| ApplyFault::Rejected)?;
+        let out = s.leases.apply(
+            req.mode,
+            req.namespace_root,
+            req.path,
+            &req.holder,
+            req.now_ms,
+            req.ttl_ms,
+        );
+        let status = match out.status {
+            super::state::LeaseStatus::Granted => super::wire::LEASE_GRANTED,
+            super::state::LeaseStatus::Held => super::wire::LEASE_HELD,
+            super::state::LeaseStatus::Lost => super::wire::LEASE_LOST,
+            super::state::LeaseStatus::Busy => super::wire::LEASE_BUSY,
+            super::state::LeaseStatus::BadRequest => super::wire::LEASE_BAD_REQ,
+            super::state::LeaseStatus::Stale => super::wire::LEASE_STALE,
+        };
+        super::wire::encode_lease_resp(&mut s.lease_resp, status, out.fence, out.expires_at)
+            .map_err(|_| ApplyFault::Rejected)?;
+        return Ok(op);
+    }
+    if op == super::wire::OP_LEASE_RESTORE {
+        let r = super::wire::decode_lease_restore(payload).map_err(|_| ApplyFault::Rejected)?;
+        if !s.leases.restore(
+            r.namespace_root,
+            r.path,
+            &r.holder,
+            r.fence,
+            r.expires_at_ms,
+            r.stamp_ms,
+            r.live,
+            r.fence_floor,
+            r.stamp_floor,
+        ) {
+            return Err(ApplyFault::Rejected);
+        }
+        if super::wire::lease_restore_flushing(payload) {
+            let _ = s
+                .leases
+                .set_flushing(r.namespace_root, r.path, &r.holder, true);
+        }
+        return Ok(op);
+    }
+    if op == super::wire::OP_VOLUME {
+        let req = super::wire::decode_volume_req(payload).map_err(|_| ApplyFault::Rejected)?;
+        let (status, revision) = judge_volume(s, syscalls, &req);
+        super::wire::encode_volume_resp(&mut s.volume_resp, status, revision)
+            .map_err(|_| ApplyFault::Rejected)?;
+        return Ok(op);
+    }
     if op == super::wire::OP_BIND {
         let dec = super::wire::decode_bind(payload).map_err(|_| ApplyFault::Rejected)?;
         if s.gc_reserved
@@ -1259,39 +1389,33 @@ unsafe fn apply_op(
         {
             return Err(ApplyFault::Reserved);
         }
-    }
-    if op == super::wire::OP_UNBIND && s.snap_active != 0 {
-        let dec = super::wire::decode_unbind(payload).map_err(|_| ApplyFault::Rejected)?;
-        let (ns_h, p_h) = super::state::key_hash(dec.namespace_root, dec.path);
-        let revision = match s
-            .bindings
-            .lookup_hashed(ns_h, p_h, dec.namespace_root, dec.path)
+        // A volume binding is made and moved only by a VOLUME record,
+        // under the volume's lease and a revision compare-and-set. A
+        // plain bind creating one, or replacing one, would be a commit
+        // nobody fenced.
+        if dec.kind == super::wire::KIND_VOLUME
+            || is_volume_binding(s, syscalls, dec.namespace_root, dec.path)
         {
-            Some(slot) if slot.kind == super::state::KIND_TOMBSTONE => {
-                return Err(ApplyFault::Rejected)
-            }
-            Some(slot) => slot.revision,
-            None => {
-                let snap = super::snapshot::OpenSnapshot {
-                    fd: s.snap_fd,
-                    count: s.snap_count,
-                    generation: s.snap_gen,
-                };
-                match super::snapshot::snap_search(syscalls, &snap, ns_h, p_h) {
-                    Some(rec) => rec.revision,
-                    None => return Err(ApplyFault::Rejected),
-                }
-            }
-        };
-        let mut res = s.bindings.tombstone(dec.namespace_root, dec.path, revision);
-        if res == Err(super::state::ApplyError::OutOfCapacity) && s.bindings.evict_one_snapshotted()
-        {
-            s.evictions = s.evictions.wrapping_add(1);
-            res = s.bindings.tombstone(dec.namespace_root, dec.path, revision);
+            return Err(ApplyFault::Fenced);
         }
-        return res
-            .map(|_| super::wire::OP_UNBIND)
-            .map_err(|_| ApplyFault::Rejected);
+    }
+    if op == super::wire::OP_RENAME {
+        let dec = super::wire::decode_rename(payload).map_err(|_| ApplyFault::Rejected)?;
+        if is_volume_binding(s, syscalls, dec.namespace_root, dec.from)
+            || is_volume_binding(s, syscalls, dec.namespace_root, dec.to)
+        {
+            return Err(ApplyFault::Fenced);
+        }
+    }
+    if op == super::wire::OP_UNBIND {
+        let dec = super::wire::decode_unbind(payload).map_err(|_| ApplyFault::Rejected)?;
+        if is_volume_binding(s, syscalls, dec.namespace_root, dec.path) {
+            return Err(ApplyFault::Fenced);
+        }
+        if s.snap_active != 0 {
+            return remove_binding(s, syscalls, dec.namespace_root, dec.path)
+                .map(|_| super::wire::OP_UNBIND);
+        }
     }
     match apply_to_arena(&mut s.bindings, payload) {
         Ok(op) => Ok(op),
@@ -1307,6 +1431,359 @@ unsafe fn apply_op(
                 return apply_to_arena(&mut s.bindings, payload).map_err(|_| ApplyFault::Rejected);
             }
             Err(ApplyFault::Rejected)
+        }
+    }
+}
+
+/// Encode lease entry `i` as the record that reinstates it: `Some(0)`
+/// for an unused slot, `None` when it cannot be encoded — which
+/// abandons the rotation rather than write a log missing a fence.
+fn seed_lease(
+    leases: &super::state::LeaseTable<{ super::limits::LEASE_SLOTS }>,
+    i: usize,
+    buf: &mut [u8],
+) -> Option<usize> {
+    let e = leases.entry(i)?;
+    if e.used == 0 {
+        return Some(0);
+    }
+    let rec = super::wire::DecodedLeaseRestore {
+        namespace_root: e.root(),
+        path: e.path(),
+        holder: e.holder,
+        fence: e.fence,
+        expires_at_ms: e.expires_at,
+        stamp_ms: e.stamp,
+        live: e.live != 0,
+        fence_floor: leases.fence_floor(),
+        stamp_floor: leases.stamp_floor(),
+    };
+    let n = super::wire::encode_lease_restore(buf, &rec).ok()?;
+    if e.flushing != 0 && !super::wire::mark_lease_restore_flushing(&mut buf[..n]) {
+        return None;
+    }
+    Some(n)
+}
+
+/// Is `(namespace_root, path)` bound, live, as a volume? The arena is
+/// authoritative for a key it holds, tombstone included; otherwise the
+/// on-disk snapshot answers.
+unsafe fn is_volume_binding(
+    s: &ModuleState,
+    syscalls: &super::SyscallTable,
+    namespace_root: &[u8],
+    path: &[u8],
+) -> bool {
+    matches!(
+        volume_binding(s, syscalls, namespace_root, path, &[]),
+        Some((_, true, _))
+    )
+}
+
+/// Remove a binding, tombstoning it at its current revision while an
+/// on-disk snapshot may still hold a record for it.
+unsafe fn remove_binding(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    namespace_root: &[u8],
+    path: &[u8],
+) -> Result<(), ApplyFault> {
+    if s.snap_active == 0 {
+        return s
+            .bindings
+            .unbind(namespace_root, path)
+            .map(|_| ())
+            .map_err(|_| ApplyFault::Rejected);
+    }
+    let (ns_h, p_h) = super::state::key_hash(namespace_root, path);
+    let revision = match s.bindings.lookup_hashed(ns_h, p_h, namespace_root, path) {
+        Some(slot) if slot.kind == super::state::KIND_TOMBSTONE => {
+            return Err(ApplyFault::Rejected)
+        }
+        Some(slot) => slot.revision,
+        None => {
+            let snap = super::snapshot::OpenSnapshot {
+                fd: s.snap_fd,
+                count: s.snap_count,
+                generation: s.snap_gen,
+            };
+            match super::snapshot::snap_search(syscalls, &snap, ns_h, p_h) {
+                Some(rec) => rec.revision,
+                None => return Err(ApplyFault::Rejected),
+            }
+        }
+    };
+    let mut res = s.bindings.tombstone(namespace_root, path, revision);
+    if res == Err(super::state::ApplyError::OutOfCapacity) && s.bindings.evict_one_snapshotted() {
+        s.evictions = s.evictions.wrapping_add(1);
+        res = s.bindings.tombstone(namespace_root, path, revision);
+    }
+    res.map(|_| ()).map_err(|_| ApplyFault::Rejected)
+}
+
+/// The binding a volume record is judged against: its revision, whether
+/// it is a volume, and whether it already names `object_id` as one.
+/// `None` when the path is unbound or tombstoned. The arena is authoritative for any
+/// key it holds; otherwise the on-disk snapshot answers, as for LOOKUP.
+unsafe fn volume_binding(
+    s: &ModuleState,
+    syscalls: &super::SyscallTable,
+    namespace_root: &[u8],
+    path: &[u8],
+    object_id: &[u8],
+) -> Option<(u64, bool, bool)> {
+    let (ns_h, p_h) = super::state::key_hash(namespace_root, path);
+    if let Some(slot) = s.bindings.lookup_hashed(ns_h, p_h, namespace_root, path) {
+        if slot.kind == super::state::KIND_TOMBSTONE {
+            return None;
+        }
+        let volume = slot.kind == super::wire::KIND_VOLUME;
+        return Some((
+            slot.revision,
+            volume,
+            volume && slot.object_id() == object_id,
+        ));
+    }
+    if s.snap_active == 0 {
+        return None;
+    }
+    let snap = super::snapshot::OpenSnapshot {
+        fd: s.snap_fd,
+        count: s.snap_count,
+        generation: s.snap_gen,
+    };
+    let rec = super::snapshot::snap_search(syscalls, &snap, ns_h, p_h)?;
+    let oid = &rec.oid[..(rec.oid_len as usize).min(rec.oid.len())];
+    let volume = rec.kind == super::wire::KIND_VOLUME;
+    Some((rec.revision, volume, volume && oid == object_id))
+}
+
+/// Decide one volume record. Everything it reads is in the record, the
+/// lease table, the GC reservations and the bindings, all of which
+/// every replica holds identically at this point in the log.
+///
+/// A record stamped no later than the last one judged for the volume is
+/// a redelivered duplicate and changes nothing (answered as a lost
+/// lease: a live request always carries a fresh stamp, so only a
+/// duplicate lands here).
+unsafe fn judge_volume(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    req: &super::wire::DecodedVolumeReq<'_>,
+) -> (u8, u64) {
+    let root = req.namespace_root;
+    let path = req.path;
+    let current = volume_binding(s, syscalls, root, path, req.object_id);
+    let cur_rev = current.map_or(0, |c| c.0);
+    if req.now_ms == 0 || path.is_empty() {
+        return (super::wire::VOLUME_BAD_REQ, cur_rev);
+    }
+    match s.leases.touch(root, path, req.now_ms) {
+        Some(true) => {}
+        Some(false) | None => return (super::wire::VOLUME_LEASE_LOST, cur_rev),
+    }
+    // Same lease generation: a holder id alone could be a writer that
+    // has since re-acquired under a new fence and opened another flush.
+    let same_generation = match s.leases.lease(root, path) {
+        Some(e) => e.holder == req.holder && e.fence == req.fence,
+        None => false,
+    };
+    let holds = s
+        .leases
+        .holds(root, path, &req.holder, req.fence, req.now_ms);
+    match req.mode {
+        super::wire::VOLUME_BEGIN => {
+            if !holds {
+                return (super::wire::VOLUME_LEASE_LOST, cur_rev);
+            }
+            // A sweep holding a reservation has proven, or is proving,
+            // some body unreferenced, and may delete it next. A flush
+            // that began now could re-put those bytes (content
+            // addressing deduplicates the put into a no-op) and then
+            // commit a root that names them.
+            if s.gc_reserved.iter().any(|r| *r != 0) {
+                return (super::wire::VOLUME_RESERVED, cur_rev);
+            }
+            let _ = s.leases.set_flushing(root, path, &req.holder, true);
+            (super::wire::VOLUME_OK, cur_rev)
+        }
+        super::wire::VOLUME_ABORT => {
+            if !same_generation {
+                return (super::wire::VOLUME_LEASE_LOST, cur_rev);
+            }
+            let _ = s.leases.set_flushing(root, path, &req.holder, false);
+            (super::wire::VOLUME_OK, cur_rev)
+        }
+        super::wire::VOLUME_COMMIT => {
+            if req.object_id.is_empty() {
+                return (super::wire::VOLUME_BAD_REQ, cur_rev);
+            }
+            let next = match req.expected.checked_add(1) {
+                Some(n) => n,
+                None => return (super::wire::VOLUME_BAD_REQ, cur_rev),
+            };
+            // The same commit asked again after it landed — a reply
+            // lost on the way back — is done, not a conflict.
+            if let Some((rev, _, true)) = current {
+                if rev == next {
+                    return (super::wire::VOLUME_OK, rev);
+                }
+            }
+            if !holds {
+                if same_generation {
+                    let _ = s.leases.set_flushing(root, path, &req.holder, false);
+                }
+                return (super::wire::VOLUME_LEASE_LOST, cur_rev);
+            }
+            // The revision decides before the flush does, so a writer
+            // that lost the race hears that it lost.
+            if cur_rev != req.expected {
+                let _ = s.leases.set_flushing(root, path, &req.holder, false);
+                return (super::wire::VOLUME_CONFLICT, cur_rev);
+            }
+            // Only a flush that has been open since before its bodies
+            // were written may commit: the open flush is what kept the
+            // orphan GC from collecting them.
+            if !s.leases.is_flushing(root, path, &req.holder) {
+                return (super::wire::VOLUME_BAD_REQ, cur_rev);
+            }
+            let _ = s.leases.set_flushing(root, path, &req.holder, false);
+            let mut res =
+                s.bindings
+                    .commit_bind(root, path, req.object_id, super::wire::KIND_VOLUME, next);
+            if res == Err(super::state::ApplyError::OutOfCapacity)
+                && s.snap_active != 0
+                && s.bindings.evict_one_snapshotted()
+            {
+                s.evictions = s.evictions.wrapping_add(1);
+                res = s.bindings.commit_bind(
+                    root,
+                    path,
+                    req.object_id,
+                    super::wire::KIND_VOLUME,
+                    next,
+                );
+            }
+            match res {
+                Ok(_) => (super::wire::VOLUME_OK, next),
+                Err(_) => (super::wire::VOLUME_BAD_REQ, cur_rev),
+            }
+        }
+        super::wire::VOLUME_DELETE => {
+            if !holds {
+                return (super::wire::VOLUME_LEASE_LOST, cur_rev);
+            }
+            let _ = s.leases.set_flushing(root, path, &req.holder, false);
+            match current {
+                Some((rev, true, _)) if rev == req.expected => {}
+                Some((_, false, _)) => return (super::wire::VOLUME_BAD_REQ, cur_rev),
+                _ => return (super::wire::VOLUME_CONFLICT, cur_rev),
+            }
+            match remove_binding(s, syscalls, root, path) {
+                Ok(()) => (super::wire::VOLUME_OK, req.expected),
+                Err(_) => (super::wire::VOLUME_BAD_REQ, cur_rev),
+            }
+        }
+        _ => (super::wire::VOLUME_BAD_REQ, cur_rev),
+    }
+}
+
+/// `sha256:<64 lowercase hex>` back to its digest; `None` for any other
+/// object id, which names no map root.
+fn digest_of_object_id(object_id: &[u8]) -> Option<[u8; 32]> {
+    if object_id.len() != 7 + 64 || &object_id[..7] != b"sha256:" {
+        return None;
+    }
+    let mut digest = [0u8; 32];
+    let mut i = 0usize;
+    while i < 32 {
+        let hi = hex_nibble(object_id[7 + 2 * i])?;
+        let lo = hex_nibble(object_id[7 + 2 * i + 1])?;
+        digest[i] = (hi << 4) | lo;
+        i += 1;
+    }
+    Some(digest)
+}
+
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// Serve a VOLUME_ROOTS request: one page of the map roots volume
+/// bindings name, for the orphan GC's walk. Read-only, like LOOKUP.
+///
+/// The cursor walks the arena, then the on-disk snapshot, examining at
+/// most `ROOTS_SCAN_PER_CALL` entries per call so a service-class
+/// arena cannot hold the lane. A snapshot record for a key the arena
+/// has since superseded is still offered: walking a root no longer
+/// current keeps more than it must, never less.
+unsafe fn handle_volume_roots(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) {
+    const ROOTS_SCAN_PER_CALL: u32 = 128;
+    let cursor = match super::wire::decode_volume_roots_req(bytes) {
+        Ok(c) => c,
+        Err(_) => {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            respond(s, syscalls, 0xFF);
+            return;
+        }
+    };
+    let arena_cap = s.bindings.capacity() as u32;
+    let snap_count = if s.snap_active != 0 { s.snap_count } else { 0 };
+    let end_all = arena_cap.saturating_add(snap_count);
+    let end = cursor.saturating_add(ROOTS_SCAN_PER_CALL).min(end_all);
+    let mut found = [[0u8; 32]; super::wire::MAX_VOLUME_ROOTS];
+    let mut count = 0usize;
+    let mut idx = cursor;
+    let snap = super::snapshot::OpenSnapshot {
+        fd: s.snap_fd,
+        count: s.snap_count,
+        generation: s.snap_gen,
+    };
+    while idx < end && count < super::wire::MAX_VOLUME_ROOTS {
+        if idx < arena_cap {
+            if let Some(slot) = s.bindings.slot_ref(idx as usize) {
+                if slot.occupied && slot.kind == super::wire::KIND_VOLUME {
+                    if let Some(d) = digest_of_object_id(slot.object_id()) {
+                        found[count] = d;
+                        count += 1;
+                    }
+                }
+            }
+        } else {
+            match super::snapshot::snap_read_at(syscalls, &snap, idx - arena_cap) {
+                Some(rec) if rec.kind == super::wire::KIND_VOLUME => {
+                    let oid = &rec.oid[..(rec.oid_len as usize).min(rec.oid.len())];
+                    if let Some(d) = digest_of_object_id(oid) {
+                        found[count] = d;
+                        count += 1;
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    // An unreadable snapshot cannot be walked, and a walk
+                    // that skipped part of it would prove too much.
+                    respond(s, syscalls, 0xFF);
+                    return;
+                }
+            }
+        }
+        idx += 1;
+    }
+    let next = if idx >= end_all { 0 } else { idx };
+    let mut out = [0u8; super::wire::VOLUME_ROOTS_HDR + super::wire::MAX_VOLUME_ROOTS * 32];
+    match super::wire::encode_volume_roots_resp(&mut out, next, s.snap_gen, &found[..count]) {
+        Ok(n) => {
+            if s.out_chan >= 0 {
+                let _ = s.reply.send(syscalls.channel_write, s.out_chan, &out[..n]);
+            }
+        }
+        Err(_) => {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            respond(s, syscalls, 0xFF);
         }
     }
 }
@@ -1461,10 +1938,18 @@ unsafe fn compaction_step(s: &mut ModuleState, syscalls: &super::SyscallTable) {
                 s.snap_count = new_snap.count;
                 s.snap_gen = new_snap.generation;
                 if s.wal_fd >= 0 {
-                    match super::wal::wal_rotate(
+                    // The snapshot holds bindings only. The lease table
+                    // lives in the log, so the new log opens with it.
+                    let leases = &s.leases;
+                    let wal_path = &s.wal_path[..s.wal_path_len as usize];
+                    let scratch = &mut s.append_scratch;
+                    match super::wal::wal_rotate_seeded(
                         syscalls,
                         s.wal_fd,
-                        &s.wal_path[..s.wal_path_len as usize],
+                        wal_path,
+                        leases.capacity(),
+                        scratch,
+                        |i, buf| seed_lease(leases, i, buf),
                     ) {
                         Ok(super::wal::RotateOutcome::Rotated(new_fd)) => {
                             s.wal_fd = new_fd;
@@ -1638,6 +2123,7 @@ const E_INVAL: i32 = -22;
 const E_NOENT: i32 = -2;
 const E_NOSYS: i32 = -38;
 const E_EXIST: i32 = -17;
+const E_PERM: i32 = -1;
 const E_MFILE: i32 = -24;
 
 /// Write one `LIST` entry into `out`, answering whether it fitted.
@@ -1907,6 +2393,14 @@ unsafe fn live_slot(s: &ModuleState, path: &[u8]) -> Option<(u32, u64)> {
     None
 }
 
+/// Is `path` (in the provider surface's root) bound as a volume?
+unsafe fn live_volume(s: &ModuleState, path: &[u8]) -> bool {
+    match s.syscalls.as_ref() {
+        Some(sys) => is_volume_binding(s, sys, &[], path),
+        None => false,
+    }
+}
+
 unsafe fn alloc_handle(s: &mut ModuleState, slot: u32, revision: u64) -> i32 {
     for (i, h) in s.ns_open.iter_mut().enumerate() {
         if h.in_use == 0 {
@@ -2056,6 +2550,11 @@ pub unsafe fn provider_dispatch_impl(
             // Without a caller-supplied revision, a replace request
             // advances past the current one and a plain bind does not,
             // which is what makes `flags` mean what the contract says.
+            // A volume is bound and replaced only by a VOLUME record,
+            // under its lease; this surface has neither.
+            if kind == super::wire::KIND_VOLUME || live_volume(s, path) {
+                return E_PERM;
+            }
             let existing = live_slot(s, path).map(|(_, rev)| rev);
             let revision = match existing {
                 Some(rev) => {
@@ -2102,6 +2601,9 @@ pub unsafe fn provider_dispatch_impl(
                 return E_INVAL;
             }
             let path = &a[2..2 + path_len];
+            if live_volume(s, path) {
+                return E_PERM;
+            }
             let rev = match live_slot(s, path) {
                 Some((_, rev)) => rev,
                 None => return E_NOENT,
@@ -2151,6 +2653,9 @@ pub unsafe fn provider_dispatch_impl(
             let Some((idx, rev)) = live_slot(s, from) else {
                 return E_NOENT;
             };
+            if live_volume(s, from) {
+                return E_PERM;
+            }
             if live_slot(s, to).is_some() {
                 return E_EXIST;
             }

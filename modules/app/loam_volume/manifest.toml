@@ -1,0 +1,40 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712", "linux"]
+
+# A `storage.block` source over one Loam volume: reads
+# resolve through the committed extent map, writes stage in memory, and
+# FLUSH / FUA / PREFLUSH complete after the fenced commit that binds the
+# volume's path to a new root. Tools-only, never serialized to the .fmod.
+#
+# Honest fence class: `RevisionMonotone { source, revision }` on durable
+# completions — the volume's commit point, which is what the admin VOLUME
+# ack proves. It carries no replica-group commit proof, so this module
+# does not claim `ReplicatedDurable` even on a replicated node.
+provides = ["storage.block"]
+
+# Acks from the node's admin surface: `admin_router.admin_out` when
+# co-located.
+[[ports]]
+name = "admin_resp"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 65536
+
+# The block device. First output, so it is `out_chan`.
+[[ports]]
+name = "blocks"
+direction = "output"
+content_type = "OctetStream"
+required = true
+
+# Requests to the node's admin surface: `admin_router.admin_in` when
+# co-located. Sized so one full-page PUT is one write — `admin_router`
+# takes a request in a single read.
+[[ports]]
+name = "admin_req"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 65536
+
+[observability]
+exempt = "block source — block I/O is observed at the consumer above it; commit and fetch counters are in-arena and readable by the host harness"

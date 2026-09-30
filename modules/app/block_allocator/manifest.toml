@@ -10,11 +10,11 @@ hardware_targets = ["bcm2712"]
 # storage, not a block device, and no consumer that resolved
 # `storage.block` by contract would find what it came for.
 #
-# Loam's actual block data path is the extent plane — fixed-size
-# extents as keyed bodies under derived keys
-# (`common/mechanics/loam_extent_wire.rs`), replicated by the fan-out
-# router like any other body. This module remains that plane's volume
-# registry. Honest fence class: LocalDurable (WAL-backed volume
+# Loam's actual block data path is the volume map — fixed-size
+# extents as content-addressed bodies under a copy-on-write map
+# (`common/mechanics/loam_volume_map_wire.rs`), committed by a
+# namespace bind and replicated by the fan-out router like any other
+# body. This module is not on that path. Honest fence class: LocalDurable (WAL-backed volume
 # metadata).
 
 [[ports]]

@@ -22,8 +22,8 @@ path = "src/nbd_main.rs"
 workspace = true
 
 [dependencies]
-# Not dev-only any more: `loam-nbd` is a shipped binary built on the
-# client crate, which is exactly the consumer the client exists for.
+# `loam-nbd` is a shipped binary built on the client crate, which is
+# exactly the consumer the client exists for.
 loam-client = { path = "../loam-client" }
 tempfile = "3.23.0"
 anyhow = "1.0.95"
@@ -31,6 +31,14 @@ clap = { version = "4.5.20", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.145", features = ["preserve_order"] }
 loam = { path = "../.." }
+# TLS 1.3 for the remote admin surface, on the ring provider: one
+# crypto backend, no C toolchain, and no TLS 1.2 code compiled at all.
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
+# The verified client certificate's names, which are the caller's
+# identity; the same crate rustls verifies the chain with.
+rustls-webpki = { version = "0.103.15", default-features = false, features = ["ring", "std"] }
 
 [dev-dependencies]
 tempfile = "3.23.0"
+# Test PKI minted per run, so no key material is committed.
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }

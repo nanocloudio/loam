@@ -27,7 +27,8 @@ Slot counts below are the bare-metal profile; see
 
 | Module | Surface | What it does |
 |---|---|---|
-| `namespace_router` | `storage.namespace` | Arena (256 binding slots) over a compacted snapshot file + WAL-backed durability via the fluxor `fs` contract. The graph's one registered provider: exports `module_provides_contract` + `module_provider_dispatch`, answering `LOOKUP`, `STAT`, `CLOSE`, `BIND`, `RENAME`, `DELETE`, `CAPS` and the change pair `SUBSCRIBE` / `CHANGES` that level-triggered consumers reconcile against. `LIST` alone is channel-only — a listing is cursor-paged and a `provider_call` returns one buffer |
+| `namespace_router` | `storage.namespace` | Arena (256 binding slots) over a compacted snapshot file + WAL-backed durability via the fluxor `fs` contract. The namespace provider: exports `module_provides_contract` + `module_provider_dispatch`, answering `LOOKUP`, `STAT`, `CLOSE`, `BIND`, `RENAME`, `DELETE`, `CAPS` and the change pair `SUBSCRIBE` / `CHANGES` that level-triggered consumers reconcile against. `LIST` alone is channel-only — a listing is cursor-paged and a `provider_call` returns one buffer |
+| `loam_volume` | `storage.block` | [`common/replicated/loam_volume_body.rs`](common/replicated/loam_volume_body.rs); one Loam volume as a block device, reached over the admin wire (`admin_req` / `admin_resp`). Holds the volume's writer lease and renews it each half TTL, reads through the committed extent map, stages writes, and completes `FLUSH` / `FUA` / `PREFLUSH` after the fenced commit, with `RevisionMonotone` at the new revision. `EXEC` completes in-call when nothing must be fetched or committed and answers `EAGAIN` otherwise; `SUBMIT` / `REAP` carry the rest. A refused commit, a lost lease or a silent node closes the device |
 
 `object_index` (whole-set arena, 256 object slots) and
 `block_allocator` (64 volume slots) are WAL-backed and reachable by
@@ -44,7 +45,7 @@ in place, next to the claim it declines to make.
 | `raft_metadata_client` | [`common/replicated/raft_proposer_body.rs`](common/replicated/raft_proposer_body.rs); proposes through a replica group, carries a WAL, addresses results by the producer's correlation id |
 | `clustor_bridge` | Carries loam's decision records across the replica group's channel envelope via the consumer facade |
 | `admin_router` | The admin op surface: bind, file and body ops, plus orphan-body GC |
-| `body_store` | Content-addressed blob store with streamed writes and keyed extents |
+| `body_store` | Content-addressed blob store with streamed writes and keyed EC shards |
 | `block_log` | Append/replay log body — durability as a channel rather than as a syscall |
 | `ec_body_router` | Erasure-coded fan-out, reconstructing reads, scrub with re-placement |
 | `placement_router` | Owns fleet membership + broadcasts a FleetEpoch snapshot on every change; consumers cache and compute placement locally via [`common/replicated/loam_placement.rs`](common/replicated/loam_placement.rs) |
@@ -268,36 +269,62 @@ next_cursor=0 → definitively unreferenced; otherwise the caller
 deciding delete. Conservative direction survives at every edge:
 hash-only records, read failures, and snapshot records masked by
 an arena tombstone all answer "referenced" (the tombstoned blob
-is collected after compaction drops the record).
+is collected after compaction drops the record). While any volume
+flush is open every page answers "referenced": the flush is writing
+bodies no binding names yet.
 
-## Block volumes: mutable keyed extents
+OP_VOLUME_ROOTS pages the map-root digests of every `VOLUME`
+binding, arena then snapshot, 128 entries examined and at most 6
+digests returned per page, with the snapshot generation as a `view`
+the GC checks is unchanged across the walk.
 
-A block volume is an ordinary content-addressed DESCRIPTOR file
-(`common/mechanics/loam_extent_wire.rs`: `LVOL` magic, volume_id, size,
-extent size — bound at the volume's path, so volume metadata
-rides bind/replication/GC unchanged) plus N fixed-size extents in
-the body plane under derived keys
-`sha256("loam-vol-extent" ‖ volume_id ‖ index)`. Extent blobs are
-self-describing (`LVEX` header echoes the key, which is how
-disk-fallback reads verify them) and MUTABLE: `PUT_KEYED`
-overwrites, last write wins (body_store unlinks before create —
-FS_OPEN_CREATE doesn't truncate, and a shorter overwrite must not
-leave a stale tail for the restart-time fallback read). The
-fanout router fans PUT_KEYED all-must-succeed to the key's ranked
-replica set, so extents replicate exactly like bodies.
+## Block volumes: committed roots over content-addressed extents
 
-Ownership: body_store slots and SCAN entries carry a KEYED flag
-(restored after restart by a 4-byte magic sniff in the disk
-sweep). The orphan GC skips keyed entries — extents and EC shards
-are never orphan-collectable; their lifecycle belongs to their
-writers (volume delete / EC scrub). Sub-extent writes
-read-modify-write in `loam-client` (sound under the one-publisher
-discipline a block volume's consumer enforces). Admin surface:
-`PUT_BODY_KEYED` / `DELETE_BODY`; client surface:
-create/open/volume_read/volume_write/delete_volume.
+A block volume is a copy-on-write map of content-addressed extent
+bodies (`common/mechanics/loam_volume_map_wire.rs`):
 
-Known trade: the replication scrub skips keyed entries, because a
-heal re-put would store them under a content hash rather than their
-key. HEAD takes the same disk fallback GET does (slot miss →
+    root  [LVMR][volume_id:16][size:u64][extent_size:u32][depth:u8][0:u8]
+          [count:u16][digest:32 × count]
+    leaf  [LVML][first_index:u64][count:u16][digest:32 × count]
+
+`P = 1024` digests per page. Depth 1 when the volume has at most `P`
+extents (the root lists extents), depth 2 up to `P²` (the root lists
+leaves); larger is refused at creation — 32 GiB at 32 KiB extents,
+60 GiB at the 60 KiB extent ceiling. The zero digest is "never
+written" and reads as zeros, so neither an all-zero extent nor an
+all-zero leaf is stored. Decoding is strict (the count must be
+exactly what the geometry needs, the depth the smallest that covers
+it) and uses no runtime division, because `admin_router` decodes
+pages inside the GC.
+
+The volume's path is bound to the root digest as a `KIND_VOLUME`
+binding. `loam-client`'s `VolumeWriter` holds the volume's lease,
+stages whole extents in memory, and flushes as one namespace
+`VOLUME` commit: `BEGIN`, then the extent bodies, changed leaves and
+new root, then `COMMIT` at the next revision — refused `CONFLICT`
+when another commit landed first and `LEASE_LOST` when its fence is
+no longer the live lease's. `DELETE` unbinds under the same lease
+and revision check, and a plain `BIND` / `RENAME` / `UNBIND` that
+would create, replace, move or remove a volume binding is refused
+`NAK_FENCED`. Nothing is mutable, so the bind is the
+atomic point and a stale body replica cannot claim to be current:
+readers resolve the path through the namespace and read bodies by
+digest.
+
+Keyed blobs remain only for EC shards, whose content is a function of
+their key: `PUT_KEYED` overwrites — atomically by rename where the
+storage provider offers it, and otherwise by unlinking the old entry
+first, so a shorter payload never inherits a stale tail (see
+[`docs/durability.md`](../docs/durability.md)) — and the
+fanout router fans it all-must-succeed to the key's ranked replica
+set. body_store slots and SCAN entries carry a KEYED flag (restored
+after restart by a magic sniff in the disk sweep), and the orphan GC
+skips keyed entries; their lifecycle belongs to the EC scrub. Admin
+surface: `PUT_BODY_KEYED` / `DELETE_BODY`.
+
+The replication scrub heals keyed entries too, re-putting each under
+its key: the keyed flag travels from the scan to the repair, because
+a re-put by content would store the blob under a name nothing looks
+it up by. HEAD takes the same disk fallback GET does (slot miss →
 FS_STAT + magic sniff), so STAT and GET answer correctly right after
 a whole-fleet restart.

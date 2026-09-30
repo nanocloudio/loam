@@ -129,3 +129,11 @@ pub fn shard_blob_matches_key(blob: &[u8], key: &[u8; DIGEST_LEN]) -> bool {
         Err(_) => false,
     }
 }
+
+/// Does a blob open with the shard magic? A 2-byte sniff, so the disk
+/// sweep can tell a keyed shard from a content-addressed body without
+/// reading the body. A body that happens to open with the same bytes is
+/// reported keyed and so kept by the orphan GC — the safe direction.
+pub fn blob_is_shard_magic(prefix: &[u8]) -> bool {
+    prefix.len() >= 2 && u16::from_le_bytes([prefix[0], prefix[1]]) == SHARD_MAGIC
+}

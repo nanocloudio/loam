@@ -56,13 +56,6 @@ mod ec_wire;
     dead_code,
     reason = "shared PIC body; each module shim drives a subset"
 )]
-#[path = "../../common/mechanics/loam_extent_wire.rs"]
-mod extent_wire;
-
-#[allow(
-    dead_code,
-    reason = "shared PIC body; each module shim drives a subset"
-)]
 #[path = "../../common/mechanics/body_store_body.rs"]
 mod body;
 

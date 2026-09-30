@@ -1,8 +1,9 @@
-//! Client for loam's admin surface: the unix-socket protocol
-//! `loam-server --socket` serves. One struct, blocking calls, no
-//! dependencies — the crate a volume backend (nanocloud's
-//! CsiPlugin), a tool, or a test links instead of re-implementing
-//! the wire.
+//! Client for loam's admin surface: the protocol `loam-server`
+//! serves on its unix socket (`--socket`) and, to a remote caller,
+//! over mutually authenticated TLS 1.3 (`--admin-listen`). One
+//! struct, blocking calls, one dependency (rustls) — the crate a
+//! volume backend (nanocloud's CsiPlugin), a tool, or a test links
+//! instead of re-implementing the wire.
 //!
 //! The wire itself is the same `#[path]`-included
 //! `modules/common/mechanics/loam_admin_wire.rs` the PIC modules compile —
@@ -32,17 +33,17 @@ pub mod manifest_wire;
 #[path = "../../../modules/common/mechanics/loam_admin_wire.rs"]
 pub mod admin_wire;
 
-/// Scope wrapper: extent_wire expects `super::sha256::Sha256`.
-pub mod wire_scope {
-    pub mod sha256 {
-        pub use crate::sha256_impl::Sha256;
-    }
-    #[path = "../../../../modules/common/mechanics/loam_extent_wire.rs"]
-    pub mod extent_wire;
-}
-pub use wire_scope::extent_wire;
+#[path = "../../../modules/common/mechanics/loam_volume_map_wire.rs"]
+pub mod map_wire;
+
+mod volume;
+pub use volume::{random_holder, Volume, VolumeWriter, PAGE_CACHE_PAGES, STAGED_EXTENTS_MAX};
 
 use admin_wire as wire;
+
+/// Namespace kinds, as `loam_wire` numbers them.
+pub const KIND_FILE: u8 = 0;
+pub const KIND_VOLUME: u8 = 3;
 use admin_wire::WireError;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -73,6 +74,14 @@ pub enum ClientError {
         expected: u32,
         observed: u32,
     },
+    /// TLS configuration the client could not build: a PEM that does
+    /// not parse, a key that does not match, a bad server name.
+    Tls(String),
+    /// A volume that cannot be used as asked: a geometry no map can
+    /// describe, a path bound to something that is not a volume, a map
+    /// page that does not decode, or a writer ended by an earlier
+    /// refusal.
+    Volume(String),
 }
 
 impl std::fmt::Display for ClientError {
@@ -85,11 +94,17 @@ impl std::fmt::Display for ClientError {
                 "not authenticated — the server requires --admin-token; \
                  call authenticate() first, and reconnect after a failure"
             ),
+            ClientError::Nak(s) if *s == wire::STATUS_FORBIDDEN => write!(
+                f,
+                "forbidden (status 0x{s:02x}): this identity holds no grant for the op"
+            ),
             ClientError::Nak(s) => write!(f, "server nak (status 0x{s:02x})"),
             ClientError::Protocol(e) => write!(f, "protocol: {e:?}"),
             ClientError::CorrelationMismatch { expected, observed } => {
                 write!(f, "correlation mismatch: sent {expected}, got {observed}")
             }
+            ClientError::Tls(m) => write!(f, "tls: {m}"),
+            ClientError::Volume(m) => write!(f, "volume: {m}"),
         }
     }
 }
@@ -115,18 +130,18 @@ pub type Result<T> = std::result::Result<T, ClientError>;
 /// An enum rather than a `Box<dyn Read + Write>`: there are exactly
 /// two transports, the dispatch is on the hot path of every frame,
 /// and a concrete type keeps the error surface honest — a unix
-/// socket and a TCP socket fail in different ways and the caller can
+/// socket and a TLS session fail in different ways and the caller can
 /// tell which it has.
 enum Transport {
     Unix(UnixStream),
-    Tcp(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
 }
 
 impl Read for Transport {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Transport::Unix(s) => s.read(buf),
-            Transport::Tcp(s) => s.read(buf),
+            Transport::Tls(s) => s.read(buf),
         }
     }
 }
@@ -135,15 +150,27 @@ impl Write for Transport {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             Transport::Unix(s) => s.write(buf),
-            Transport::Tcp(s) => s.write(buf),
+            Transport::Tls(s) => s.write(buf),
         }
     }
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Transport::Unix(s) => s.flush(),
-            Transport::Tcp(s) => s.flush(),
+            Transport::Tls(s) => s.flush(),
         }
     }
+}
+
+/// Parse every certificate in a PEM buffer.
+fn pem_certs(pem: &[u8], what: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    use rustls::pki_types::pem::PemObject;
+    let certs = rustls::pki_types::CertificateDer::pem_slice_iter(pem)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| ClientError::Tls(format!("{what}: {e:?}")))?;
+    if certs.is_empty() {
+        return Err(ClientError::Tls(format!("{what}: no certificate")));
+    }
+    Ok(certs)
 }
 
 /// A blocking connection to a loam-server admin surface.
@@ -163,28 +190,67 @@ impl LoamClient {
         })
     }
 
-    /// Connect to a remote admin surface over TCP.
+    /// Connect to a remote admin surface over TLS 1.3.
     ///
-    /// This is what lets a volume backend run somewhere other than
-    /// the storage node. It is deliberately paired
-    /// with [`authenticate`](Self::authenticate) in the docs and in
-    /// every example, because the admin surface can bind, read and
-    /// delete anything in any namespace: a server started without
-    /// `--admin-token` will accept this connection and everything
-    /// sent over it, and exposing THAT off-box is worse than having
-    /// no remote transport at all.
-    pub fn connect_tcp(addr: impl std::net::ToSocketAddrs) -> Result<Self> {
-        let conn = TcpStream::connect(addr)?;
-        conn.set_read_timeout(Some(Duration::from_secs(30)))?;
-        conn.set_nodelay(true).ok();
+    /// The server is verified against `ca_pem` under `server_name` (a
+    /// DNS name or IP address its certificate carries); this client
+    /// presents `client_cert_pem` / `client_key_pem`, whose name is the
+    /// identity the server checks every request against its grants.
+    /// All PEM arguments are file contents, not paths.
+    ///
+    /// A certificate the server does not accept fails the first
+    /// request, not this call: in TLS 1.3 the client finishes its
+    /// handshake before the server has judged the client's
+    /// certificate.
+    ///
+    /// Lease holders need no special handling here: the server binds
+    /// whatever holder this connection names to its identity, so two
+    /// identities can never share one, and the holders a caller picks
+    /// still tell its own writers apart.
+    pub fn connect_tls(
+        addr: impl std::net::ToSocketAddrs,
+        server_name: &str,
+        ca_pem: &[u8],
+        client_cert_pem: &[u8],
+        client_key_pem: &[u8],
+    ) -> Result<Self> {
+        use rustls::pki_types::pem::PemObject;
+        let mut roots = rustls::RootCertStore::empty();
+        for ca in pem_certs(ca_pem, "CA")? {
+            roots
+                .add(ca)
+                .map_err(|e| ClientError::Tls(format!("CA: {e}")))?;
+        }
+        let chain = pem_certs(client_cert_pem, "client certificate")?;
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(client_key_pem)
+            .map_err(|e| ClientError::Tls(format!("client key: {e:?}")))?;
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|e| ClientError::Tls(e.to_string()))?
+            .with_root_certificates(roots)
+            .with_client_auth_cert(chain, key)
+            .map_err(|e| ClientError::Tls(format!("client certificate: {e}")))?;
+        let name = rustls::pki_types::ServerName::try_from(server_name.to_string())
+            .map_err(|e| ClientError::Tls(format!("server name {server_name:?}: {e}")))?;
+        let mut tls = rustls::ClientConnection::new(std::sync::Arc::new(cfg), name)
+            .map_err(|e| ClientError::Tls(e.to_string()))?;
+        let mut sock = TcpStream::connect(addr)?;
+        sock.set_read_timeout(Some(Duration::from_secs(30)))?;
+        sock.set_nodelay(true).ok();
+        while tls.is_handshaking() {
+            tls.complete_io(&mut sock)?;
+        }
         Ok(LoamClient {
-            conn: Transport::Tcp(conn),
+            conn: Transport::Tls(Box::new(rustls::StreamOwned::new(tls, sock))),
             next_cid: 1,
         })
     }
 
-    /// Present `token` to the server. Must succeed before any other
-    /// call when the server was started with `--admin-token`.
+    /// Present `token` to the server. On a unix socket, must succeed
+    /// before any other call when the server was started with
+    /// `--admin-token`. A TLS connection authenticated in its handshake,
+    /// and the server refuses a token on one.
     ///
     /// A server that requires auth closes the connection on a wrong
     /// token rather than letting it be guessed again, so a failure
@@ -232,7 +298,15 @@ impl LoamClient {
                 Err(WireError::Truncated) => {}
                 Err(e) => return Err(ClientError::Protocol(e)),
             }
-            let n = self.conn.read(&mut chunk)?;
+            let n = match self.conn.read(&mut chunk) {
+                Ok(n) => n,
+                // A signal landing in the wait is not the peer's answer:
+                // a socket with a read timeout is not restarted, and
+                // giving up here would abandon a reply already on its
+                // way.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            };
             if n == 0 {
                 return Err(ClientError::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -490,40 +564,7 @@ impl LoamClient {
     }
 }
 
-// ── Block volumes ──────────────────────────────────────────────────
-//
-// A volume is a content-addressed DESCRIPTOR file (put_file at the
-// volume's path — replicated, listable, GC-referenced like any
-// file) plus N fixed-size extents in the body plane under derived
-// keys (loam_extent_wire). Extents are mutable keyed blobs;
-// sub-extent writes read-modify-write client-side, which is sound
-// under the single-attacher discipline block volumes get from
-// their consumer (one NBD/ublk/FUSE publisher at a time).
-
-/// An open volume handle: the decoded descriptor plus identity.
-#[derive(Debug, Clone)]
-pub struct Volume {
-    pub namespace_root: Vec<u8>,
-    pub path: Vec<u8>,
-    pub desc: extent_wire::VolumeDesc,
-}
-
-impl Volume {
-    fn extent_count(&self) -> u64 {
-        let es = self.desc.extent_size as u64;
-        self.desc.size_bytes.div_ceil(es)
-    }
-    /// Payload length of extent `idx` (the tail extent is short
-    /// when the volume size isn't a multiple of the extent size).
-    fn extent_len(&self, idx: u64) -> usize {
-        let es = self.desc.extent_size as u64;
-        let start = idx * es;
-        ((self.desc.size_bytes - start).min(es)) as usize
-    }
-    fn key(&self, idx: u64) -> [u8; 32] {
-        extent_wire::derive_extent_key(&self.desc.volume_id, idx)
-    }
-}
+// ── Raw body plane ─────────────────────────────────────────────────
 
 impl LoamClient {
     /// Raw content-addressed body write. Returns the digest the
@@ -553,20 +594,6 @@ impl LoamClient {
         }
         out.copy_from_slice(&d);
         Ok(out)
-    }
-
-    /// Raw keyed body write (mutable, last write wins).
-    pub fn put_body_keyed(&mut self, key: &[u8; 32], blob: &[u8]) -> Result<()> {
-        let cid = self.cid();
-        let mut buf = vec![0u8; blob.len() + 64];
-        let n = admin_wire::encode_admin_put_body_keyed(&mut buf, cid, key, blob)
-            .map_err(ClientError::Protocol)?;
-        let status =
-            self.round_trip(&buf[..n], admin_wire::decode_admin_put_body_keyed_ack, cid)?;
-        if status != admin_wire::STATUS_OK {
-            return Err(ClientError::Nak(status));
-        }
-        Ok(())
     }
 
     /// Raw body read by key/digest. `None` when the blob doesn't
@@ -607,136 +634,123 @@ impl LoamClient {
         }
         Ok(existed)
     }
+}
 
-    /// Create a volume: writes the descriptor file. Extents
-    /// materialize lazily on first write (unwritten ranges read as
-    /// zeros).
-    pub fn create_volume(
+// ── Volume writer leases ───────────────────────────────────────────
+//
+// A lease decides who a volume's writer IS before anyone writes. One
+// holder per volume, a TTL the holder renews, and a fence token that
+// grows every time the holder changes, so a writer that stalled past
+// its lease can be told apart from its successor: the namespace
+// refuses a commit whose fence is not the live lease's.
+//
+// The server judges expiry by its own clock; nothing here sends a
+// time. `holder` is an opaque 16-byte identity the caller chooses —
+// stable for one attachment, distinct between attachments.
+
+/// A granted writer lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lease {
+    /// Grows every time the volume's writer changes, and never
+    /// repeats. A holder re-acquiring or renewing its own live lease
+    /// keeps it.
+    pub fence: u64,
+    /// When the lease lapses, in the server's wall-clock milliseconds.
+    /// Renew before it, allowing for the round trip.
+    pub expires_at_ms: u64,
+}
+
+impl LoamClient {
+    /// Take the writer lease on `(namespace_root, path)` for `ttl_ms`.
+    ///
+    /// Granted when nobody holds it, the holder's lease has lapsed, or
+    /// `holder` already holds it. Refused `Nak(STATUS_LEASE_HELD)`
+    /// while another holder's lease is live, `Nak(STATUS_BUSY)` when
+    /// the server's lease table is full (retry), and `Nak(STATUS_NAK)`
+    /// for a TTL outside `1..=LEASE_TTL_MAX_MS`.
+    pub fn acquire_lease(
         &mut self,
         namespace_root: &[u8],
         path: &[u8],
-        size_bytes: u64,
-        extent_size: u32,
-    ) -> Result<Volume> {
-        let desc = extent_wire::VolumeDesc {
-            volume_id: extent_wire::derive_volume_id(namespace_root, path),
-            size_bytes,
-            extent_size,
-        };
-        let mut buf = [0u8; extent_wire::VOL_DESC_LEN];
-        let n = encode_desc(&mut buf, &desc)?;
-        self.put_file(namespace_root, path, 1, &buf[..n])?;
-        Ok(Volume {
-            namespace_root: namespace_root.to_vec(),
-            path: path.to_vec(),
-            desc,
-        })
+        holder: &[u8; admin_wire::LEASE_HOLDER_LEN],
+        ttl_ms: u32,
+    ) -> Result<Lease> {
+        self.lease_op(
+            admin_wire::LEASE_ACQUIRE,
+            namespace_root,
+            path,
+            holder,
+            ttl_ms,
+        )
     }
 
-    /// Open an existing volume by its descriptor file. `None` if
-    /// the path isn't bound; a bound path that doesn't hold a
-    /// volume descriptor is a protocol error.
-    pub fn open_volume(&mut self, namespace_root: &[u8], path: &[u8]) -> Result<Option<Volume>> {
-        let bytes = match self.get_file(namespace_root, path)? {
-            Some(b) => b,
-            None => return Ok(None),
-        };
-        let desc = extent_wire::decode_volume_desc(&bytes)
-            .map_err(|_| ClientError::Nak(admin_wire::STATUS_NAK))?;
-        Ok(Some(Volume {
-            namespace_root: namespace_root.to_vec(),
-            path: path.to_vec(),
-            desc,
-        }))
+    /// Extend `holder`'s live lease to `ttl_ms` from now, keeping its
+    /// fence. `Nak(STATUS_LEASE_LOST)` when `holder` no longer holds it
+    /// — expired, released, or taken over — and the caller must stop
+    /// writing.
+    pub fn renew_lease(
+        &mut self,
+        namespace_root: &[u8],
+        path: &[u8],
+        holder: &[u8; admin_wire::LEASE_HOLDER_LEN],
+        ttl_ms: u32,
+    ) -> Result<Lease> {
+        self.lease_op(
+            admin_wire::LEASE_RENEW,
+            namespace_root,
+            path,
+            holder,
+            ttl_ms,
+        )
     }
 
-    /// Read `buf.len()` bytes at `offset`. Unwritten extents read
-    /// as zeros. Errors if the range exceeds the volume.
-    pub fn volume_read(&mut self, vol: &Volume, offset: u64, buf: &mut [u8]) -> Result<()> {
-        check_range(vol, offset, buf.len())?;
-        let es = vol.desc.extent_size as u64;
-        let mut done = 0usize;
-        while done < buf.len() {
-            let pos = offset + done as u64;
-            let idx = pos / es;
-            let in_ext = (pos % es) as usize;
-            let take = (buf.len() - done).min(vol.extent_len(idx) - in_ext);
-            match self.get_body(&vol.key(idx))? {
-                Some(blob) => {
-                    let (_, payload) = extent_wire::decode_extent_blob(&blob)
-                        .map_err(|_| ClientError::Nak(admin_wire::STATUS_NAK))?;
-                    // A short stored payload (never written past
-                    // its tail) zero-fills the remainder.
-                    for i in 0..take {
-                        buf[done + i] = payload.get(in_ext + i).copied().unwrap_or(0);
-                    }
-                }
-                None => buf[done..done + take].fill(0),
-            }
-            done += take;
+    /// Give up `holder`'s lease so the next writer need not wait out
+    /// the TTL. The fence is kept, so the next holder's is higher.
+    /// `Nak(STATUS_LEASE_LOST)` when `holder` does not hold it,
+    /// including when it was already released.
+    pub fn release_lease(
+        &mut self,
+        namespace_root: &[u8],
+        path: &[u8],
+        holder: &[u8; admin_wire::LEASE_HOLDER_LEN],
+    ) -> Result<()> {
+        self.lease_op(admin_wire::LEASE_RELEASE, namespace_root, path, holder, 0)
+            .map(|_| ())
+    }
+
+    fn lease_op(
+        &mut self,
+        mode: u8,
+        namespace_root: &[u8],
+        path: &[u8],
+        holder: &[u8; admin_wire::LEASE_HOLDER_LEN],
+        ttl_ms: u32,
+    ) -> Result<Lease> {
+        let cid = self.cid();
+        let mut buf = vec![0u8; namespace_root.len() + path.len() + 64];
+        let n = admin_wire::encode_admin_lease(
+            &mut buf,
+            cid,
+            mode,
+            namespace_root,
+            path,
+            holder,
+            ttl_ms,
+        )?;
+        let (status, fence, expires_at_ms) = self.round_trip(
+            &buf[..n],
+            |b| admin_wire::decode_admin_lease_ack(b).map(|(c, s, f, e)| (c, (s, f, e))),
+            cid,
+        )?;
+        if status == admin_wire::STATUS_OK {
+            Ok(Lease {
+                fence,
+                expires_at_ms,
+            })
+        } else {
+            Err(ClientError::Nak(status))
         }
-        Ok(())
     }
-
-    /// Write `data` at `offset`, read-modify-writing partially
-    /// covered extents. Errors if the range exceeds the volume.
-    pub fn volume_write(&mut self, vol: &Volume, offset: u64, data: &[u8]) -> Result<()> {
-        check_range(vol, offset, data.len())?;
-        let es = vol.desc.extent_size as u64;
-        let mut done = 0usize;
-        while done < data.len() {
-            let pos = offset + done as u64;
-            let idx = pos / es;
-            let in_ext = (pos % es) as usize;
-            let ext_len = vol.extent_len(idx);
-            let take = (data.len() - done).min(ext_len - in_ext);
-            let key = vol.key(idx);
-            let mut payload = vec![0u8; ext_len];
-            if in_ext != 0 || take != ext_len {
-                // Partial cover: merge over the current bytes.
-                if let Some(blob) = self.get_body(&key)? {
-                    let (_, existing) = extent_wire::decode_extent_blob(&blob)
-                        .map_err(|_| ClientError::Nak(admin_wire::STATUS_NAK))?;
-                    payload[..existing.len().min(ext_len)]
-                        .copy_from_slice(&existing[..existing.len().min(ext_len)]);
-                }
-            }
-            payload[in_ext..in_ext + take].copy_from_slice(&data[done..done + take]);
-            let mut blob = vec![0u8; extent_wire::EXT_HDR + payload.len()];
-            let n = extent_wire::encode_extent_blob(&mut blob, &key, &payload)
-                .map_err(|_| ClientError::Nak(admin_wire::STATUS_NAK))?;
-            self.put_body_keyed(&key, &blob[..n])?;
-            done += take;
-        }
-        Ok(())
-    }
-
-    /// Delete a volume: every extent, then the descriptor binding.
-    pub fn delete_volume(&mut self, vol: &Volume) -> Result<()> {
-        for idx in 0..vol.extent_count() {
-            let _ = self.delete_body(&vol.key(idx))?;
-        }
-        self.delete_file(&vol.namespace_root.clone(), &vol.path.clone())?;
-        Ok(())
-    }
-}
-
-fn check_range(vol: &Volume, offset: u64, len: usize) -> Result<()> {
-    if offset
-        .checked_add(len as u64)
-        .map(|end| end <= vol.desc.size_bytes)
-        != Some(true)
-    {
-        return Err(ClientError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "range exceeds volume size",
-        )));
-    }
-    Ok(())
-}
-
-fn encode_desc(dst: &mut [u8], desc: &extent_wire::VolumeDesc) -> Result<usize> {
-    extent_wire::encode_volume_desc(dst, desc).map_err(|_| ClientError::Nak(admin_wire::STATUS_NAK))
 }
 
 // ── Snapshots, clones and portable export ────────────────────────
@@ -748,11 +762,14 @@ fn encode_desc(dst: &mut [u8], desc: &extent_wire::VolumeDesc) -> Result<usize> 
 //   clone    = a snapshot restored into a writable root
 //   export   = the manifest blob plus the bodies it names
 //
-// The consequence worth stating: **the orphan GC needs no changes at
-// all.** It already asks "is this object id bound by anything?", and
-// a snapshot's bindings are bindings. A design that instead
-// reference-counted bodies would have needed a new durable counter,
-// a new crash model for it, and a new way to be wrong.
+// The consequence worth stating: **the orphan GC has no
+// snapshot-specific logic.** It asks "is this object id bound by
+// anything?", and a snapshot's bindings are bindings. A volume
+// snapshot binds a map root, and the GC already walks the map of every
+// VOLUME binding, so a snapshotted volume's pages and extents are kept
+// by the same walk that keeps the live one's. A design that instead
+// reference-counted bodies would need a durable counter, a crash model
+// for it, and a new way to be wrong.
 //
 // A snapshot costs N bindings, which is what the namespace's hot
 // cache over a compacted snapshot file exists to absorb.
@@ -771,6 +788,21 @@ impl LoamClient {
         object_id: &[u8],
         revision: u64,
     ) -> Result<()> {
+        self.bind_as(namespace_root, path, object_id, KIND_FILE, revision)
+    }
+
+    /// [`bind`](Self::bind) under an explicit namespace kind. Not for a
+    /// volume: the namespace refuses a plain bind that would create,
+    /// replace or remove a volume binding, because those changes are
+    /// fenced — see [`bind_volume_root`](Self::bind_volume_root).
+    pub fn bind_as(
+        &mut self,
+        namespace_root: &[u8],
+        path: &[u8],
+        object_id: &[u8],
+        kind: u8,
+        revision: u64,
+    ) -> Result<()> {
         let cid = self.cid();
         let mut buf = vec![0u8; namespace_root.len() + path.len() + object_id.len() + 64];
         let n = admin_wire::encode_admin_bind(
@@ -779,7 +811,7 @@ impl LoamClient {
             namespace_root,
             path,
             object_id,
-            0,
+            kind,
             revision,
         )?;
         let status = self.round_trip(
@@ -820,24 +852,34 @@ impl LoamClient {
     /// keeping; `put_file` it wherever you like, and it becomes an
     /// ordinary content-addressed object with binding, replication
     /// and GC unchanged.
+    ///
+    /// Each entry keeps its kind. A volume's entry is the digest of the
+    /// map root it had committed at that moment, so the snapshot pins
+    /// that exact version: later commits to the volume write new
+    /// extents and a new root, and never touch the ones pinned here.
     pub fn snapshot_create(&mut self, src_root: &[u8], snap_root: &[u8]) -> Result<Vec<u8>> {
         let keys = self.list_files(src_root)?;
-        let mut digests: Vec<(Vec<u8>, [u8; 32])> = Vec::with_capacity(keys.len());
+        let mut digests: Vec<(Vec<u8>, [u8; 32], u8)> = Vec::with_capacity(keys.len());
         for key in &keys {
             // A key that vanished between the listing and here is
             // simply not in the snapshot. A snapshot is of a moment,
             // and this is that moment's honest content — better than
             // failing the whole operation over one concurrent delete.
-            if let Some(d) = self.digest_of(src_root, key)? {
-                digests.push((key.clone(), d));
+            // A binding that names no content digest has no body a
+            // manifest could name, and is not in it either.
+            if let Some(b) = self.lookup(src_root, key)? {
+                if let Some(d) = digest_of_object_id(&b.object_id) {
+                    digests.push((key.clone(), d, b.kind));
+                }
             }
         }
-        for (key, digest) in &digests {
-            let oid = object_id_for(digest);
-            self.bind(snap_root, key, oid.as_bytes(), 1)?;
+        for (key, digest, kind) in &digests {
+            self.bind_entry(snap_root, key, digest, *kind)?;
         }
-        let refs: Vec<(&[u8], [u8; 32])> =
-            digests.iter().map(|(k, d)| (k.as_slice(), *d)).collect();
+        let refs: Vec<manifest_wire::Entry<'_>> = digests
+            .iter()
+            .map(|(k, d, kind)| (k.as_slice(), *d, *kind))
+            .collect();
         let mut out = vec![0u8; manifest_wire::encoded_len(src_root, &refs)];
         let n = manifest_wire::encode(&mut out, src_root, &refs)
             .map_err(|e| ClientError::Manifest(format!("{e:?}")))?;
@@ -852,16 +894,25 @@ impl LoamClient {
     ///
     /// Returns how many entries were bound.
     pub fn snapshot_restore(&mut self, manifest: &[u8], dst_root: &[u8]) -> Result<usize> {
-        let mut entries: Vec<(Vec<u8>, [u8; 32])> = Vec::new();
-        manifest_wire::for_each(manifest, |key, digest| {
-            entries.push((key.to_vec(), *digest));
+        let mut entries: Vec<(Vec<u8>, [u8; 32], u8)> = Vec::new();
+        manifest_wire::for_each(manifest, |key, digest, kind| {
+            entries.push((key.to_vec(), *digest, kind));
         })
         .map_err(|e| ClientError::Manifest(format!("{e:?}")))?;
-        for (key, digest) in &entries {
-            let oid = object_id_for(digest);
-            self.bind(dst_root, key, oid.as_bytes(), 1)?;
+        for (key, digest, kind) in &entries {
+            self.bind_entry(dst_root, key, digest, *kind)?;
         }
         Ok(entries.len())
+    }
+
+    /// Bind one snapshot entry at revision 1. A volume entry is bound the
+    /// only way a volume binding can be: a fenced commit of its root.
+    fn bind_entry(&mut self, root: &[u8], key: &[u8], digest: &[u8; 32], kind: u8) -> Result<()> {
+        if kind == KIND_VOLUME {
+            return self.bind_volume_root(root, key, digest).map(|_| ());
+        }
+        let oid = object_id_for(digest);
+        self.bind_as(root, key, oid.as_bytes(), kind, 1)
     }
 
     /// Drop every binding under `snap_root`.
@@ -874,7 +925,13 @@ impl LoamClient {
         let keys = self.list_files(snap_root)?;
         let mut n = 0;
         for key in &keys {
-            if self.delete_file(snap_root, key)? {
+            let volume = matches!(self.lookup(snap_root, key)?, Some(b) if b.kind == KIND_VOLUME);
+            let gone = if volume {
+                self.delete_volume(snap_root, key)?
+            } else {
+                self.delete_file(snap_root, key)?
+            };
+            if gone {
                 n += 1;
             }
         }
@@ -887,10 +944,19 @@ impl LoamClient {
     /// This is what makes a portable export cheap: the receiver asks
     /// only for what it lacks, and deduplication across the transfer
     /// is free because the names are content digests on both sides.
+    ///
+    /// A volume entry names only its map root; the pages and extents
+    /// the root reaches are asked about by [`export_snapshot`], which
+    /// can read them at the source.
     pub fn manifest_missing_here(&mut self, manifest: &[u8]) -> Result<Vec<[u8; 32]>> {
         let mut want: Vec<[u8; 32]> = Vec::new();
-        manifest_wire::for_each(manifest, |_, d| want.push(*d))
+        manifest_wire::for_each(manifest, |_, d, _| want.push(*d))
             .map_err(|e| ClientError::Manifest(format!("{e:?}")))?;
+        self.missing_here(want)
+    }
+
+    /// Those of `want` this cluster does not hold.
+    pub fn missing_here(&mut self, mut want: Vec<[u8; 32]>) -> Result<Vec<[u8; 32]>> {
         want.sort_unstable();
         want.dedup();
         let mut missing = Vec::new();
@@ -900,6 +966,24 @@ impl LoamClient {
             }
         }
         Ok(missing)
+    }
+
+    /// Every body a manifest needs, read here: each entry's digest and,
+    /// for a volume entry, every map page and extent its root reaches.
+    pub fn manifest_closure(&mut self, manifest: &[u8]) -> Result<Vec<[u8; 32]>> {
+        let mut entries: Vec<([u8; 32], u8)> = Vec::new();
+        manifest_wire::for_each(manifest, |_, d, kind| entries.push((*d, kind)))
+            .map_err(|e| ClientError::Manifest(format!("{e:?}")))?;
+        let mut want = Vec::new();
+        for (digest, kind) in entries {
+            want.push(digest);
+            if kind == KIND_VOLUME {
+                want.extend(self.volume_bodies(&digest)?);
+            }
+        }
+        want.sort_unstable();
+        want.dedup();
+        Ok(want)
     }
 }
 
@@ -934,8 +1018,10 @@ pub fn export_snapshot(
     dst_root: &[u8],
 ) -> Result<(usize, usize)> {
     // 1. Ask the DESTINATION what it lacks. Asking the source would
-    //    send everything.
-    let missing = dst.manifest_missing_here(manifest)?;
+    //    send everything. The source says what "everything" is: a
+    //    volume entry reaches bodies the manifest does not name.
+    let wanted = src.manifest_closure(manifest)?;
+    let missing = dst.missing_here(wanted)?;
 
     // 2. Ship exactly those, verifying as we go. A digest the source
     //    cannot produce is a broken manifest, not something to skip
@@ -974,6 +1060,31 @@ fn hex_digest(d: &[u8; 32]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// The digest the store names `bytes` by: their SHA-256.
+pub fn content_digest(bytes: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize()
+}
+
+/// The digest a content-derived object id names, or `None` for an id of
+/// any other form.
+pub fn digest_of_object_id(object_id: &[u8]) -> Option<[u8; 32]> {
+    let hex = object_id.strip_prefix(b"sha256:")?;
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, pair) in hex.chunks(2).enumerate() {
+        let s = std::str::from_utf8(pair).ok()?;
+        if s.bytes().any(|c| c.is_ascii_uppercase()) {
+            return None;
+        }
+        out[i] = u8::from_str_radix(s, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// The content-derived object id for a digest: `sha256:<64 hex>`.

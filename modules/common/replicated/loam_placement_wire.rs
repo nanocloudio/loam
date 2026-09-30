@@ -3,8 +3,8 @@
 // Placement in Loam follows the "channels as state-surfaces"
 // discipline: the router owns the fleet table and publishes the
 // authoritative snapshot on its `placement_decisions` output.
-// Consumers (admin_router today; future read-path PICs tomorrow)
-// cache the latest epoch locally and compute per-object targets
+// Consumers (`body_fanout_router` and `ec_body_router`) cache the
+// latest epoch locally and compute per-object targets
 // inline via `loam_placement::pick_targets`. There is no per-PUT
 // RPC into the router — placement is a pure function of the
 // cached fleet snapshot + the object's content digest.
@@ -35,13 +35,13 @@
 // so it has to travel with the rest of the input or consumers would
 // compute different answers from the same epoch. All-zero domains
 // means one domain — the honest default for a fleet nobody has
-// described. `states` is `MEMBER_ACTIVE` / `MEMBER_DRAINING`; all
-// zero means fully active, and a short list leaves the remainder
+// described. `states` is a bitfield of `MEMBER_DRAINING` and
+// `MEMBER_COLD` (see `loam_placement.rs`); all zero means fully active, and a short list leaves the remainder
 // active, because wrongly believing a member is draining would stop
 // placing on a perfectly good node.
 //
-// The wire intentionally does NOT carry per-member health bits in
-// v1 — the publish-on-change model means a member that goes dark
+// The wire intentionally does NOT carry per-member health bits — the
+// publish-on-change model means a member that goes dark
 // is removed from the FleetUpdate, not flagged inline. This keeps
 // the consumer-side `Fleet` snapshot tiny.
 

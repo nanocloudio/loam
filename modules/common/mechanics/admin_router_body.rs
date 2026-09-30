@@ -189,6 +189,28 @@ pub struct ModuleState {
     pub gc_checked: u32,
     pub gc_deleted: u32,
     pub gc_kept: u32,
+    /// The volume-map walk for the current entry. A body no binding
+    /// names may still be an extent or a map page of a bound volume
+    /// root, so before deleting it the sweep walks every volume root
+    /// the namespace reports — root page, then each leaf — looking for
+    /// the digest. One downstream read at a time, so per-step work is
+    /// one page. `gc_walk_view` is the namespace snapshot generation
+    /// the first roots page reported; a later page reporting another
+    /// crossed a compaction and the entry is kept.
+    pub gc_walk_view: u64,
+    pub gc_walk_view_set: u8,
+    /// Cursor of the next roots page, 0 once the current page is the
+    /// last.
+    pub gc_walk_next: u32,
+    pub gc_roots: [[u8; 32]; super::ns_wire::MAX_VOLUME_ROOTS],
+    pub gc_roots_len: u8,
+    pub gc_roots_pos: u8,
+    /// The current depth-2 root's leaf digests.
+    pub gc_leaves: [[u8; 32]; super::map_wire::PAGE_ENTRIES],
+    pub gc_leaves_len: u16,
+    pub gc_leaves_pos: u16,
+    /// Map pages the walk has read.
+    pub gc_map_reads: u32,
     pub ticks: u32,
     pub forwarded: u32,
     /// Answers the channel has ACCEPTED, counted where they land
@@ -199,6 +221,12 @@ pub struct ModuleState {
     /// by behaviour.
     pub replied: u32,
     pub apply_errors: u32,
+    /// The `now` stamped on the last lease request. Stamps are strictly
+    /// increasing: the namespace treats a lease record stamped no later
+    /// than the one before it as a redelivered duplicate, so two
+    /// requests inside one clock tick, or across a clock stepped back,
+    /// must still read as later.
+    pub lease_stamp: u64,
 }
 
 /// Internal pending-op markers for the GC's downstream requests —
@@ -210,6 +238,9 @@ const GC_OP_OBJ_SCAN: u8 = 0xF3;
 const GC_OP_RESERVE: u8 = 0xF4;
 const GC_OP_OBJ_REMOVE: u8 = 0xF5;
 const GC_OP_RELEASE: u8 = 0xF6;
+const GC_OP_ROOTS: u8 = 0xF7;
+const GC_OP_MAP_ROOT: u8 = 0xF8;
+const GC_OP_MAP_LEAF: u8 = 0xF9;
 
 /// Which inventory a GC pass is walking.
 pub const GC_PHASE_BODY: u8 = 0;
@@ -527,6 +558,9 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
             super::admin::OP_PUT_FILE_COMMIT => handle_put_file_commit(s, syscalls, bytes),
             super::admin::OP_READ_FILE_RANGE => handle_read_file_range(s, syscalls, bytes),
             super::admin::OP_STAT_FILE => handle_stat_file(s, syscalls, bytes),
+            super::admin::OP_LEASE => handle_admin_lease(s, syscalls, bytes),
+            super::admin::OP_VOLUME => handle_admin_volume(s, syscalls, bytes),
+            super::admin::OP_LOOKUP => handle_admin_lookup(s, syscalls, bytes),
             _ => {
                 s.apply_errors = s.apply_errors.wrapping_add(1);
             }
@@ -610,9 +644,24 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                 GC_OP_RELEASE => {
                     gc_next(s, syscalls);
                 }
+                super::admin::OP_LEASE => {
+                    handle_lease_response(s, syscalls, entry, ns_resp);
+                }
+                super::admin::OP_VOLUME => {
+                    handle_volume_response(s, syscalls, entry, ns_resp);
+                }
+                super::admin::OP_LOOKUP => {
+                    handle_lookup_response(s, syscalls, entry, ns_resp);
+                }
+                GC_OP_ROOTS => {
+                    gc_apply_roots(s, syscalls, ns_resp);
+                }
                 super::admin::OP_DELETE_FILE => {
                     let status = if ns_resp[0] == super::ns_wire::OP_UNBIND {
                         super::admin::STATUS_OK
+                    } else if ns_resp[0] == super::ns_wire::NAK_FENCED {
+                        // A volume: bound, and not this op's to remove.
+                        super::admin::STATUS_NAK
                     } else {
                         super::admin::STATUS_NOT_FOUND
                     };
@@ -749,6 +798,8 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                 }
                 GC_OP_SCAN => gc_apply_scan(s, syscalls, body_resp),
                 GC_OP_DELETE => gc_apply_delete(s, syscalls, body_resp),
+                GC_OP_MAP_ROOT => gc_apply_map_root(s, syscalls, body_resp),
+                GC_OP_MAP_LEAF => gc_apply_map_leaf(s, syscalls, body_resp),
                 _ => emit_body_admin_response(s, syscalls, entry, body_resp),
             }
             drained = drained.wrapping_add(1);
@@ -842,6 +893,323 @@ unsafe fn handle_admin_bind(s: &mut ModuleState, syscalls: &super::SyscallTable,
     s.forwarded = s.forwarded.wrapping_add(1);
 }
 
+/// `TIMER::UNIX_MILLIS`: wall-clock milliseconds, 0 when the platform
+/// has none.
+const TIMER_UNIX_MILLIS: u32 = 0x0608;
+
+/// This server's wall clock as a record stamp, strictly later than the
+/// last one issued; 0 when there is no wall clock.
+unsafe fn stamp_now(s: &mut ModuleState, syscalls: &super::SyscallTable) -> u64 {
+    let mut clock = [0u8; 8];
+    let rc = (syscalls.provider_call)(-1, TIMER_UNIX_MILLIS, clock.as_mut_ptr(), clock.len());
+    let wall = if rc < 0 { 0 } else { u64::from_le_bytes(clock) };
+    if wall == 0 {
+        return 0;
+    }
+    let now = wall.max(s.lease_stamp.saturating_add(1));
+    s.lease_stamp = now;
+    now
+}
+
+/// Forward a lease request to the namespace, stamped with this
+/// server's wall clock.
+///
+/// The stamp is taken here and nowhere else. The namespace judges
+/// expiry against the `now` in the record so that every replica and
+/// every replay agrees; that makes the stamp authoritative, so it
+/// cannot come from the client.
+unsafe fn handle_admin_lease(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) {
+    let req = match super::admin::decode_admin_lease(bytes) {
+        Ok(r) => r,
+        Err(_) => {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            return;
+        }
+    };
+    let now = stamp_now(s, syscalls);
+    if now == 0 {
+        // No wall clock: a lease granted now could never be judged
+        // expired, so none is granted.
+        emit_lease_status(s, syscalls, req.correlation_id, super::admin::STATUS_NAK);
+        return;
+    }
+    let n = match super::ns_wire::encode_lease_req(
+        &mut s.scratch,
+        req.mode,
+        req.namespace_root,
+        req.path,
+        &req.holder,
+        now,
+        req.ttl_ms,
+    ) {
+        Ok(n) => n,
+        Err(_) => {
+            emit_lease_status(s, syscalls, req.correlation_id, super::admin::STATUS_NAK);
+            return;
+        }
+    };
+    if !enqueue_pending(
+        s,
+        Stream::Namespace,
+        req.correlation_id,
+        super::admin::OP_LEASE,
+        u16::MAX,
+    ) {
+        emit_lease_status(s, syscalls, req.correlation_id, super::admin::STATUS_BUSY);
+        s.apply_errors = s.apply_errors.wrapping_add(1);
+        return;
+    }
+    let wrote = (syscalls.channel_write)(s.ns_req_chan, s.scratch.as_ptr(), n);
+    if wrote < 0 || (wrote as usize) != n {
+        let _ = dequeue_pending(s, Stream::Namespace);
+        s.apply_errors = s.apply_errors.wrapping_add(1);
+        return;
+    }
+    s.forwarded = s.forwarded.wrapping_add(1);
+}
+
+/// Translate the namespace's lease verdict into the admin ack. A
+/// one-byte nak in place of a verdict is a record the namespace could
+/// not apply at all.
+unsafe fn handle_lease_response(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    entry: PendingDownstream,
+    ns_resp: &[u8],
+) {
+    let (status, fence, expires) = match super::ns_wire::decode_lease_resp(ns_resp) {
+        Ok((verdict, fence, expires)) => {
+            let status = match verdict {
+                super::ns_wire::LEASE_GRANTED => super::admin::STATUS_OK,
+                super::ns_wire::LEASE_HELD => super::admin::STATUS_LEASE_HELD,
+                super::ns_wire::LEASE_LOST => super::admin::STATUS_LEASE_LOST,
+                // Both resolve by asking again: a table with room, or
+                // a request carrying a later stamp.
+                super::ns_wire::LEASE_BUSY | super::ns_wire::LEASE_STALE => {
+                    super::admin::STATUS_BUSY
+                }
+                _ => super::admin::STATUS_NAK,
+            };
+            (status, fence, expires)
+        }
+        Err(_) => (super::admin::STATUS_NAK, 0, 0),
+    };
+    if let Ok(n) = super::admin::encode_admin_lease_ack(
+        &mut s.scratch,
+        entry.correlation_id,
+        status,
+        fence,
+        expires,
+    ) {
+        reply_staged(s, syscalls, n);
+    }
+}
+
+/// Forward a volume flush record to the namespace, stamped like a lease
+/// request: the namespace judges the writer's lease against it.
+unsafe fn handle_admin_volume(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) {
+    let req = match super::admin::decode_admin_volume(bytes) {
+        Ok(r) => r,
+        Err(_) => {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            return;
+        }
+    };
+    let now = stamp_now(s, syscalls);
+    if now == 0 {
+        emit_volume_status(s, syscalls, req.correlation_id, super::admin::STATUS_NAK, 0);
+        return;
+    }
+    let rec = super::ns_wire::DecodedVolumeReq {
+        mode: req.mode,
+        namespace_root: req.namespace_root,
+        path: req.path,
+        object_id: req.object_id,
+        holder: req.holder,
+        fence: req.fence,
+        expected: req.expected,
+        now_ms: now,
+    };
+    let n = match super::ns_wire::encode_volume_req(&mut s.scratch, &rec) {
+        Ok(n) => n,
+        Err(_) => {
+            emit_volume_status(s, syscalls, req.correlation_id, super::admin::STATUS_NAK, 0);
+            return;
+        }
+    };
+    if !enqueue_pending(
+        s,
+        Stream::Namespace,
+        req.correlation_id,
+        super::admin::OP_VOLUME,
+        u16::MAX,
+    ) {
+        emit_volume_status(
+            s,
+            syscalls,
+            req.correlation_id,
+            super::admin::STATUS_BUSY,
+            0,
+        );
+        s.apply_errors = s.apply_errors.wrapping_add(1);
+        return;
+    }
+    let wrote = (syscalls.channel_write)(s.ns_req_chan, s.scratch.as_ptr(), n);
+    if wrote < 0 || (wrote as usize) != n {
+        let _ = dequeue_pending(s, Stream::Namespace);
+        s.apply_errors = s.apply_errors.wrapping_add(1);
+        return;
+    }
+    s.forwarded = s.forwarded.wrapping_add(1);
+}
+
+/// Translate the namespace's verdict on a volume record.
+unsafe fn handle_volume_response(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    entry: PendingDownstream,
+    ns_resp: &[u8],
+) {
+    let (status, revision) = match super::ns_wire::decode_volume_resp(ns_resp) {
+        Ok((verdict, revision)) => {
+            let status = match verdict {
+                super::ns_wire::VOLUME_OK => super::admin::STATUS_OK,
+                super::ns_wire::VOLUME_CONFLICT => super::admin::STATUS_CONFLICT,
+                super::ns_wire::VOLUME_LEASE_LOST => super::admin::STATUS_LEASE_LOST,
+                super::ns_wire::VOLUME_RESERVED => super::admin::STATUS_BUSY,
+                _ => super::admin::STATUS_NAK,
+            };
+            (status, revision)
+        }
+        Err(_) => (super::admin::STATUS_NAK, 0),
+    };
+    emit_volume_status(s, syscalls, entry.correlation_id, status, revision);
+}
+
+unsafe fn emit_volume_status(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    correlation_id: u32,
+    status: u8,
+    revision: u64,
+) {
+    if let Ok(n) =
+        super::admin::encode_admin_volume_ack(&mut s.scratch, correlation_id, status, revision)
+    {
+        reply_staged(s, syscalls, n);
+    }
+}
+
+/// Resolve a path to its binding: a namespace LOOKUP, answered without
+/// touching the body plane.
+unsafe fn handle_admin_lookup(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) {
+    let req = match super::admin::decode_admin_lookup(bytes) {
+        Ok(r) => r,
+        Err(_) => {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            return;
+        }
+    };
+    let n = match super::ns_wire::encode_lookup_req(&mut s.scratch, req.namespace_root, req.path) {
+        Ok(n) => n,
+        Err(_) => {
+            emit_lookup_status(s, syscalls, req.correlation_id, super::admin::STATUS_NAK);
+            return;
+        }
+    };
+    if !enqueue_pending(
+        s,
+        Stream::Namespace,
+        req.correlation_id,
+        super::admin::OP_LOOKUP,
+        u16::MAX,
+    ) {
+        emit_lookup_status(s, syscalls, req.correlation_id, super::admin::STATUS_BUSY);
+        s.apply_errors = s.apply_errors.wrapping_add(1);
+        return;
+    }
+    let wrote = (syscalls.channel_write)(s.ns_req_chan, s.scratch.as_ptr(), n);
+    if wrote < 0 || (wrote as usize) != n {
+        let _ = dequeue_pending(s, Stream::Namespace);
+        s.apply_errors = s.apply_errors.wrapping_add(1);
+        return;
+    }
+    s.forwarded = s.forwarded.wrapping_add(1);
+}
+
+unsafe fn handle_lookup_response(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    entry: PendingDownstream,
+    ns_resp: &[u8],
+) {
+    match super::ns_wire::decode_lookup_resp(ns_resp) {
+        Ok(super::ns_wire::DecodedLookupResp::Found {
+            object_id,
+            revision,
+            kind,
+        }) => {
+            // Copied out: the response lives in the reassembly buffer,
+            // and the ack is encoded into `scratch`.
+            let mut oid = [0u8; super::limits::MAX_OBJECT_ID];
+            let len = object_id.len().min(oid.len());
+            oid[..len].copy_from_slice(&object_id[..len]);
+            let binding = super::admin::AdminBinding {
+                revision,
+                kind,
+                object_id: &oid[..len],
+            };
+            match super::admin::encode_admin_lookup_ack(
+                &mut s.scratch,
+                entry.correlation_id,
+                super::admin::STATUS_OK,
+                Some(&binding),
+            ) {
+                Ok(n) => reply_staged(s, syscalls, n),
+                Err(_) => {
+                    emit_lookup_status(s, syscalls, entry.correlation_id, super::admin::STATUS_NAK)
+                }
+            }
+        }
+        Ok(super::ns_wire::DecodedLookupResp::NotFound) => emit_lookup_status(
+            s,
+            syscalls,
+            entry.correlation_id,
+            super::admin::STATUS_NOT_FOUND,
+        ),
+        Err(_) => {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            emit_lookup_status(s, syscalls, entry.correlation_id, super::admin::STATUS_NAK);
+        }
+    }
+}
+
+unsafe fn emit_lookup_status(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    correlation_id: u32,
+    status: u8,
+) {
+    if let Ok(n) =
+        super::admin::encode_admin_lookup_ack(&mut s.scratch, correlation_id, status, None)
+    {
+        reply_staged(s, syscalls, n);
+    }
+}
+
+unsafe fn emit_lease_status(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    correlation_id: u32,
+    status: u8,
+) {
+    if let Ok(n) =
+        super::admin::encode_admin_lease_ack(&mut s.scratch, correlation_id, status, 0, 0)
+    {
+        reply_staged(s, syscalls, n);
+    }
+}
+
 unsafe fn handle_admin_put_body(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) {
     let (cid, body) = match super::admin::decode_admin_put_body(bytes) {
         Ok(p) => p,
@@ -875,7 +1243,7 @@ unsafe fn handle_admin_put_body(s: &mut ModuleState, syscalls: &super::SyscallTa
     s.forwarded = s.forwarded.wrapping_add(1);
 }
 
-/// Raw keyed body write (volume extents). Body-plane forward of
+/// Raw keyed body write. Body-plane forward of
 /// OP_PUT_KEYED; ack is status-only (the key is the caller's).
 unsafe fn handle_admin_put_body_keyed(
     s: &mut ModuleState,
@@ -922,8 +1290,7 @@ unsafe fn handle_admin_put_body_keyed(
     s.forwarded = s.forwarded.wrapping_add(1);
 }
 
-/// Raw body delete by key/digest (the volume-delete path's
-/// per-extent cleanup). Fans out downstream via the router.
+/// Raw body delete by key/digest. Fans out downstream via the router.
 unsafe fn handle_admin_delete_body(
     s: &mut ModuleState,
     syscalls: &super::SyscallTable,
@@ -1691,7 +2058,10 @@ unsafe fn gc_begin_current(s: &mut ModuleState, syscalls: &super::SyscallTable) 
         return;
     }
     let oid = gc_object_id(&s.gc_digests[s.gc_q_pos as usize]);
-    let req_n = match super::ns_wire::encode_gc_reserve_req(&mut s.scratch, false, &oid) {
+    // Stamped so the namespace can end flushes whose writers' leases
+    // have expired by now; with no clock it ends none.
+    let now = stamp_now(s, syscalls);
+    let req_n = match super::ns_wire::encode_gc_reserve_req(&mut s.scratch, &oid, now) {
         Ok(n) => n,
         Err(_) => {
             gc_skip_current(s, syscalls);
@@ -1735,7 +2105,7 @@ unsafe fn gc_release_current(s: &mut ModuleState, syscalls: &super::SyscallTable
     }
     s.gc_reserved = 0;
     let oid = gc_object_id(&s.gc_digests[s.gc_q_pos as usize]);
-    let req_n = match super::ns_wire::encode_gc_reserve_req(&mut s.scratch, true, &oid) {
+    let req_n = match super::ns_wire::encode_gc_release_req(&mut s.scratch, &oid) {
         Ok(n) => n,
         Err(_) => {
             gc_next(s, syscalls);
@@ -1828,10 +2198,11 @@ unsafe fn gc_apply_scan(s: &mut ModuleState, syscalls: &super::SyscallTable, res
     match super::body_wire::decode_scan_resp(resp, &mut digests, &mut keyed) {
         Ok((next, count)) => {
             s.gc_cursor = next;
-            // Keyed blobs (volume extents, EC shards) are NOT
-            // orphan-GC's to collect: their keys are never bound in
-            // the namespace by design — lifecycle belongs to their
-            // writers (volume delete / EC scrub stray-delete).
+            // Keyed blobs (EC shards) are NOT orphan-GC's to
+            // collect: their keys are never bound in the namespace by
+            // design, and their lifecycle belongs to the EC router,
+            // whose scrub deletes a shard copy found off its ranked
+            // home.
             let mut kept = 0usize;
             for i in 0..count {
                 if keyed[i] == 0 {
@@ -1905,9 +2276,204 @@ unsafe fn gc_apply_check(s: &mut ModuleState, syscalls: &super::SyscallTable, ns
         gc_release_current(s, syscalls);
         return;
     }
+    // No binding names it. In the body sweep it may still be a page or
+    // an extent of a bound volume root, which only the maps can say.
+    if s.gc_phase == GC_PHASE_BODY {
+        gc_walk_begin(s, syscalls);
+        return;
+    }
     // Absence is proven and the reservation still stands, so it stays
     // proven through both deletions.
     gc_delete_descriptor(s, syscalls);
+}
+
+/// Keep the current entry: something may reach it, or the walk could
+/// not tell.
+unsafe fn gc_keep_current(s: &mut ModuleState, syscalls: &super::SyscallTable) {
+    s.gc_kept = s.gc_kept.wrapping_add(1);
+    gc_release_current(s, syscalls);
+}
+
+/// Start the volume-map walk for the current entry. It runs inside the
+/// reservation, and while a reservation stands the namespace refuses to
+/// open a volume flush — so no commit can bind a new root during the
+/// walk, and the roots it sees are every root that can reach the body.
+unsafe fn gc_walk_begin(s: &mut ModuleState, syscalls: &super::SyscallTable) {
+    s.gc_walk_view_set = 0;
+    s.gc_walk_next = 0;
+    s.gc_roots_len = 0;
+    s.gc_roots_pos = 0;
+    s.gc_leaves_len = 0;
+    s.gc_leaves_pos = 0;
+    gc_walk_roots_page(s, syscalls, 0);
+}
+
+unsafe fn gc_walk_roots_page(s: &mut ModuleState, syscalls: &super::SyscallTable, cursor: u32) {
+    let req_n = match super::ns_wire::encode_volume_roots_req(&mut s.scratch, cursor) {
+        Ok(n) => n,
+        Err(_) => {
+            gc_keep_current(s, syscalls);
+            return;
+        }
+    };
+    if !gc_forward(
+        s,
+        syscalls,
+        Stream::Namespace,
+        s.ns_req_chan,
+        GC_OP_ROOTS,
+        req_n,
+    ) {
+        gc_keep_current(s, syscalls);
+    }
+}
+
+unsafe fn gc_apply_roots(s: &mut ModuleState, syscalls: &super::SyscallTable, ns_resp: &[u8]) {
+    let (next, view, digests) = match super::ns_wire::decode_volume_roots_resp(ns_resp) {
+        Ok(v) => v,
+        Err(_) => {
+            gc_keep_current(s, syscalls);
+            return;
+        }
+    };
+    if s.gc_walk_view_set != 0 && s.gc_walk_view != view {
+        gc_keep_current(s, syscalls);
+        return;
+    }
+    s.gc_walk_view = view;
+    s.gc_walk_view_set = 1;
+    let mut n = 0usize;
+    while n < super::ns_wire::MAX_VOLUME_ROOTS {
+        let at = n * 32;
+        match digests.get(at..at + 32) {
+            Some(d) => s.gc_roots[n].copy_from_slice(d),
+            None => break,
+        }
+        n += 1;
+    }
+    s.gc_roots_len = n as u8;
+    s.gc_roots_pos = 0;
+    s.gc_walk_next = next;
+    gc_walk_next_root(s, syscalls);
+}
+
+/// Read the next root of the current page, or the next page, or — with
+/// every root walked — delete.
+unsafe fn gc_walk_next_root(s: &mut ModuleState, syscalls: &super::SyscallTable) {
+    if s.gc_roots_pos < s.gc_roots_len {
+        let digest = s.gc_roots[s.gc_roots_pos as usize];
+        gc_walk_read(s, syscalls, &digest, GC_OP_MAP_ROOT);
+        return;
+    }
+    if s.gc_walk_next != 0 {
+        let next = s.gc_walk_next;
+        gc_walk_roots_page(s, syscalls, next);
+        return;
+    }
+    // Walked every root. The PutFile guard is re-checked here for the
+    // reason it is re-checked after the reachability answer.
+    if s.putfiles.iter().any(|p| p.in_use != 0) {
+        gc_keep_current(s, syscalls);
+        return;
+    }
+    gc_delete_descriptor(s, syscalls);
+}
+
+unsafe fn gc_walk_read(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    digest: &[u8; 32],
+    gc_op: u8,
+) {
+    let req_n = match super::body_wire::encode_get_req(&mut s.scratch, digest) {
+        Ok(n) => n,
+        Err(_) => {
+            gc_keep_current(s, syscalls);
+            return;
+        }
+    };
+    if !gc_forward(s, syscalls, Stream::Body, s.body_req_chan, gc_op, req_n) {
+        gc_keep_current(s, syscalls);
+    }
+}
+
+/// The bytes of a map page read by the walk, or `None` for anything
+/// else — a refusal, a missing body — which keeps the entry: a map the
+/// walk cannot read is a map it cannot prove the body absent from.
+fn gc_page_bytes(resp: &[u8]) -> Option<&[u8]> {
+    if resp.first() != Some(&super::body_wire::OP_GET) {
+        return None;
+    }
+    super::body_wire::decode_get_resp(resp).ok()
+}
+
+unsafe fn gc_apply_map_root(s: &mut ModuleState, syscalls: &super::SyscallTable, resp: &[u8]) {
+    s.gc_map_reads = s.gc_map_reads.wrapping_add(1);
+    let candidate = s.gc_digests[s.gc_q_pos as usize];
+    let root = match gc_page_bytes(resp).and_then(|b| super::map_wire::decode_root(b).ok()) {
+        Some(r) => r,
+        None => {
+            gc_keep_current(s, syscalls);
+            return;
+        }
+    };
+    if super::map_wire::names_digest(root.children, &candidate) {
+        gc_keep_current(s, syscalls);
+        return;
+    }
+    if root.depth == 1 {
+        s.gc_roots_pos = s.gc_roots_pos.wrapping_add(1);
+        gc_walk_next_root(s, syscalls);
+        return;
+    }
+    let mut n = 0usize;
+    while n < super::map_wire::PAGE_ENTRIES {
+        match root.child(n) {
+            Some(d) => s.gc_leaves[n] = d,
+            None => break,
+        }
+        n += 1;
+    }
+    s.gc_leaves_len = n as u16;
+    s.gc_leaves_pos = 0;
+    gc_walk_next_leaf(s, syscalls);
+}
+
+/// Read the next written leaf of the current root, or move to the next
+/// root. Never-written leaves are skipped without a read.
+unsafe fn gc_walk_next_leaf(s: &mut ModuleState, syscalls: &super::SyscallTable) {
+    while s.gc_leaves_pos < s.gc_leaves_len
+        && s.gc_leaves[s.gc_leaves_pos as usize] == super::map_wire::ZERO_DIGEST
+    {
+        s.gc_leaves_pos += 1;
+    }
+    if s.gc_leaves_pos < s.gc_leaves_len {
+        let digest = s.gc_leaves[s.gc_leaves_pos as usize];
+        gc_walk_read(s, syscalls, &digest, GC_OP_MAP_LEAF);
+        return;
+    }
+    s.gc_leaves_len = 0;
+    s.gc_leaves_pos = 0;
+    s.gc_roots_pos = s.gc_roots_pos.wrapping_add(1);
+    gc_walk_next_root(s, syscalls);
+}
+
+unsafe fn gc_apply_map_leaf(s: &mut ModuleState, syscalls: &super::SyscallTable, resp: &[u8]) {
+    s.gc_map_reads = s.gc_map_reads.wrapping_add(1);
+    let candidate = s.gc_digests[s.gc_q_pos as usize];
+    let leaf = match gc_page_bytes(resp).and_then(|b| super::map_wire::decode_leaf(b).ok()) {
+        Some(l) => l,
+        None => {
+            gc_keep_current(s, syscalls);
+            return;
+        }
+    };
+    if super::map_wire::names_digest(leaf.digests, &candidate) {
+        gc_keep_current(s, syscalls);
+        return;
+    }
+    s.gc_leaves_pos += 1;
+    gc_walk_next_leaf(s, syscalls);
 }
 
 unsafe fn gc_apply_obj_remove(s: &mut ModuleState, syscalls: &super::SyscallTable, ack: u8) {

@@ -70,8 +70,8 @@ pub struct DiskSlot {
     pub digest: [u8; super::wire::DIGEST_LEN],
     pub size: u32,
     pub in_use: u8,
-    /// 1 when the blob is stored under an explicit key (volume
-    /// extent / EC shard) rather than its content hash. Keyed
+    /// 1 when the blob is stored under an explicit key (an EC
+    /// shard) rather than its content hash. Keyed
     /// blobs' lifecycle belongs to their writers — the orphan GC
     /// must never collect them, so SCAN reports this flag.
     pub keyed: u8,
@@ -427,7 +427,9 @@ unsafe fn name_present(sys: &super::SyscallTable, path: &mut [u8], plen: usize) 
 
 /// Write `bytes` to `<root_dir>/<hex(digest)>` (create + write +
 /// fsync + close) and record a slot. Returns false on any disk
-/// failure or a full slot table.
+/// failure. The slot table is a lookup index, not the inventory: a body
+/// written past a full table is stored all the same, and a GET reads it
+/// from disk and verifies it, as after a restart.
 unsafe fn write_blob_at(
     s: &mut ModuleState,
     digest: &[u8; super::wire::DIGEST_LEN],
@@ -452,11 +454,11 @@ unsafe fn write_blob_at(
     // rather than acknowledge bytes nothing has verified. The cost is
     // one rewrite per retried PUT; the alternative is a durability
     // claim over unverified content.
-    // Keyed blobs are mutable — last write wins on a derived key — so
-    // they take the same recipe as content-addressed ones rather than
-    // a weaker one. On `Rename` that makes an overwrite atomic: the
-    // crash-visible outcomes are the old extent or the new one, never
-    // an absent or half-replaced extent.
+    // Keyed blobs are overwritten in place on a re-put, so they take
+    // the same recipe as content-addressed ones rather than a weaker
+    // one. On `Rename` that makes an overwrite atomic: the
+    // crash-visible outcomes are the old blob or the new one, never an
+    // absent or half-replaced one.
     match tier {
         PublishTier::Rename => {
             let mut tmp = [0u8; 256];
@@ -481,8 +483,8 @@ unsafe fn write_blob_at(
         PublishTier::NameFence => {
             // No atomic replace on this tier. A keyed blob may shrink,
             // and `FS_OPEN_CREATE` does not truncate, so the old entry
-            // has to go first — which leaves a window where the extent
-            // is absent. That window is the cost of the tier, not of
+            // has to go first — which leaves a window where the blob is
+            // absent. That window is the cost of the tier, not of
             // the operation.
             if keyed != 0 {
                 let _ = (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), plen);
@@ -499,7 +501,8 @@ unsafe fn write_blob_at(
         // acknowledge bytes reachable by no durable name.
         PublishTier::Unavailable => return false,
     }
-    record_slot(s, digest, bytes.len(), keyed)
+    let _ = record_slot(s, digest, bytes.len(), keyed);
+    true
 }
 
 /// Upsert the slot for a blob now on disk. An overwrite (mutable keyed
@@ -535,13 +538,11 @@ fn record_slot(
 // ── PUT_KEYED ─────────────────────────────────────────────────────
 
 /// Store bytes at an EXPLICIT key rather than the content hash.
-/// Used for EC shard blobs (key derives from (body_digest, shard
-/// index)) and volume extent blobs (key derives from (volume_id,
-/// extent index)); both are self-describing, so disk-fallback
-/// reads verify them against the key instead of a content hash.
-/// MUTABLE: a re-put of an existing key overwrites — last write
-/// wins. (Extents require it; EC shard content is deterministic
-/// per key, so an overwrite there is a no-op by value.)
+/// Used for EC shard blobs, whose key derives from (body_digest, shard
+/// index); they are self-describing, so disk-fallback reads verify them
+/// against the key instead of a content hash. A re-put of an existing
+/// key overwrites it, which for a shard is a no-op by value: a shard's
+/// content is a deterministic function of its key.
 unsafe fn handle_put_keyed(s: &mut ModuleState, bytes: &[u8]) {
     if s.root_dir_len == 0 {
         nak(s, super::wire::ERR_NO_ROOT);
@@ -685,9 +686,7 @@ unsafe fn handle_get(s: &mut ModuleState, bytes: &[u8]) {
                 hasher.update(bytes);
                 if hasher.finalize() == digest {
                     (true, 0u8)
-                } else if super::ec_wire::shard_blob_matches_key(bytes, &digest)
-                    || super::extent_wire::extent_blob_matches_key(bytes, &digest)
-                {
+                } else if super::ec_wire::shard_blob_matches_key(bytes, &digest) {
                     (true, 1u8)
                 } else {
                     (false, 0u8)
@@ -772,7 +771,7 @@ unsafe fn handle_head(s: &mut ModuleState, bytes: &[u8]) {
                 slot.digest = digest;
                 slot.size = size;
                 slot.in_use = 1;
-                slot.keyed = if mread >= 4 && super::extent_wire::blob_is_keyed_magic(&magic) {
+                slot.keyed = if mread >= 4 && super::ec_wire::blob_is_shard_magic(&magic) {
                     1
                 } else {
                     0
@@ -1062,8 +1061,8 @@ unsafe fn rehydrate_from_disk(s: &mut ModuleState) {
             }
             let mut stat = [0u8; 8];
             let rc = (sys.provider_call)(fd, FS_STAT, stat.as_mut_ptr(), stat.len());
-            // Keyed-ness sniff: keyed blobs (extents, EC shards)
-            // open with a known magic; 4 bytes tell them apart
+            // Keyed-ness sniff: keyed blobs (EC shards) open with a
+            // known magic; 4 bytes tell them apart
             // from content-addressed bodies without a body read.
             let mut magic = [0u8; 4];
             let mread = (sys.provider_call)(fd, FS_READ, magic.as_mut_ptr(), magic.len());
@@ -1075,7 +1074,7 @@ unsafe fn rehydrate_from_disk(s: &mut ModuleState) {
             if size as usize > super::wire::MAX_BODY {
                 continue;
             }
-            let keyed = if mread >= 4 && super::extent_wire::blob_is_keyed_magic(&magic) {
+            let keyed = if mread >= 4 && super::ec_wire::blob_is_shard_magic(&magic) {
                 1
             } else {
                 0

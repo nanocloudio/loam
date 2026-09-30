@@ -295,6 +295,13 @@ pub const BLOCK_SLOTS: usize = if MINIMAL {
     1024
 };
 
+/// Extents a `loam_volume` holds at once, staged or clean. Its commits
+/// carry up to this many less two: a commit's map pages (a leaf and the
+/// root) are uploaded whole however few extents it carries, so a larger
+/// batch is less of the volume's traffic spent on them, and fewer round
+/// trips. Each slot is an `EXTENT_CAP` buffer in the module's state.
+pub const VOLUME_EXTENT_SLOTS: usize = if MINIMAL { 8 } else { 32 };
+
 /// Body slots per `body_store` instance. The slot table is an index
 /// over the on-disk inventory, not the inventory itself — a cursor-0
 /// SCAN rehydrates it from the root directory — so this bounds
@@ -404,6 +411,27 @@ pub const ADMIN_STREAMED_PUTFILE: usize = if SERVER { 32 } else { 4 };
 /// about four values instead of two.
 pub const OPS_PER_STEP: u32 = if SERVER { 8 } else { 4 };
 
+// ── Volume writer leases ──────────────────────────────────────────
+
+/// Volumes one `namespace_router` instance tracks a writer lease for.
+///
+/// A lease is per attached volume, and a node attaches a handful, so
+/// the table is small and not profiled. An entry outlives its lease —
+/// the fence it last issued is what keeps the next one from repeating
+/// — and an ended or expired entry is recycled only by carrying that
+/// fence into the table's floor. An acquire for a new volume past a
+/// table of live leases is REFUSED busy, never granted without a fence.
+pub const LEASE_SLOTS: usize = 16;
+
+/// Longest lease an acquire or renew may ask for, in milliseconds.
+///
+/// A protocol commitment rather than an arena size, so it is the same
+/// on every profile: every replica applies the same record and must
+/// reach the same verdict on it. Five minutes bounds how long a
+/// crashed writer can keep a volume from its successor; a live writer
+/// renews well inside it.
+pub const LEASE_TTL_MAX_MS: u32 = 300_000;
+
 // ── Const assertions ──────────────────────────────────────────────
 //
 // The invariants that make the key ceilings safe to store inline.
@@ -416,3 +444,4 @@ const _: () = assert!(MAX_PATH <= u16::MAX as usize);
 const _: () = assert!(MAX_KEY_STRING >= MAX_PATH);
 const _: () = assert!(MAX_KEY_STRING >= MAX_ROOT);
 const _: () = assert!(MAX_KEY_STRING >= MAX_OBJECT_ID);
+const _: () = assert!(LEASE_SLOTS > 0);

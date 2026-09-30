@@ -102,14 +102,24 @@ session is gone belongs to a stream that died before its commit, and a
 rename. Neither is reachable by any content path, so both are removed
 and an interrupted write leaves the same state every time.
 
-Mutable keyed blobs — volume extents and erasure-coded shards — take
-the same recipe. Their contract is last-write-wins on a derived key,
-which an atomic rename satisfies exactly: an overwrite is crash-visible
-as the old extent or the new one, never as an absent or half-replaced
-one. Where the provider offers no atomic replace, the old entry must
-be removed before a shorter payload can be written over it, so the
-extent is briefly absent — a property of that tier rather than of the
+Keyed blobs — erasure-coded shards — take the same recipe. A re-put
+overwrites, which an atomic rename makes crash-visible as the old blob
+or the new one, never as an absent or half-replaced one. Where the
+provider offers no atomic replace, the old entry must be removed
+before a shorter payload can be written over it, so the blob is
+briefly absent — a property of that tier rather than of the
 operation.
+
+A block volume needs no such recipe, because nothing of it is
+overwritten. Extents and map pages are content-addressed bodies, and
+a flush is committed by one namespace bind of the volume's path to a
+new map root at the next revision. The bind is the atomic point:
+before it every reader resolves the previous root, after it the new
+one, and a crash between the body writes and the bind leaves orphan
+bodies and the previous revision whole. The commit is refused unless
+the current revision is the one the writer started from and the
+writer's lease fence is the live one, so a deposed or racing writer
+cannot land a flush on top of a version it never read.
 
 ## Body names against the embedded profile's name length
 
@@ -198,10 +208,32 @@ refuses to admit a bind naming it, with a distinct transient refusal
 the client retries — so absence stays proven all the way to the
 deletion, including across the cursor-paged pages of the proof itself.
 
-Reservations are never logged. A crash clears every one of them, which
-is the correct restart state: an unfinished sweep leaves either the
+Reservations do not survive a restart: the namespace skips them when
+it replays its log, so a crash clears every one of them. That is the
+correct restart state: an unfinished sweep leaves either the
 descriptor, which a later pass collects, or a refused bind, which its
-client re-issues.
+client re-issues — and a volume flush, which a reservation refuses to
+open, is never locked out by a sweep that no longer exists.
+
+A body no binding names may still be an extent or a map page of a
+bound volume root. Before deleting one the body sweep walks every
+volume root the namespace lists — live volumes and snapshots alike —
+root page, then each written leaf, keeping the body at the first page
+that names it and at any page it cannot read. The walk runs inside the
+reservation, and while a reservation stands the namespace refuses to
+open a volume flush, so no commit can bind a new root during it. The
+other direction is covered by the flush itself: from the moment a
+writer opens a flush until its commit or abort, the namespace answers
+every reachability question "referenced", so the bodies of a commit
+not yet decided are never collected. A flush is opened before its
+first body is written and must still be open for its commit to be
+admitted. A flush does not outlive its writer's lease: each
+reservation carries the sweep's server time, and deciding one ends
+every open flush whose lease has expired by then. The writer is
+deposed — its commit is refused `LEASE_LOST` — so what it wrote is
+ordinary garbage, and a writer that crashed mid-flush keeps the sweep
+away only until its lease lapses. The stamp is in the record, so
+replay ends the same flushes.
 
 Ordering is explicit. The descriptor is deleted before the body,
 because the descriptor is the half a binding would reach. Neither
@@ -209,8 +241,8 @@ deletion can strand a reachable pointer — both happen only while the
 id is unbound and reserved — so a crash between them leaves an orphan
 body, which the body sweep collects on a later pass.
 
-Two things are deliberately out of the sweep's reach. Keyed blobs are
-their writers' to retire. And a descriptor whose object id is not
+Two things are deliberately out of the sweep's reach. Keyed blobs (EC
+shards) are their writers' to retire. And a descriptor whose object id is not
 content-derived was minted by something other than a composed write;
 its lifecycle belongs to whoever minted it, which is the same rule
 keyed blobs follow.

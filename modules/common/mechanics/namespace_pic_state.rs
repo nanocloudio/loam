@@ -460,6 +460,55 @@ impl<const N: usize> PicNamespaceState<N> {
         Err(ApplyError::OutOfCapacity)
     }
 
+    /// Bind `(namespace_root, path)` to `object_id` at `revision`,
+    /// replacing whatever the arena holds for the key — a live binding
+    /// or a tombstone — whatever its revision.
+    ///
+    /// This is the apply half of a volume commit, whose compare-and-set
+    /// against the CURRENT revision has already been decided by the
+    /// caller from the arena and the on-disk snapshot together. The
+    /// revision order `bind` enforces cannot decide it: after a delete
+    /// the tombstone's revision is higher than the re-created volume's
+    /// first, and a snapshot-only binding is not in the arena at all.
+    /// A lock still refuses it.
+    pub fn commit_bind(
+        &mut self,
+        namespace_root: &[u8],
+        path: &[u8],
+        object_id: &[u8],
+        kind: u8,
+        revision: u64,
+    ) -> Result<ApplyOk, ApplyError> {
+        if !key_fits(namespace_root, path, object_id) {
+            return Err(ApplyError::KeyTooLong);
+        }
+        let (ns_h, p_h) = key_hash(namespace_root, path);
+        let oid_h = fnv1a64(object_id);
+        let seq = self.change_seq.wrapping_add(1);
+        for s in self.slots.iter_mut() {
+            if s.matches(ns_h, p_h, namespace_root, path) {
+                if s.locked != 0 {
+                    return Err(ApplyError::Locked);
+                }
+                s.object_id_hash = oid_h;
+                s.revision = revision;
+                s.kind = kind;
+                s.snapshotted = 0;
+                s.cmp_emitted = 0;
+                s.expires_at = 0;
+                s.object_id_len = 0;
+                if !object_id.is_empty() {
+                    s.object_id_bytes[..object_id.len()].copy_from_slice(object_id);
+                    s.object_id_len = object_id.len() as u8;
+                }
+                s.change_rev = seq;
+                self.change_seq = seq;
+                return Ok(ApplyOk::Bound { revision });
+            }
+        }
+        self.bind(namespace_root, path, object_id, kind, revision)
+    }
+
     pub fn rename(
         &mut self,
         namespace_root: &[u8],
@@ -891,6 +940,573 @@ impl<const N: usize> PicNamespaceState<N> {
 }
 
 impl<const N: usize> Default for PicNamespaceState<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Volume writer leases ───────────────────────────────────────────
+//
+// One writer per volume, named by (root, path), with a FENCE TOKEN
+// that grows whenever the writer changes. A store that remembers the
+// highest fence it has seen can then refuse a write from a holder that
+// has since been replaced — the stale writer that paused, lost its
+// lease, and woke up still believing it held it.
+//
+// Everything a verdict depends on is in the record: the holder, the
+// TTL, and `now`, which the admin router stamps. The table never reads
+// a clock, so every replica, and every replay of the same log, reaches
+// the same verdict.
+//
+// Delivery is at-least-once, so the same record can be applied twice
+// — a proposer replaying its log after a restart hands back commits
+// the local WAL already holds. An acquire, release, acquire sequence
+// replayed a second time would otherwise mint a fresh fence, or revive
+// a released lease. Each entry therefore keeps the stamp of the last
+// record it judged, and a record stamped no later than that is STALE
+// and changes nothing. The admin router stamps monotonically, so a
+// live request is never mistaken for a duplicate of its predecessor.
+//
+// Identity is the key bytes, as for bindings: a hash-only match would
+// let a caller contend a lease on a volume that is not the one it
+// named.
+
+/// Width of a holder identity. Matches `loam_wire::LEASE_HOLDER_LEN`.
+pub const LEASE_HOLDER_LEN: usize = 16;
+
+pub use super::limits::LEASE_TTL_MAX_MS;
+
+/// What a lease record asks for. The numeric codes are the wire's
+/// `LEASE_ACQUIRE` / `LEASE_RENEW` / `LEASE_RELEASE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseOp {
+    Acquire,
+    Renew,
+    Release,
+}
+
+impl LeaseOp {
+    pub fn from_u8(b: u8) -> Option<Self> {
+        match b {
+            1 => Some(Self::Acquire),
+            2 => Some(Self::Renew),
+            3 => Some(Self::Release),
+            _ => None,
+        }
+    }
+}
+
+/// The verdict on one lease record. The wire's `LEASE_*` status bytes
+/// name the same outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseStatus {
+    Granted,
+    Held,
+    Lost,
+    Busy,
+    BadRequest,
+    Stale,
+}
+
+/// A verdict plus the lease it leaves standing. On a grant that is the
+/// caller's lease; on `Held` or `Lost` it is whoever else's lease is
+/// live, so a contender knows when to try again; otherwise zero. A
+/// release answers the fence it ended and no expiry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseOutcome {
+    pub status: LeaseStatus,
+    pub fence: u64,
+    pub expires_at: u64,
+}
+
+impl LeaseOutcome {
+    const fn bare(status: LeaseStatus) -> Self {
+        Self {
+            status,
+            fence: 0,
+            expires_at: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseEntry {
+    /// The slot names a volume. Stays set after the lease ends, since
+    /// the entry's fence is what the next holder's is counted from.
+    pub used: u8,
+    /// A holder has the lease until `expires_at`.
+    pub live: u8,
+    pub holder: [u8; LEASE_HOLDER_LEN],
+    /// The fence issued to the current (or last) holder.
+    pub fence: u64,
+    /// Absolute expiry in the stamping clock's milliseconds. The lease
+    /// has expired once a record's `now` reaches it.
+    pub expires_at: u64,
+    /// `now` of the last record judged against this entry.
+    pub stamp: u64,
+    /// The holder has a volume flush open: it is writing bodies that
+    /// no bound root reaches yet, so the orphan GC must treat every
+    /// body as referenced until the flush commits or ends. Cleared by
+    /// the commit, an abort, a release, and any change of writer — a
+    /// deposed writer's commit is refused, so its bodies are garbage.
+    pub flushing: u8,
+    pub root_bytes: [u8; MAX_LIST_ROOT],
+    pub root_len: u8,
+    pub path_bytes: [u8; MAX_LIST_PATH],
+    pub path_len: u16,
+}
+
+impl LeaseEntry {
+    pub const fn empty() -> Self {
+        Self {
+            used: 0,
+            live: 0,
+            holder: [0u8; LEASE_HOLDER_LEN],
+            fence: 0,
+            expires_at: 0,
+            stamp: 0,
+            flushing: 0,
+            root_bytes: [0u8; MAX_LIST_ROOT],
+            root_len: 0,
+            path_bytes: [0u8; MAX_LIST_PATH],
+            path_len: 0,
+        }
+    }
+
+    pub fn root(&self) -> &[u8] {
+        &self.root_bytes[..(self.root_len as usize).min(MAX_LIST_ROOT)]
+    }
+
+    pub fn path(&self) -> &[u8] {
+        &self.path_bytes[..(self.path_len as usize).min(MAX_LIST_PATH)]
+    }
+
+    fn names(&self, root: &[u8], path: &[u8]) -> bool {
+        self.used != 0 && self.root() == root && self.path() == path
+    }
+
+    /// A holder has it and `now` has not reached its expiry.
+    pub fn held_at(&self, now: u64) -> bool {
+        self.live != 0 && now < self.expires_at
+    }
+
+    fn standing(&self, status: LeaseStatus, now: u64) -> LeaseOutcome {
+        if self.held_at(now) {
+            LeaseOutcome {
+                status,
+                fence: self.fence,
+                expires_at: self.expires_at,
+            }
+        } else {
+            LeaseOutcome::bare(status)
+        }
+    }
+}
+
+/// Fixed-capacity lease table. All-zero is the empty table, so a
+/// zero-filled module state needs no constructor call.
+pub struct LeaseTable<const N: usize> {
+    entries: [LeaseEntry; N],
+    /// Highest fence carried out of the table when an entry was
+    /// recycled. A volume that later returns starts above it, so no
+    /// fence is ever issued twice for it.
+    fence_floor: u64,
+    /// Highest stamp carried out with a recycled entry. A volume with
+    /// no entry judges staleness against this, for the reason the
+    /// per-entry stamp exists.
+    stamp_floor: u64,
+}
+
+impl<const N: usize> LeaseTable<N> {
+    pub const fn new() -> Self {
+        Self {
+            entries: [LeaseEntry::empty(); N],
+            fence_floor: 0,
+            stamp_floor: 0,
+        }
+    }
+
+    pub const fn capacity(&self) -> usize {
+        N
+    }
+
+    pub fn fence_floor(&self) -> u64 {
+        self.fence_floor
+    }
+
+    pub fn stamp_floor(&self) -> u64 {
+        self.stamp_floor
+    }
+
+    pub fn entry(&self, i: usize) -> Option<&LeaseEntry> {
+        self.entries.get(i)
+    }
+
+    /// The entry naming `(root, path)`, live or not.
+    pub fn lease(&self, namespace_root: &[u8], path: &[u8]) -> Option<&LeaseEntry> {
+        self.entries.iter().find(|e| e.names(namespace_root, path))
+    }
+
+    fn find(&self, namespace_root: &[u8], path: &[u8]) -> Option<usize> {
+        let mut i = 0;
+        while i < N {
+            if self.entries[i].names(namespace_root, path) {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Judge one lease record and apply it.
+    ///
+    /// - acquire: granted when no lease is held at `now`, or the caller
+    ///   already holds it. A new holder gets the previous fence + 1;
+    ///   the holder re-acquiring keeps its fence. Another holder's
+    ///   unexpired lease refuses it `Held`.
+    /// - renew: the caller's unexpired lease is extended to
+    ///   `now + ttl_ms` under the same fence; anything else is `Lost`.
+    /// - release: the caller's lease ends and its fence is kept;
+    ///   anything else is `Lost`, including a second release. Release
+    ///   ignores `ttl_ms`.
+    ///
+    /// Refusals change no lease, but on an existing entry they do
+    /// advance its stamp: whatever is judged later must be later.
+    pub fn apply(
+        &mut self,
+        mode: u8,
+        namespace_root: &[u8],
+        path: &[u8],
+        holder: &[u8; LEASE_HOLDER_LEN],
+        now: u64,
+        ttl_ms: u32,
+    ) -> LeaseOutcome {
+        let op = match LeaseOp::from_u8(mode) {
+            Some(op) => op,
+            None => return LeaseOutcome::bare(LeaseStatus::BadRequest),
+        };
+        // Zero is what a platform with no wall clock reads. Expiry
+        // cannot be judged against it.
+        if now == 0 || !key_fits(namespace_root, path, &[]) || path.is_empty() {
+            return LeaseOutcome::bare(LeaseStatus::BadRequest);
+        }
+        if op != LeaseOp::Release && (ttl_ms == 0 || ttl_ms > LEASE_TTL_MAX_MS) {
+            return LeaseOutcome::bare(LeaseStatus::BadRequest);
+        }
+        let expires = now.saturating_add(ttl_ms as u64);
+        let idx = match self.find(namespace_root, path) {
+            Some(i) => i,
+            None => return self.apply_absent(op, namespace_root, path, holder, now, expires),
+        };
+        let e = match self.entries.get_mut(idx) {
+            Some(e) => e,
+            None => return LeaseOutcome::bare(LeaseStatus::BadRequest),
+        };
+        if now <= e.stamp {
+            return LeaseOutcome::bare(LeaseStatus::Stale);
+        }
+        e.stamp = now;
+        let mine = e.live != 0 && e.holder == *holder;
+        match op {
+            LeaseOp::Acquire => {
+                if e.held_at(now) && !mine {
+                    return e.standing(LeaseStatus::Held, now);
+                }
+                if !(mine && e.held_at(now)) {
+                    // A new holder, or the old one after its lease
+                    // lapsed: either way the writer has changed.
+                    e.fence = match e.fence.checked_add(1) {
+                        Some(f) => f,
+                        None => return LeaseOutcome::bare(LeaseStatus::Busy),
+                    };
+                    e.holder = *holder;
+                    e.live = 1;
+                    e.flushing = 0;
+                }
+                e.expires_at = expires;
+                LeaseOutcome {
+                    status: LeaseStatus::Granted,
+                    fence: e.fence,
+                    expires_at: e.expires_at,
+                }
+            }
+            LeaseOp::Renew => {
+                if mine && e.held_at(now) {
+                    e.expires_at = expires;
+                    LeaseOutcome {
+                        status: LeaseStatus::Granted,
+                        fence: e.fence,
+                        expires_at: e.expires_at,
+                    }
+                } else {
+                    e.standing(LeaseStatus::Lost, now)
+                }
+            }
+            LeaseOp::Release => {
+                if mine {
+                    e.live = 0;
+                    e.flushing = 0;
+                    LeaseOutcome {
+                        status: LeaseStatus::Granted,
+                        fence: e.fence,
+                        expires_at: 0,
+                    }
+                } else {
+                    e.standing(LeaseStatus::Lost, now)
+                }
+            }
+        }
+    }
+
+    /// A record naming a volume the table has no entry for.
+    fn apply_absent(
+        &mut self,
+        op: LeaseOp,
+        namespace_root: &[u8],
+        path: &[u8],
+        holder: &[u8; LEASE_HOLDER_LEN],
+        now: u64,
+        expires: u64,
+    ) -> LeaseOutcome {
+        if now <= self.stamp_floor {
+            return LeaseOutcome::bare(LeaseStatus::Stale);
+        }
+        if op != LeaseOp::Acquire {
+            return LeaseOutcome::bare(LeaseStatus::Lost);
+        }
+        let slot = match self.claim_slot(now) {
+            Some(i) => i,
+            None => return LeaseOutcome::bare(LeaseStatus::Busy),
+        };
+        // Counted from the floor AFTER the claim: a recycle may just
+        // have raised it, and the entry it evicted could have been
+        // this very volume's.
+        let fence = match self.fence_floor.checked_add(1) {
+            Some(f) => f,
+            None => return LeaseOutcome::bare(LeaseStatus::Busy),
+        };
+        let mut e = LeaseEntry::empty();
+        e.used = 1;
+        e.live = 1;
+        e.holder = *holder;
+        e.fence = fence;
+        e.expires_at = expires;
+        e.stamp = now;
+        e.root_bytes[..namespace_root.len()].copy_from_slice(namespace_root);
+        e.root_len = namespace_root.len() as u8;
+        e.path_bytes[..path.len()].copy_from_slice(path);
+        e.path_len = path.len() as u16;
+        match self.entries.get_mut(slot) {
+            Some(dst) => *dst = e,
+            None => return LeaseOutcome::bare(LeaseStatus::Busy),
+        }
+        LeaseOutcome {
+            status: LeaseStatus::Granted,
+            fence,
+            expires_at: expires,
+        }
+    }
+
+    /// A free slot, or the first entry whose lease has ended or
+    /// expired at `now`, recycled by folding its fence and stamp into
+    /// the floors. An entry stamped at or after `now` is not recycled:
+    /// its history is later than this record, and folding it in would
+    /// make this record stale against its own floor.
+    fn claim_slot(&mut self, now: u64) -> Option<usize> {
+        let mut i = 0;
+        while i < N {
+            if self.entries[i].used == 0 {
+                return Some(i);
+            }
+            i += 1;
+        }
+        let mut i = 0;
+        while i < N {
+            let e = self.entries[i];
+            if !e.held_at(now) && e.stamp < now {
+                if e.fence > self.fence_floor {
+                    self.fence_floor = e.fence;
+                }
+                if e.stamp > self.stamp_floor {
+                    self.stamp_floor = e.stamp;
+                }
+                self.entries[i] = LeaseEntry::empty();
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Judge the stamp of a volume record against this volume's entry,
+    /// as a lease record's is judged: `None` when there is no entry,
+    /// `Some(false)` when `now` is no later than the last record judged
+    /// here — a redelivered duplicate, which must change nothing — and
+    /// `Some(true)` after advancing the entry's stamp to `now`.
+    pub fn touch(&mut self, namespace_root: &[u8], path: &[u8], now: u64) -> Option<bool> {
+        let i = self.find(namespace_root, path)?;
+        let e = self.entries.get_mut(i)?;
+        if now <= e.stamp {
+            return Some(false);
+        }
+        e.stamp = now;
+        Some(true)
+    }
+
+    /// End every open flush whose writer's lease has expired at `now`.
+    /// Its writer is deposed — a commit from it is refused — so its
+    /// flush guards nothing but orphans. Deterministic: it reads only
+    /// the table and `now`, which the record carries. Answers how many
+    /// were ended.
+    pub fn end_expired_flushes(&mut self, now: u64) -> usize {
+        if now == 0 {
+            return 0;
+        }
+        let mut ended = 0;
+        let mut i = 0;
+        while i < N {
+            let e = &mut self.entries[i];
+            if e.used != 0 && e.flushing != 0 && !e.held_at(now) {
+                e.flushing = 0;
+                ended += 1;
+            }
+            i += 1;
+        }
+        ended
+    }
+
+    /// Does any volume have a flush open? While one does, a body with no
+    /// binding may still be about to be reachable, so the orphan GC keeps
+    /// everything.
+    pub fn any_flushing(&self) -> bool {
+        let mut i = 0;
+        while i < N {
+            if self.entries[i].used != 0 && self.entries[i].flushing != 0 {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// The verdict on a volume record from `holder` under `fence` at
+    /// `now`: whether it holds the volume's live lease under exactly
+    /// that fence.
+    pub fn holds(
+        &self,
+        namespace_root: &[u8],
+        path: &[u8],
+        holder: &[u8; LEASE_HOLDER_LEN],
+        fence: u64,
+        now: u64,
+    ) -> bool {
+        match self.lease(namespace_root, path) {
+            Some(e) => e.held_at(now) && e.holder == *holder && e.fence == fence,
+            None => false,
+        }
+    }
+
+    /// Is `holder`'s flush open on this volume?
+    pub fn is_flushing(
+        &self,
+        namespace_root: &[u8],
+        path: &[u8],
+        holder: &[u8; LEASE_HOLDER_LEN],
+    ) -> bool {
+        match self.lease(namespace_root, path) {
+            Some(e) => e.flushing != 0 && e.holder == *holder,
+            None => false,
+        }
+    }
+
+    /// Open or end `holder`'s flush on this volume. Acts only on an
+    /// entry naming `holder`: another holder's flush is not this one's
+    /// to end. Answers whether the entry was found.
+    pub fn set_flushing(
+        &mut self,
+        namespace_root: &[u8],
+        path: &[u8],
+        holder: &[u8; LEASE_HOLDER_LEN],
+        open: bool,
+    ) -> bool {
+        match self.find(namespace_root, path) {
+            Some(i) => match self.entries.get_mut(i) {
+                Some(e) if e.holder == *holder => {
+                    e.flushing = u8::from(open);
+                    true
+                }
+                _ => false,
+            },
+            None => false,
+        }
+    }
+
+    /// Reinstate one entry and the table's floors exactly as recorded.
+    /// This is how the table survives a WAL rotation: the rotated log
+    /// opens with one of these per entry. False when the key does not
+    /// fit or the table has no room, which a log written from a table
+    /// of the same capacity never produces.
+    pub fn restore(
+        &mut self,
+        namespace_root: &[u8],
+        path: &[u8],
+        holder: &[u8; LEASE_HOLDER_LEN],
+        fence: u64,
+        expires_at: u64,
+        stamp: u64,
+        live: bool,
+        fence_floor: u64,
+        stamp_floor: u64,
+    ) -> bool {
+        if !key_fits(namespace_root, path, &[]) || path.is_empty() {
+            return false;
+        }
+        let slot = match self.find(namespace_root, path) {
+            Some(i) => i,
+            None => {
+                let mut free = None;
+                let mut i = 0;
+                while i < N {
+                    if self.entries[i].used == 0 {
+                        free = Some(i);
+                        break;
+                    }
+                    i += 1;
+                }
+                match free {
+                    Some(i) => i,
+                    None => return false,
+                }
+            }
+        };
+        if fence_floor > self.fence_floor {
+            self.fence_floor = fence_floor;
+        }
+        if stamp_floor > self.stamp_floor {
+            self.stamp_floor = stamp_floor;
+        }
+        let mut e = LeaseEntry::empty();
+        e.used = 1;
+        e.live = u8::from(live);
+        e.holder = *holder;
+        e.fence = fence;
+        e.expires_at = expires_at;
+        e.stamp = stamp;
+        e.root_bytes[..namespace_root.len()].copy_from_slice(namespace_root);
+        e.root_len = namespace_root.len() as u8;
+        e.path_bytes[..path.len()].copy_from_slice(path);
+        e.path_len = path.len() as u16;
+        match self.entries.get_mut(slot) {
+            Some(dst) => {
+                *dst = e;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+impl<const N: usize> Default for LeaseTable<N> {
     fn default() -> Self {
         Self::new()
     }
