@@ -28,7 +28,8 @@ Slot counts below are the bare-metal profile; see
 | Module | Surface | What it does |
 |---|---|---|
 | `namespace_router` | `storage.namespace` | Arena (256 binding slots) over a compacted snapshot file + WAL-backed durability via the fluxor `fs` contract. The namespace provider: exports `module_provides_contract` + `module_provider_dispatch`, answering `LOOKUP`, `STAT`, `CLOSE`, `BIND`, `RENAME`, `DELETE`, `CAPS` and the change pair `SUBSCRIBE` / `CHANGES` that level-triggered consumers reconcile against. `LIST` alone is channel-only — a listing is cursor-paged and a `provider_call` returns one buffer |
-| `loam_volume` | `storage.block` | [`common/replicated/loam_volume_body.rs`](common/replicated/loam_volume_body.rs); one Loam volume as a block device, reached over the admin wire (`admin_req` / `admin_resp`). Holds the volume's writer lease and renews it each half TTL, reads through the committed extent map, stages writes, and completes `FLUSH` / `FUA` / `PREFLUSH` after the fenced commit, with `RevisionMonotone` at the new revision. `EXEC` completes in-call when nothing must be fetched or committed and answers `EAGAIN` otherwise; `SUBMIT` / `REAP` carry the rest. A refused commit, a lost lease or a silent node closes the device |
+| `object_provider` | `storage.object` | [`common/mechanics/object_provider_body.rs`](common/mechanics/object_provider_body.rs); objects named `bucket/key` as files under namespace root `bucket`. Exports `module_provider_dispatch`: `PRESENT` relays a caller's capability to `admin_gate` on a session of its own, so one caller's scopes never reach another's; reads answer `EAGAIN` and writes `EINPROGRESS` until the admin plane decides; a streamed upload spools under `spool_dir` and goes in as one `PUT_FILE` stream. wave's `s3_serve` speaks S3 in front of it |
+| `loam_volume` | `storage.block` | [`common/replicated/loam_volume_body.rs`](common/replicated/loam_volume_body.rs); one Loam volume as a block device, reached over the admin wire (`admin_in` / `admin_out`): an in-graph link to `admin_gate`, or a client-mode `tls` to a node, after presenting the capabilities in its `capability` file. Holds the volume's writer lease and renews it each half TTL, reads through the committed extent map, stages writes, and completes `FLUSH` / `FUA` / `PREFLUSH` after the fenced commit, with `RevisionMonotone` at the new revision. `EXEC` completes in-call when nothing must be fetched or committed and answers `EAGAIN` otherwise; `SUBMIT` / `REAP` carry the rest. A refused commit, a lost lease or a silent node closes the device |
 
 `object_index` (whole-set arena, 256 object slots) and
 `block_allocator` (64 volume slots) are WAL-backed and reachable by
@@ -44,12 +45,14 @@ in place, next to the claim it declines to make.
 |---|---|
 | `raft_metadata_client` | [`common/replicated/raft_proposer_body.rs`](common/replicated/raft_proposer_body.rs); proposes through a replica group, carries a WAL, addresses results by the producer's correlation id |
 | `clustor_bridge` | Carries loam's decision records across the replica group's channel envelope via the consumer facade |
+| `admin_gate` | The admin plane's session layer, in front of `admin_router`: sessions from a server `tls`'s clear side (each bound to its peer certificate) and from in-graph links. A session presents capabilities with `MSG_CAP_PRESENT`, verified against the `mesh_roots` it is configured with; every request is then admitted by what it touches — a `/`-terminated prefix of `root/path`, or the body plane — and the permission it needs, or answered `FORBIDDEN`. A stream belongs to the session that opened it, and a lease's holder is bound to the session's identity |
 | `admin_router` | The admin op surface: bind, file and body ops, plus orphan-body GC |
 | `body_store` | Content-addressed blob store with streamed writes and keyed EC shards |
 | `block_log` | Append/replay log body — durability as a channel rather than as a syscall |
 | `ec_body_router` | Erasure-coded fan-out, reconstructing reads, scrub with re-placement |
 | `placement_router` | Owns fleet membership + broadcasts a FleetEpoch snapshot on every change; consumers cache and compute placement locally via [`common/replicated/loam_placement.rs`](common/replicated/loam_placement.rs) |
-| `body_fanout_router` | Sits between `admin_router` and the `body_store` fleet; all-must-succeed PUT, ranked GET/HEAD fallback with read repair, full-set DELETE, background scrub |
+| `body_fanout_router` | Sits between `admin_router` and the `body_store` fleet; all-must-succeed PUT, ranked GET/HEAD fallback with read repair, full-set DELETE, background scrub. A member is a local `body_store` or one on another node, reached through `remote_channel` over mutual TLS; a member that misses an answer's deadline is read last until it answers again |
+| `loam_cli` | The operator applet (`type = "Cli"`), run by `fluxor exec loam -- …`: files, volumes, snapshots and export over the admin wire, through a client-mode `tls` to a node |
 | `telemetry_agg` | An 11-line shim over `stub_body.rs`'s ping/noop/ticks protocol, and the one reserved name in the roster. It is held rather than dropped because the job behind it — metrics, health and readiness — is one a sustained soak cannot run without, so the name will be filled rather than retired. No other placeholder is kept: a reserved name is a cost paid by every reader, the roster, the docs and the tier guard |
 
 ### Replication topology
@@ -215,10 +218,9 @@ whether its cap is a ceiling:
   from the root directory by a cursor-0 `OP_SCAN`. It bounds
   working-set lookup, not bodies held.
 
-Caps are per capacity profile. A cargo build selects one with an
-explicit `--cfg loam_profile="…"` and is `node` without one; fluxor's
-module build selects by the die it declares, so a bcm2712 image is
-`embedded`:
+Caps are per capacity profile. Each module builds one `[[variant]]`
+per profile, and a graph picks one with `variant: <profile>`; the
+harness builds the same sources under the profile's cargo feature:
 
 | Arena | `minimal` | `embedded` | `node` | `server` |
 |---|---|---|---|---|
@@ -298,7 +300,7 @@ it) and uses no runtime division, because `admin_router` decodes
 pages inside the GC.
 
 The volume's path is bound to the root digest as a `KIND_VOLUME`
-binding. `loam-client`'s `VolumeWriter` holds the volume's lease,
+binding. `loam_volume`, the volume's one writer, holds its lease,
 stages whole extents in memory, and flushes as one namespace
 `VOLUME` commit: `BEGIN`, then the extent bodies, changed leaves and
 new root, then `COMMIT` at the next revision — refused `CONFLICT`

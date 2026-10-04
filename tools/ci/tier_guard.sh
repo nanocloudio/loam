@@ -23,8 +23,8 @@ cd "$(dirname "$0")/../.."
 
 # Tier rosters. A NEW module must be added to exactly one list — the
 # guard fails on unlisted modules rather than guessing its tier.
-MECHANICS="admin_router block_allocator block_log body_e2e_probe body_store \
-namespace_router object_index telemetry_agg"
+MECHANICS="admin_gate admin_router block_allocator block_log body_e2e_probe body_store \
+loam_cli namespace_router object_index object_provider telemetry_agg"
 # loam_load_gen and loam_throughput_counter drive and measure the
 # REPLICATED metadata plane: they speak loam_decision_wire, so they sit
 # with the tier whose vocabulary they carry.

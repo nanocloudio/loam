@@ -258,6 +258,10 @@ pub fn reconstruct(
 /// Cauchy-mix matrices are always invertible, so a zero pivot
 /// column means caller error (duplicate chosen shard) — surfaced
 /// as BadParams rather than a panic.
+#[allow(
+    clippy::needless_range_loop,
+    reason = "indexed loops keep the PIC build panic-free: iterator adapters and slice ranges pull core::panicking paths the bare-metal SDK does not carry"
+)]
 fn invert(
     mat: &mut [[u8; MAX_SHARDS]; MAX_SHARDS],
     n: usize,

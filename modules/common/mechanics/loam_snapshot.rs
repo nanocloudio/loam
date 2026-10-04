@@ -2,17 +2,18 @@
 // of every binding, letting the PIC arena be a HOT CACHE instead
 // of the whole set. Consumed by namespace_pic_body.
 //
-// Layout: 16-byte header + `count` fixed-size records sorted by
-// (namespace_hash, path_hash):
+// Layout: 16-byte header + `count` fixed-size records sorted by key —
+// the root's bytes, then the path's — so a lookup is a binary search
+// and a listing in name order is a search to its cursor and a
+// sequential read from there:
 //
 //   header  [magic u32 "LSNP"][count u32][generation u64]
-//   record  [ns_hash u64][path_hash u64][revision u64][kind u8]
-//           [oid_len u8][oid MAX_OID][root_len u8][root MAX_ROOT]
-//           [path_len u16][path MAX_PATH]
+//   record  [root_len u8][root MAX_ROOT][path_len u16][path MAX_PATH]
+//           [revision u64][kind u8][oid_len u8][oid MAX_OID]
+//           [stamp_ms u64][size u64][ctype_len u8][ctype CONTENT_TYPE_MAX]
 //
-// The three key ceilings come from `loam_limits.rs`, so REC_SIZE is
-// per capacity profile (349 B embedded, 1213 B host) rather than a
-// number stated here. A snapshot is therefore a node-local artefact
+// The key and metadata ceilings come from `loam_limits.rs`, so
+// REC_SIZE is per capacity profile rather than a number stated here. A snapshot is therefore a node-local artefact
 // of one profile: a file written by the other profile fails the
 // `size == SNAP_HDR + count * REC_SIZE` validity check on open and
 // is treated as the invalid generation, which is the same path a
@@ -48,12 +49,15 @@ const FS_UNLINK: u32 = 0x090A;
 
 pub const SNAP_MAGIC: u32 = u32::from_le_bytes(*b"LSNP");
 pub const SNAP_HDR: usize = 16;
-/// Key ceilings, from the single register in `loam_limits.rs`.
-pub use super::limits::{MAX_OBJECT_ID as MAX_OID, MAX_PATH, MAX_ROOT};
+/// Key and metadata ceilings, from the single register in `loam_limits.rs`.
+pub use super::limits::{CONTENT_TYPE_MAX, MAX_OBJECT_ID as MAX_OID, MAX_PATH, MAX_ROOT};
 
 /// Derived, not chosen: the fixed record width that makes the file
 /// binary-searchable. Moves when any ceiling above moves.
-pub const REC_SIZE: usize = 8 + 8 + 8 + 1 + 1 + MAX_OID + 1 + MAX_ROOT + 2 + MAX_PATH;
+pub const REC_SIZE: usize =
+    1 + MAX_ROOT + 2 + MAX_PATH + 8 + 1 + 1 + MAX_OID + 8 + 8 + 1 + CONTENT_TYPE_MAX;
+
+pub use super::hash::key_cmp;
 
 /// `kind` value marking a tombstone in ARENA slots (never written
 /// to a snapshot — compaction drops the record entirely).
@@ -62,54 +66,81 @@ pub const KIND_TOMBSTONE: u8 = 0xFE;
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct SnapRecord {
-    pub ns_hash: u64,
-    pub path_hash: u64,
-    pub revision: u64,
-    pub kind: u8,
-    pub oid_len: u8,
-    pub oid: [u8; MAX_OID],
     pub root_len: u8,
     pub root: [u8; MAX_ROOT],
     pub path_len: u16,
     pub path: [u8; MAX_PATH],
+    pub revision: u64,
+    pub kind: u8,
+    pub oid_len: u8,
+    pub oid: [u8; MAX_OID],
+    pub stamp_ms: u64,
+    pub size: u64,
+    pub ctype_len: u8,
+    pub ctype: [u8; CONTENT_TYPE_MAX],
 }
 
 impl SnapRecord {
     pub const fn empty() -> Self {
         Self {
-            ns_hash: 0,
-            path_hash: 0,
-            revision: 0,
-            kind: 0,
-            oid_len: 0,
-            oid: [0; MAX_OID],
             root_len: 0,
             root: [0; MAX_ROOT],
             path_len: 0,
             path: [0; MAX_PATH],
+            revision: 0,
+            kind: 0,
+            oid_len: 0,
+            oid: [0; MAX_OID],
+            stamp_ms: 0,
+            size: 0,
+            ctype_len: 0,
+            ctype: [0; CONTENT_TYPE_MAX],
         }
     }
 
-    pub fn key(&self) -> (u64, u64) {
-        (self.ns_hash, self.path_hash)
+    pub fn root(&self) -> &[u8] {
+        &self.root[..(self.root_len as usize).min(MAX_ROOT)]
+    }
+
+    pub fn path(&self) -> &[u8] {
+        &self.path[..(self.path_len as usize).min(MAX_PATH)]
+    }
+
+    pub fn oid(&self) -> &[u8] {
+        &self.oid[..(self.oid_len as usize).min(MAX_OID)]
+    }
+
+    pub fn content_type(&self) -> &[u8] {
+        &self.ctype[..(self.ctype_len as usize).min(CONTENT_TYPE_MAX)]
+    }
+
+    /// This record's key against `(root, path)`.
+    pub fn cmp_key(&self, root: &[u8], path: &[u8]) -> core::cmp::Ordering {
+        key_cmp(self.root(), self.path(), root, path)
     }
 
     pub fn encode(&self, out: &mut [u8]) -> bool {
         if out.len() < REC_SIZE {
             return false;
         }
-        out[0..8].copy_from_slice(&self.ns_hash.to_le_bytes());
-        out[8..16].copy_from_slice(&self.path_hash.to_le_bytes());
-        out[16..24].copy_from_slice(&self.revision.to_le_bytes());
-        out[24] = self.kind;
-        out[25] = self.oid_len;
-        out[26..26 + MAX_OID].copy_from_slice(&self.oid);
-        let mut o = 26 + MAX_OID;
+        let mut o = 0;
         out[o] = self.root_len;
         out[o + 1..o + 1 + MAX_ROOT].copy_from_slice(&self.root);
         o += 1 + MAX_ROOT;
         out[o..o + 2].copy_from_slice(&self.path_len.to_le_bytes());
         out[o + 2..o + 2 + MAX_PATH].copy_from_slice(&self.path);
+        o += 2 + MAX_PATH;
+        out[o..o + 8].copy_from_slice(&self.revision.to_le_bytes());
+        o += 8;
+        out[o] = self.kind;
+        out[o + 1] = self.oid_len;
+        out[o + 2..o + 2 + MAX_OID].copy_from_slice(&self.oid);
+        o += 2 + MAX_OID;
+        out[o..o + 8].copy_from_slice(&self.stamp_ms.to_le_bytes());
+        out[o + 8..o + 16].copy_from_slice(&self.size.to_le_bytes());
+        o += 16;
+        out[o] = self.ctype_len;
+        out[o + 1..o + 1 + CONTENT_TYPE_MAX].copy_from_slice(&self.ctype);
         true
     }
 
@@ -118,18 +149,32 @@ impl SnapRecord {
             return None;
         }
         let mut r = Self::empty();
-        r.ns_hash = u64::from_le_bytes(src[0..8].try_into().ok()?);
-        r.path_hash = u64::from_le_bytes(src[8..16].try_into().ok()?);
-        r.revision = u64::from_le_bytes(src[16..24].try_into().ok()?);
-        r.kind = src[24];
-        r.oid_len = src[25];
-        r.oid.copy_from_slice(&src[26..26 + MAX_OID]);
-        let mut o = 26 + MAX_OID;
+        let mut o = 0;
         r.root_len = src[o];
         r.root.copy_from_slice(&src[o + 1..o + 1 + MAX_ROOT]);
         o += 1 + MAX_ROOT;
         r.path_len = u16::from_le_bytes(src[o..o + 2].try_into().ok()?);
         r.path.copy_from_slice(&src[o + 2..o + 2 + MAX_PATH]);
+        o += 2 + MAX_PATH;
+        r.revision = u64::from_le_bytes(src[o..o + 8].try_into().ok()?);
+        o += 8;
+        r.kind = src[o];
+        r.oid_len = src[o + 1];
+        r.oid.copy_from_slice(&src[o + 2..o + 2 + MAX_OID]);
+        o += 2 + MAX_OID;
+        r.stamp_ms = u64::from_le_bytes(src[o..o + 8].try_into().ok()?);
+        r.size = u64::from_le_bytes(src[o + 8..o + 16].try_into().ok()?);
+        o += 16;
+        r.ctype_len = src[o];
+        r.ctype
+            .copy_from_slice(&src[o + 1..o + 1 + CONTENT_TYPE_MAX]);
+        if r.root_len as usize > MAX_ROOT
+            || r.path_len as usize > MAX_PATH
+            || r.oid_len as usize > MAX_OID
+            || r.ctype_len as usize > CONTENT_TYPE_MAX
+        {
+            return None;
+        }
         Some(r)
     }
 }
@@ -265,27 +310,51 @@ pub unsafe fn snap_read_at(
     SnapRecord::decode(&buf)
 }
 
-/// Binary-search for (ns_hash, path_hash): ~log2(count) seeks.
+/// Binary-search for the record keyed `(root, path)`: ~log2(count)
+/// seeks.
 ///
 /// SAFETY: valid syscalls table; `snap.fd` open.
 pub unsafe fn snap_search(
     syscalls: &super::SyscallTable,
     snap: &OpenSnapshot,
-    ns_hash: u64,
-    path_hash: u64,
+    root: &[u8],
+    path: &[u8],
 ) -> Option<SnapRecord> {
-    let key = (ns_hash, path_hash);
     let (mut lo, mut hi) = (0u32, snap.count);
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         let rec = snap_read_at(syscalls, snap, mid)?;
-        match rec.key().cmp(&key) {
+        match rec.cmp_key(root, path) {
             core::cmp::Ordering::Equal => return Some(rec),
             core::cmp::Ordering::Less => lo = mid + 1,
             core::cmp::Ordering::Greater => hi = mid,
         }
     }
     None
+}
+
+/// Index of the first record whose key sorts strictly after
+/// `(root, after)`: where a name-ordered listing resumes. `None` when a
+/// probe cannot be read.
+///
+/// SAFETY: valid syscalls table; `snap.fd` open.
+pub unsafe fn snap_seek_after(
+    syscalls: &super::SyscallTable,
+    snap: &OpenSnapshot,
+    root: &[u8],
+    after: &[u8],
+) -> Option<u32> {
+    let (mut lo, mut hi) = (0u32, snap.count);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let rec = snap_read_at(syscalls, snap, mid)?;
+        if rec.cmp_key(root, after) == core::cmp::Ordering::Greater {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Some(lo)
 }
 
 /// Streaming snapshot writer (used by the incremental compactor).

@@ -1,0 +1,83 @@
+# loam-nbd: a loam volume exported as an NBD block device.
+#
+#   python3 tools/e2e/render_service.py packaging/mtls/loam-nbd/linux.yaml loam-nbd.yaml \
+#     <param>=<value> …
+#   fluxor run loam-nbd.yaml
+#
+# Its TLS identity — the CA, certificate and key — is files the build
+# reads, which a bundle cannot yet take as run-time parameters, so this
+# is a template rendered with its values. The parameters below are its
+# schema; render_service.py refuses a rendering that leaves one out.
+#
+# The device is `loam_volume`: the volume's writer, holding its lease,
+# staging writes and committing them at a flush as one revision. It
+# reaches the volume's node over mutual TLS — `cert` and `key` are this
+# node's identity; the node's certificate is checked against the host's
+# trusted CAs (`FLUXOR_CA_BUNDLE` names another bundle) — and works under
+# the capabilities in `capability`. The volume must exist (`loam volume
+# create`).
+[workload]
+name = "loam-nbd"
+version = "0.1.0"
+role = "service"
+
+[[implementation]]
+target = "linux"
+graph = "linux.yaml"
+
+[params.port]
+type = "integer"
+default = 10809
+min = 1
+max = 65535
+description = "TCP port the NBD export listens on"
+
+[params.admin]
+type = "string"
+required = true
+example = "storage.example:7443"
+description = "The volume's node: its admin plane, host:port"
+
+[params.capability]
+type = "string"
+required = true
+example = "/etc/loam/volume.cap"
+description = "Capability file: one fxcap1. chain per line, covering the volume's key and the body plane"
+
+[params.root]
+type = "string"
+required = true
+example = "tenant"
+description = "The volume's namespace root"
+
+[params.path]
+type = "string"
+required = true
+example = "/vols/db0"
+description = "The volume's path under its root"
+
+[params.block_size]
+type = "integer"
+default = 4096
+min = 512
+max = 32768
+description = "Logical block size of the export, bytes: a power of two"
+
+[params.lease_ttl_ms]
+type = "integer"
+default = 30000
+min = 1000
+max = 300000
+description = "The writer lease's time to live, milliseconds"
+
+[params.cert]
+type = "string"
+required = true
+example = "/etc/loam/node.der"
+description = "This node's certificate, DER"
+
+[params.key]
+type = "string"
+required = true
+example = "/etc/loam/node.key.der"
+description = "This node's private key, DER"

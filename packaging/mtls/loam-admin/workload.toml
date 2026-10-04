@@ -1,0 +1,80 @@
+# loam-admin: a storage node serving the admin plane over mutual TLS.
+#
+#   python3 tools/e2e/render_service.py packaging/mtls/loam-admin/linux.yaml loam-admin.yaml \
+#     <param>=<value> …
+#   fluxor run loam-admin.yaml
+#
+# Its TLS identity — the CA, certificate and key — is files the build
+# reads, which a bundle cannot yet take as run-time parameters, so this
+# is a template rendered with its values. The parameters below are its
+# schema; render_service.py refuses a rendering that leaves one out.
+#
+# Every session presents mesh capability chains before it is admitted to
+# anything; a chain verifies against `mesh_roots`, and its leaf names the
+# scope (a `root/` or deeper `/`-ended prefix) and the permission each
+# operation needs. The client certificate authenticates the session; the
+# capability authorises what it does.
+[workload]
+name = "loam-admin"
+version = "0.1.0"
+role = "service"
+
+[[implementation]]
+target = "linux"
+graph = "linux.yaml"
+
+[params.port]
+type = "integer"
+default = 7443
+min = 1
+max = 65535
+description = "TCP port the admin plane accepts sessions on"
+
+[params.mesh_roots]
+type = "string"
+required = true
+example = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+description = "Mesh root keys capability chains verify against: one or two 64-hex Ed25519 keys, comma-separated"
+
+[params.ns_wal]
+type = "string"
+required = true
+example = "/var/lib/loam/ns.wal"
+description = "The namespace's write-ahead log; its snapshots live beside it"
+
+[params.obj_wal]
+type = "string"
+required = true
+example = "/var/lib/loam/obj.wal"
+description = "The object index's write-ahead log"
+
+[params.body_dir]
+type = "string"
+required = true
+example = "/var/lib/loam/bodies"
+description = "Directory holding the bodies, one file per content digest"
+
+[params.gc_interval]
+type = "integer"
+default = 0
+min = 0
+max = 4294967295
+description = "Steps between orphan-sweep pages; 0 leaves the sweep off"
+
+[params.ca]
+type = "string"
+required = true
+example = "/etc/loam/ca.pem"
+description = "CA bundle a client certificate must chain to (PEM or DER)"
+
+[params.cert]
+type = "string"
+required = true
+example = "/etc/loam/node.der"
+description = "This node's certificate, DER"
+
+[params.key]
+type = "string"
+required = true
+example = "/etc/loam/node.key.der"
+description = "This node's private key, DER"

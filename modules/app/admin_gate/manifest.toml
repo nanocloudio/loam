@@ -1,0 +1,126 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+# Session deadlines are not kept here; a capability's window is checked
+# against the kernel's trusted clock.
+timer_class = "wall_clock"
+
+# The admin plane's front door (modules/common/mechanics/admin_gate_body.rs).
+#
+# Network sessions: the clear side of a server-mode `tls` — `net_in` from
+# `tls.clear_out`, `net_out` to `tls.clear_in`, `peer_identity` from
+# `tls.peer_identity`. The gate binds `port` through them. Unwired, the
+# gate serves its links only.
+#
+# In-graph links: `link{i}_in` / `link{i}_out`, records
+# `[session:u32][frame]`, one per buffer (wire them with a
+# `buffer_group`). A link is authenticated by being a channel inside this
+# graph; never carry one across a network.
+#
+# `admin_req` / `admin_resp` go to admin_router's `admin_in` /
+# `admin_out`, one record per buffer.
+#
+# Parameters:
+# | Tag | Name       | Type | Default | Description |
+# |-----|------------|------|---------|-------------|
+# | 1   | port       | u16  | 0       | TCP port the admin plane listens on; 0 binds nothing |
+# | 2   | mesh_roots | str  | —       | One or two 64-hex Ed25519 mesh root keys, comma-separated; required |
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+
+[[ports]]
+name = "peer_identity"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "admin_resp"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 131072
+
+[[ports]]
+name = "link0_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 131072
+
+[[ports]]
+name = "link1_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 131072
+
+[[ports]]
+name = "link2_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 131072
+
+[[ports]]
+name = "link3_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 131072
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+
+[[ports]]
+name = "admin_req"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 131072
+
+[[ports]]
+name = "link0_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 131072
+
+[[ports]]
+name = "link1_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 131072
+
+[[ports]]
+name = "link2_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 131072
+
+[[ports]]
+name = "link3_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 131072
+
+[observability]
+exempt = "in-arena state counters (forwarded, answered, refused, presentations) readable by the host harness; typed MSG_METRIC_SAMPLE emission is not wired yet"
+
+# Capacity profiles (modules/common/mechanics/loam_limits.rs). A graph
+# picks one with `variant: <profile>`; the default is the bare-metal
+# budget a Pi 5 / CM5 affords.
+[[variant]]
+name = "embedded"
+features = ["embedded"]
+default = true
+
+[[variant]]
+name = "minimal"
+features = ["minimal"]
+
+[[variant]]
+name = "node"
+features = ["node"]
+
+[[variant]]
+name = "server"
+features = ["server"]

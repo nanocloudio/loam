@@ -1,0 +1,62 @@
+# The loam-body template: a body store behind one mutually
+# authenticated session.
+#
+#   router node                               this node
+#   body router member port ⇄ remote_channel ⇄ tls ⇄ linux_net
+#                                       ⇅ (TCP, mutual TLS)
+#   linux_net ⇄ tls (server, client cert required) ⇄ remote_channel (listen)
+#                                                       ⇅ ch0
+#                                                    body_store
+#
+# Channel 0 carries body frames (`[len:u32][cid:u32][record]`) in both
+# directions: requests in, answers out. Its table entry is the body
+# plane's: len32 framing, records up to the largest frame (61485 bytes).
+# `remote_channel` takes the session only once `tls` has bound the
+# router's certificate to it.
+target: linux
+tick_us: 100
+
+# Every pair below is a bidirectional feedback pair.
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+
+modules:
+  - name: body_tls
+    type: tls
+    mode: 1                       # server
+    verify_peer: 1
+    peer_auth: ca_dns
+    trust: "${file:${param:ca}}"
+    cert_file: "${param:cert}"
+    key_file: "${param:key}"
+
+  - name: remote_channel
+    transport: net
+    role: listen
+    port: ${param:port}
+    require_peer: 1
+    channels: "OctetStream:len32:61485"
+
+  - name: body_store
+    variant: node
+    root_dir: "${param:body_dir}"
+
+wiring:
+  - from: linux_net.net_out
+    to: body_tls.cipher_in
+  - from: body_tls.cipher_out
+    to: linux_net.net_in
+  - from: body_tls.clear_out
+    to: remote_channel.transport_in
+  - from: remote_channel.transport_out
+    to: body_tls.clear_in
+  - from: body_tls.peer_identity
+    to: remote_channel.peer_identity
+
+  - from: remote_channel.ch0_rx
+    to: body_store.body_requests
+  - from: body_store.body_responses
+    to: remote_channel.ch0

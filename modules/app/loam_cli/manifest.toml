@@ -1,0 +1,86 @@
+version          = "0.1.0"
+type             = "Cli"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Session and presentation deadlines run on the monotonic clock.
+timer_class      = "agnostic"
+
+# The loam operator applet (modules/common/mechanics/loam_cli_body.rs):
+# one PIC module dispatching loam's commands over the cli host surface,
+# speaking the admin wire to a node's admin plane over mutual TLS.
+#
+#   fluxor install packaging/cli/workload.toml
+#   fluxor exec loam -- --admin node:7443 --capability ops.cap ls tenant
+#
+# Every command runs the admin, map and manifest wires the node's own
+# modules run.
+
+# argv after `--`, NUL-separated (from cli_in.args_out). Sized to
+# `ARGV_MAX`: a record the channel cannot carry never arrives, and the
+# applet would answer with help.
+[[ports]]
+name         = "args"
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 8192
+
+# ← tls.clear_out: net_proto events of both of the applet's dials.
+[[ports]]
+name         = "net_in"
+direction    = "input"
+index        = 1
+content_type = "OctetStream"
+buffer_size  = 16384
+
+# stdout → cli_out.bytes_in. Takes a whole `OUT_MAX` (65536) write as one
+# record: a channel smaller than the write refuses it.
+[[ports]]
+name         = "stdout"
+direction    = "output"
+content_type = "TextPlain"
+buffer_size  = 65536
+
+# exit code [i32 LE] → cli_out.exit_in.
+[[ports]]
+name         = "exit"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 16
+
+# → tls.clear_in: dials and admin requests, net_proto commands.
+[[ports]]
+name         = "net_out"
+direction    = "output"
+index        = 2
+content_type = "OctetStream"
+buffer_size  = 16384
+
+# Files a command reads and writes: the capability file, put/get data,
+# volume reads and snapshot manifests.
+[[resources]]
+requires_contract = "fs"
+access            = "write"
+
+[observability]
+exempt = "run-to-completion CLI applet; no steady-state throughput to observe"
+
+# Capacity profiles (modules/common/mechanics/loam_limits.rs). The applet
+# runs on an operator's host, so it carries the host's key ceilings.
+[[variant]]
+name = "node"
+features = ["node"]
+default = true
+
+[[variant]]
+name = "embedded"
+features = ["embedded"]
+
+[[variant]]
+name = "minimal"
+features = ["minimal"]
+
+[[variant]]
+name = "server"
+features = ["server"]

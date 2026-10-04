@@ -10,8 +10,7 @@
 //   [payload: len bytes]
 //
 // No file header. Records self-validate via CRC; a torn tail trips
-// the CRC and replay stops cleanly there. Same scheme as
-// `src/wal.rs`, simplified for a fixed binary payload schema.
+// the CRC and replay stops cleanly there.
 //
 // `FS_OPEN` does not create a file. `wal_open_create` uses
 // `FS_OPEN_CREATE` for that and is what a PIC lands its WAL with on
@@ -763,8 +762,8 @@ unsafe fn name_present(syscalls: &SyscallTable, path: &[u8]) -> bool {
 
 // ── CRC32 (IEEE 802.3 polynomial, table-based, no_std) ────────────
 //
-// Mirror of `src/wal.rs:292`. Kept inline here so PIC builds don't
-// pick up any std-only deps.
+// The table is built at compile time, so the module carries it as data
+// and computes nothing at load.
 
 const fn build_crc32_table() -> [u32; 256] {
     let mut table = [0u32; 256];
@@ -797,19 +796,16 @@ pub fn crc32(bytes: &[u8]) -> u32 {
     crc ^ 0xFFFF_FFFF
 }
 
-/// Decode a module's `params` byte slice into a WAL path.
-///
+/// The `wal_path` a module's params blob carries: the TLV block the
+/// fluxor build packs from a graph's parameters (`0xFE 0x01` magic, then
+/// `[tag][len][bytes]` records, tag 1 = `wal_path`, tag 0xFF = end).
 /// Four modules take a WAL path this way, so the parser lives here
-/// rather than four times over. The format has two shapes and that
-/// ambiguity is the whole reason it is worth owning once: a TLV block (`0xFE 0x01` magic, then
-/// `[tag][len][bytes]` records, tag 1 = wal_path, tag 0xFF = end) or,
-/// when the magic is absent, the raw bytes as the path itself.
+/// rather than four times over.
 ///
-/// Returns the number of bytes written into `out`, or `None` when
-/// `params` carries no path. A path longer than `out` is TRUNCATED
-/// rather than refused: the caller sizes `out` from
-/// `WAL_PATH_BUF`, and a truncated path fails
-/// loudly at open rather than silently writing somewhere wrong.
+/// `Ok(0)` when the blob carries no path: a channel-only module. `Err`
+/// when it is not a TLV block, or names a path longer than `out` — a
+/// path is never cut short, since a shortened one can name a file that
+/// opens, and the module would log somewhere no one configured.
 ///
 /// # Safety
 /// `params` must point to `params_len` readable bytes.
@@ -817,39 +813,34 @@ pub unsafe fn decode_wal_path(
     params: *const u8,
     params_len: usize,
     out: &mut [u8],
-) -> Option<usize> {
-    if params.is_null() || params_len == 0 || out.is_empty() {
-        return None;
+) -> Result<usize, ()> {
+    if params.is_null() || params_len == 0 {
+        return Ok(0);
     }
-    let is_tlv = params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
-    if is_tlv {
-        let mut off = 4usize;
-        while off + 2 <= params_len {
-            let tag = *params.add(off);
-            let elen = *params.add(off + 1) as usize;
-            off += 2;
-            if tag == 0xFF {
-                break;
-            }
-            if tag == 1 && off + elen <= params_len {
-                let copy = elen.min(out.len());
-                let src = params.add(off);
-                let mut i = 0usize;
-                while i < copy {
-                    out[i] = *src.add(i);
-                    i += 1;
-                }
-                return Some(copy);
-            }
-            off += elen;
+    if params_len < 4 || *params != 0xFE || *params.add(1) != 0x01 {
+        return Err(());
+    }
+    let mut off = 4usize;
+    while off + 2 <= params_len {
+        let tag = *params.add(off);
+        let elen = *params.add(off + 1) as usize;
+        off += 2;
+        if tag == 0xFF {
+            break;
         }
-        return None;
+        if tag == 1 {
+            if off + elen > params_len || elen > out.len() {
+                return Err(());
+            }
+            let src = params.add(off);
+            let mut i = 0usize;
+            while i < elen {
+                out[i] = *src.add(i);
+                i += 1;
+            }
+            return Ok(elen);
+        }
+        off += elen;
     }
-    let copy = params_len.min(out.len());
-    let mut i = 0usize;
-    while i < copy {
-        out[i] = *params.add(i);
-        i += 1;
-    }
-    Some(copy)
+    Ok(0)
 }

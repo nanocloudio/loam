@@ -1,0 +1,47 @@
+# The loam operator applet as a fluxor cli-applet: one module over the
+# cli stack, dialing a node's admin plane through a client-mode `tls`.
+#
+#   fluxor install packaging/cli/workload.toml
+#   fluxor exec loam -- --admin node:7443 --capability ops.cap ls tenant
+#
+# The node's certificate must chain to a CA the host trusts (the bundle
+# `FLUXOR_CA_BUNDLE` names, when set) and name the host the applet dials. The node accepts the applet by its own certificate, read from
+# `$HOME/.config/loam/` when the applet is installed. Capabilities
+# authorise what it does.
+target: linux
+tick_us: 100
+
+# loam_cli ⇄ tls ⇄ linux_net: request/answer cycles by construction.
+scheduler:
+  accept_cycles: true
+
+platform:
+  cli: {}
+  net: {}
+
+modules:
+  - name: loam_cli
+  - name: tls
+    mode: 0                       # client
+    peer_auth: ca_dns
+    trust: system
+    cert_file: "${HOME}/.config/loam/client.der"
+    key_file: "${HOME}/.config/loam/client.key.der"
+    ecdh_bits_per_step: 32
+
+wiring:
+  - from: cli_in.args_out
+    to: loam_cli.args
+  - from: loam_cli.stdout
+    to: cli_out.bytes_in
+  - from: loam_cli.exit
+    to: cli_out.exit_in
+
+  - from: loam_cli.net_out
+    to: tls.clear_in
+  - from: tls.clear_out
+    to: loam_cli.net_in
+  - from: tls.cipher_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: tls.cipher_in

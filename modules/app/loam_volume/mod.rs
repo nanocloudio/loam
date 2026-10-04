@@ -8,10 +8,12 @@
 // Loam volume. Step body in
 // `modules/common/replicated/loam_volume_body.rs`.
 //
-// Ports: `admin_resp` in[0] carries the node's admin acks, `blocks`
-// out[0] is the block channel consumers wire to, `admin_req` out[1]
-// carries admin requests to the node. Both admin ports speak the raw
-// loam admin wire, one request and its ack at a time.
+// Ports: `admin_in` in[0] carries the admin plane's answers, `blocks`
+// out[0] is the block channel consumers wire to, `admin_out` out[1]
+// carries requests to the admin plane. The admin pair is either an
+// in-graph link to `admin_gate` (`[session:u32][frame]` records) or
+// the clear side of a client-mode `tls` (net_proto), as the `admin`
+// parameter says; one request and its ack at a time.
 
 use core::ffi::c_void;
 
@@ -32,22 +34,20 @@ mod sha256 {
     pub use super::Sha256;
 }
 
-#[allow(
-    dead_code,
-    reason = "shared PIC body; each module shim drives a subset"
-)]
 #[path = "../../common/mechanics/loam_limits.rs"]
 mod limits;
 
-#[allow(
-    dead_code,
-    reason = "shared PIC body; each module shim drives a subset"
-)]
 #[path = "../../common/mechanics/loam_admin_wire.rs"]
 mod admin;
 
+#[path = "../../common/mechanics/loam_body_wire.rs"]
+mod body_wire;
+
 #[path = "../../common/mechanics/loam_volume_map_wire.rs"]
 mod map_wire;
+
+#[path = "../../common/mechanics/admin_client.rs"]
+mod admin_client;
 
 #[allow(
     dead_code,
@@ -81,6 +81,15 @@ mod params_def {
 
         6, fence, str, 0
             => |s, d, len| { super::body::set_fence(s, core::slice::from_raw_parts(d, len)); };
+
+        7, capability, str, 0
+            => |s, d, len| { super::body::set_capability(s, core::slice::from_raw_parts(d, len)); };
+
+        8, admin, str, 0
+            => |s, d, len| { super::body::set_admin(s, core::slice::from_raw_parts(d, len)); };
+
+        9, session, u32, 1
+            => |s, d, len| { s.link_session = p_u32(d, len, 0, 1); };
     }
 }
 
@@ -102,9 +111,13 @@ pub extern "C" fn module_deferred_ready() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// The module ABI's constructor: `state_ptr` points to `state_size`
+/// zeroed bytes this module owns, `params` to `params_len` bytes, and
+/// `syscalls` to the runtime's table, all valid for the call.
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -119,9 +132,9 @@ pub extern "C" fn module_new(
         if sys.is_null() {
             return -1;
         }
-        // `admin_req`, the second output.
-        let req_chan = dev_channel_port(&*sys, 1, 1);
-        let rc = body::module_new_impl(in_chan, out_chan, req_chan, state_ptr, state_size, sys);
+        // `admin_in` is the first input; `admin_out` the second output.
+        let admin_out = dev_channel_port(&*sys, 1, 1);
+        let rc = body::module_new_impl(out_chan, state_ptr, state_size, sys);
         if rc != 0 {
             return rc;
         }
@@ -133,6 +146,13 @@ pub extern "C" fn module_new(
         } else {
             params_def::set_defaults(s);
         }
+        if in_chan < 0 || admin_out < 0 {
+            let why = b"[loam_volume] admin_in and admin_out must be wired";
+            dev_log(&*sys, 1, why.as_ptr(), why.len());
+            return -22;
+        }
+        let tag = dev_requester_tag(&*sys);
+        body::connect(state_ptr, in_chan, admin_out, tag);
         if out_chan >= 0 {
             dev_channel_register_ioctl(
                 &*sys,
@@ -145,10 +165,29 @@ pub extern "C" fn module_new(
     }
 }
 
+/// # Safety
+/// The module ABI's step: the state pointer is the state `module_new`
+/// initialised, and the runtime steps it from one caller at a time.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
     unsafe { body::module_step_impl(state_ptr) }
+}
+
+/// Stop taking requests, commit what is staged, release the writer
+/// lease, then report done from `module_step`.
+///
+/// # Safety
+/// The module ABI's drain: `state_ptr` is the state `module_new`
+/// initialised, and the runtime drains it from one caller at a time.
+#[no_mangle]
+#[link_section = ".text.module_drain"]
+pub unsafe extern "C" fn module_drain(state_ptr: *mut u8) -> i32 {
+    if state_ptr.is_null() {
+        return -1;
+    }
+    unsafe { body::drain(&mut *(state_ptr as *mut body::ModuleState)) };
+    0
 }
 
 // Panic handler comes from `runtime.rs` via the include! above.

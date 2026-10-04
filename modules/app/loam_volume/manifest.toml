@@ -14,27 +14,65 @@ provides = ["storage.block"]
 
 # Acks from the node's admin surface: `admin_router.admin_out` when
 # co-located.
+# The admin plane: an in-graph link to admin_gate (records
+# `[session:u32][frame]`, one per buffer — wire both edges with a
+# `buffer_group`), or, with the `admin` parameter set, net_proto to the
+# clear side of a client-mode `tls` that dials the gate.
+#
+# Parameters:
+# | Tag | Name         | Type | Default | Description |
+# |-----|--------------|------|---------|-------------|
+# | 1   | root         | str  | —       | The volume's namespace root |
+# | 2   | path         | str  | —       | The volume's path |
+# | 3   | lease_ttl_ms | u32  | 30000   | The writer lease asked for |
+# | 4   | block_size   | u32  | 4096    | Block size the device presents |
+# | 5   | holder       | str  | random  | The writer's chosen holder, 32 hex |
+# | 6   | fence        | str  | —       | The fence an attach flow bound its key release to |
+# | 7   | capability   | str  | —       | Path of the capability file, one `fxcap1.` chain per line; required |
+# | 8   | admin        | str  | —       | The gate's `host[:port]`; unset, the module is a link session |
+# | 9   | session      | u32  | 1       | The link session id (link only) |
+
 [[ports]]
-name = "admin_resp"
+name = "admin_in"
 direction = "input"
 content_type = "OctetStream"
-buffer_size = 65536
+buffer_size = 131072
 
-# The block device. First output, so it is `out_chan`.
 [[ports]]
 name = "blocks"
 direction = "output"
 content_type = "OctetStream"
 required = true
 
-# Requests to the node's admin surface: `admin_router.admin_in` when
-# co-located. Sized so one full-page PUT is one write — `admin_router`
-# takes a request in a single read.
 [[ports]]
-name = "admin_req"
+name = "admin_out"
 direction = "output"
 content_type = "OctetStream"
-buffer_size = 65536
+buffer_size = 131072
+
+[[resources]]
+requires_contract = "fs"
+access = "read"
 
 [observability]
 exempt = "block source — block I/O is observed at the consumer above it; commit and fetch counters are in-arena and readable by the host harness"
+
+# Capacity profiles (modules/common/mechanics/loam_limits.rs). A graph
+# picks one with `variant: <profile>`; the default is the bare-metal
+# budget a Pi 5 / CM5 affords.
+[[variant]]
+name = "embedded"
+features = ["embedded"]
+default = true
+
+[[variant]]
+name = "minimal"
+features = ["minimal"]
+
+[[variant]]
+name = "node"
+features = ["node"]
+
+[[variant]]
+name = "server"
+features = ["server"]

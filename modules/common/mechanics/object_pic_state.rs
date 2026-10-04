@@ -270,6 +270,10 @@ impl<const N: usize> PicObjectState<N> {
     /// Resolve an id whose hash the caller already has. The id bytes
     /// are still required and still decide the match; there is no
     /// hash-only variant, by design.
+    #[allow(
+        clippy::manual_find,
+        reason = "an explicit scan keeps the PIC build panic-free: iterator adapters pull core::panicking paths the bare-metal SDK does not carry"
+    )]
     pub fn lookup_hashed(&self, object_id_hash: u64, object_id: &[u8]) -> Option<&ObjectSlot> {
         for s in &self.slots {
             if s.matches(object_id_hash, object_id) {
@@ -285,6 +289,10 @@ impl<const N: usize> PicObjectState<N> {
     /// whenever identical bytes are bound at a second path: dedup,
     /// not an error). The same id with a DIFFERENT size is a real
     /// conflict and errors.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "bounded no_std step functions pass explicit scalar params"
+    )]
     pub fn put_new(
         &mut self,
         object_id: &[u8],
@@ -352,6 +360,10 @@ impl<const N: usize> PicObjectState<N> {
     /// Overwrite an existing entry. The PIC apply path is permissive
     /// (quorum has validated); we do not enforce monotone revisions
     /// here — the proposer's quota and check pipeline did.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "bounded no_std step functions pass explicit scalar params"
+    )]
     pub fn update(
         &mut self,
         object_id: &[u8],

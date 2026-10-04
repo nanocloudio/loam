@@ -66,7 +66,28 @@ impl NamespaceKindCode {
 /// not independent knobs. Every one of them is enforced by refusal
 /// at the wire, so a key that reaches this state machine always
 /// fits inline.
-pub use super::limits::{MAX_OBJECT_ID, MAX_PATH as MAX_LIST_PATH, MAX_ROOT as MAX_LIST_ROOT};
+pub use super::limits::{
+    CONTENT_TYPE_MAX, MAX_OBJECT_ID, MAX_PATH as MAX_LIST_PATH, MAX_ROOT as MAX_LIST_ROOT,
+};
+
+/// What a binding records besides its target: when its writer was
+/// admitted, the size of what it bound, and its content type. All three
+/// arrive in the record, so every replica and every replay stores the
+/// same values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Meta<'a> {
+    pub stamp_ms: u64,
+    pub size: u64,
+    pub content_type: &'a [u8],
+}
+
+impl Meta<'_> {
+    pub const NONE: Meta<'static> = Meta {
+        stamp_ms: 0,
+        size: 0,
+        content_type: &[],
+    };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BindingSlot {
@@ -136,6 +157,11 @@ pub struct BindingSlot {
     /// which is what makes a delta window mean "everything that has
     /// happened since you last looked".
     pub change_rev: u64,
+    /// The binding's metadata (`Meta`).
+    pub stamp_ms: u64,
+    pub size: u64,
+    pub ctype_bytes: [u8; CONTENT_TYPE_MAX],
+    pub ctype_len: u8,
 }
 
 /// `kind` marking a deletion that must mask an on-disk snapshot
@@ -162,7 +188,33 @@ impl BindingSlot {
             expires_at: 0,
             locked: 0,
             change_rev: 0,
+            stamp_ms: 0,
+            size: 0,
+            ctype_bytes: [0u8; CONTENT_TYPE_MAX],
+            ctype_len: 0,
         }
+    }
+
+    /// The binding's content type.
+    pub fn content_type(&self) -> &[u8] {
+        &self.ctype_bytes[..(self.ctype_len as usize).min(CONTENT_TYPE_MAX)]
+    }
+
+    /// The binding's metadata.
+    pub fn meta(&self) -> Meta<'_> {
+        Meta {
+            stamp_ms: self.stamp_ms,
+            size: self.size,
+            content_type: self.content_type(),
+        }
+    }
+
+    fn set_meta(&mut self, m: &Meta<'_>) {
+        self.stamp_ms = m.stamp_ms;
+        self.size = m.size;
+        let n = m.content_type.len().min(CONTENT_TYPE_MAX);
+        self.ctype_bytes[..n].copy_from_slice(&m.content_type[..n]);
+        self.ctype_len = n as u8;
     }
 
     /// Hash-narrowed, byte-decided key equality. The hashes are a
@@ -347,6 +399,10 @@ impl<const N: usize> PicNamespaceState<N> {
     /// — the hashes only narrow the scan. There is deliberately no
     /// hash-only variant: one would reintroduce the aliasing this
     /// signature exists to prevent.
+    #[allow(
+        clippy::manual_find,
+        reason = "an explicit scan keeps the PIC build panic-free: iterator adapters pull core::panicking paths the bare-metal SDK does not carry"
+    )]
     pub fn lookup_hashed(
         &self,
         namespace_hash: u64,
@@ -369,8 +425,10 @@ impl<const N: usize> PicNamespaceState<N> {
         object_id: &[u8],
         kind: u8,
         revision: u64,
+        meta: &Meta<'_>,
     ) -> Result<ApplyOk, ApplyError> {
-        if !key_fits(namespace_root, path, object_id) {
+        if !key_fits(namespace_root, path, object_id) || meta.content_type.len() > CONTENT_TYPE_MAX
+        {
             return Err(ApplyError::KeyTooLong);
         }
         let (ns_h, p_h) = key_hash(namespace_root, path);
@@ -417,6 +475,7 @@ impl<const N: usize> PicNamespaceState<N> {
                         s.object_id_bytes[..object_id.len()].copy_from_slice(object_id);
                         s.object_id_len = object_id.len() as u8;
                     }
+                    s.set_meta(meta);
                     s.change_rev = seq;
                     self.change_seq = seq;
                     return Ok(ApplyOk::Bound { revision });
@@ -451,6 +510,7 @@ impl<const N: usize> PicNamespaceState<N> {
                     slot.root_bytes[..namespace_root.len()].copy_from_slice(namespace_root);
                     slot.root_len = namespace_root.len() as u8;
                 }
+                slot.set_meta(meta);
                 slot.change_rev = seq;
                 *s = slot;
                 self.change_seq = seq;
@@ -478,8 +538,10 @@ impl<const N: usize> PicNamespaceState<N> {
         object_id: &[u8],
         kind: u8,
         revision: u64,
+        meta: &Meta<'_>,
     ) -> Result<ApplyOk, ApplyError> {
-        if !key_fits(namespace_root, path, object_id) {
+        if !key_fits(namespace_root, path, object_id) || meta.content_type.len() > CONTENT_TYPE_MAX
+        {
             return Err(ApplyError::KeyTooLong);
         }
         let (ns_h, p_h) = key_hash(namespace_root, path);
@@ -501,12 +563,13 @@ impl<const N: usize> PicNamespaceState<N> {
                     s.object_id_bytes[..object_id.len()].copy_from_slice(object_id);
                     s.object_id_len = object_id.len() as u8;
                 }
+                s.set_meta(meta);
                 s.change_rev = seq;
                 self.change_seq = seq;
                 return Ok(ApplyOk::Bound { revision });
             }
         }
-        self.bind(namespace_root, path, object_id, kind, revision)
+        self.bind(namespace_root, path, object_id, kind, revision, meta)
     }
 
     pub fn rename(
@@ -550,16 +613,18 @@ impl<const N: usize> PicNamespaceState<N> {
         Err(ApplyError::NotBound)
     }
 
-    /// Is `object_id` bound by ANY occupied slot, in any root?
+    /// Is `object_id` bound by ANY live slot, in any root?
     /// Used by orphan-body GC. Hash-narrowed and byte-decided like
-    /// every other identity question here. A slot with no id bytes
-    /// still counts as a reference: that is a binding whose binder
-    /// supplied no id at all, and keeping a blob is always safe
-    /// where deleting a referenced one never is.
+    /// every other identity question here. A live slot with no id
+    /// bytes still counts as a reference: that is a binding whose
+    /// binder supplied no id at all, and keeping a blob is always safe
+    /// where deleting a referenced one never is. A tombstone binds
+    /// nothing.
     pub fn object_id_referenced(&self, object_id: &[u8]) -> bool {
         let h = fnv1a64(object_id);
         self.slots.iter().any(|s| {
             s.occupied
+                && s.kind != KIND_TOMBSTONE
                 && s.object_id_hash == h
                 && (s.object_id_len == 0 || s.object_id() == object_id)
         })
@@ -586,7 +651,9 @@ impl<const N: usize> PicNamespaceState<N> {
                 }
                 s.kind = KIND_TOMBSTONE;
                 s.revision = revision;
+                s.object_id_hash = 0;
                 s.object_id_len = 0;
+                s.set_meta(&Meta::NONE);
                 s.snapshotted = 0;
                 s.cmp_emitted = 0;
                 s.change_rev = seq;
@@ -818,124 +885,67 @@ impl<const N: usize> PicNamespaceState<N> {
         }
     }
 
-    /// Smallest (ns_hash, path_hash) strictly greater than `after`
-    /// among occupied slots — the compactor's merge cursor over
-    /// the (unsorted) arena. O(N) per call, bounded per step.
-    pub fn min_key_above(&self, after: Option<(u64, u64)>) -> Option<(usize, (u64, u64))> {
-        let mut best: Option<(usize, (u64, u64))> = None;
-        for (i, s) in self.slots.iter().enumerate() {
+    /// The occupied slot with the smallest key — root bytes, then path
+    /// bytes — strictly greater than `after`: the compactor's merge
+    /// cursor over the (unsorted) arena. O(N) per call, bounded per
+    /// step.
+    pub fn min_key_above(&self, after: Option<(&[u8], &[u8])>) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for i in 0..N {
+            let s = &self.slots[i];
             if !s.occupied {
                 continue;
             }
-            let key = (s.namespace_hash, s.path_hash);
-            if let Some(a) = after {
-                if key <= a {
+            if let Some((ar, ap)) = after {
+                if super::hash::key_cmp(s.root(), s.path(), ar, ap) != core::cmp::Ordering::Greater
+                {
                     continue;
                 }
             }
-            match best {
-                Some((_, bk)) if bk <= key => {}
-                _ => best = Some((i, key)),
+            let better = match best {
+                None => true,
+                Some(b) => {
+                    let bs = &self.slots[b];
+                    super::hash::key_cmp(s.root(), s.path(), bs.root(), bs.path())
+                        == core::cmp::Ordering::Less
+                }
+            };
+            if better {
+                best = Some(i);
             }
         }
         best
     }
 
-    /// One page of the keys under `namespace_root` whose path begins
-    /// with `prefix`, in slot order.
-    ///
-    /// `emit` is called once per matching key, with its path and its
-    /// kind, and answers whether it TOOK the entry. A `false` stops
-    /// the walk without consuming that entry, so the cursor returned
-    /// points AT it and the next page offers it again — which is what
-    /// lets a caller fill a fixed buffer and come back for the rest
-    /// instead of refusing the listing.
-    ///
-    /// The answer is where to resume, or `None` once every slot has
-    /// been examined. `None` rather than a zero sentinel because slot
-    /// 0 is a valid place to resume: a caller whose buffer could not
-    /// hold even the first entry must be told "resume at 0", and a
-    /// sentinel would tell it "finished" instead.
-    ///
-    /// Every bound key appears: the wire refuses anything that would
-    /// not fit inline, so there is no "bound but unlistable" state
-    /// for a listing to skip. The root is compared on BYTES — a
-    /// root-hash match alone would enumerate one tenant's keys under
-    /// another tenant's root. The prefix is a byte prefix of the path
-    /// and nothing else: this state holds no notion of a separator,
-    /// so a caller that means "children" says so in the bytes it
-    /// sends.
-    pub fn list_page_prefixed(
-        &self,
-        namespace_root: &[u8],
-        prefix: &[u8],
-        cursor: u32,
-        max: usize,
-        mut emit: impl FnMut(&[u8], u8) -> bool,
-    ) -> Option<u32> {
-        let ns_h = fnv1a64(namespace_root);
-        let mut idx = cursor as usize;
-        let mut count = 0usize;
-        while idx < N {
-            if count >= max {
-                return Some(idx as u32);
+    /// The occupied slot under `namespace_root` whose path starts with
+    /// `prefix` and sorts strictly after `after`, smallest first —
+    /// tombstones included, since a listing merged with the snapshot
+    /// must see the deletions that mask it. One step of a name-ordered
+    /// listing; O(N).
+    pub fn next_listed(&self, namespace_root: &[u8], prefix: &[u8], after: &[u8]) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for i in 0..N {
+            let s = &self.slots[i];
+            if !s.occupied || s.path_len == 0 || s.root() != namespace_root {
+                continue;
             }
-            let s = &self.slots[idx];
-            if s.occupied
-                && s.kind != KIND_TOMBSTONE
-                && s.namespace_hash == ns_h
-                && s.path_len != 0
-                && s.root() == namespace_root
-                && s.path().starts_with(prefix)
+            let p = s.path();
+            if !p.starts_with(prefix)
+                || super::hash::bytes_cmp(p, after) != core::cmp::Ordering::Greater
             {
-                if !emit(s.path(), s.kind) {
-                    return Some(idx as u32);
-                }
-                count += 1;
+                continue;
             }
-            idx += 1;
-        }
-        None
-    }
-
-    /// One page of the namespace's paths, in slot order. `emit` is
-    /// called once per path (at most `max` times); returns the next
-    /// cursor, 0 when the enumeration wrapped.
-    ///
-    /// The empty prefix matches every path, so this is
-    /// `list_page_prefixed` with the filter open and the kind
-    /// dropped. One walk, one set of match rules: a second copy of
-    /// them is a second place for a tenant's keys to leak from.
-    pub fn list_page(
-        &self,
-        namespace_root: &[u8],
-        cursor: u32,
-        max: usize,
-        mut emit: impl FnMut(&[u8]),
-    ) -> u32 {
-        // `None` is "every slot examined", which this surface reports
-        // as the 0 its own contract calls "wrapped".
-        self.list_page_prefixed(namespace_root, &[], cursor, max, |path, _kind| {
-            emit(path);
-            true
-        })
-        .unwrap_or_default()
-    }
-
-    pub fn unbind(&mut self, namespace_root: &[u8], path: &[u8]) -> Result<ApplyOk, ApplyError> {
-        let seq = self.change_seq.wrapping_add(1);
-        let (ns_h, p_h) = key_hash(namespace_root, path);
-        for s in self.slots.iter_mut() {
-            if s.matches(ns_h, p_h, namespace_root, path) {
-                if s.locked != 0 {
-                    return Err(ApplyError::Locked);
+            let better = match best {
+                None => true,
+                Some(b) => {
+                    super::hash::bytes_cmp(p, self.slots[b].path()) == core::cmp::Ordering::Less
                 }
-                *s = BindingSlot::empty();
-                self.change_seq = seq;
-                return Ok(ApplyOk::Unbound);
+            };
+            if better {
+                best = Some(i);
             }
         }
-        Err(ApplyError::NotBound)
+        best
     }
 }
 
@@ -1446,6 +1456,10 @@ impl<const N: usize> LeaseTable<N> {
     /// opens with one of these per entry. False when the key does not
     /// fit or the table has no room, which a log written from a table
     /// of the same capacity never produces.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "bounded no_std step functions pass explicit scalar params"
+    )]
     pub fn restore(
         &mut self,
         namespace_root: &[u8],

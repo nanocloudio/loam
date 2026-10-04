@@ -1,0 +1,89 @@
+# loam-s3: an S3 endpoint over a loam storage node.
+#
+#   fluxor publish bundle packaging/service/loam-s3/workload.toml
+#   fluxor store pin loam-s3:latest          # in the consumer
+#   fluxor run loam-s3 --params loam-s3.toml
+#
+# wave's `http` and `s3_serve` terminate S3 and SigV4; every object goes
+# through loam's `storage.object` provider, which presents each access
+# key's capability to the node's admin plane and works under the grant
+# it is given. Credentials name a scope and a capability per access key
+# (wave's credentials format); the capabilities verify against
+# `mesh_roots`, which the S3 server and the admin plane share.
+[workload]
+name = "loam-s3"
+version = "0.1.0"
+role = "service"
+
+[[implementation]]
+target = "linux"
+graph = "linux.yaml"
+
+[params.port]
+type = "integer"
+default = 9000
+min = 1
+max = 65535
+description = "TCP port the S3 endpoint listens on"
+
+[params.credentials]
+type = "string"
+required = true
+example = "/etc/loam/s3-credentials"
+description = "Path of the credentials file: access key, secret, scope and capability per line"
+
+[params.mesh_roots]
+type = "string"
+required = true
+example = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+description = "Mesh root keys the capabilities verify against: one or two 64-hex Ed25519 keys, comma-separated"
+
+[params.region]
+type = "string"
+default = "us-east-1"
+description = "Region requests must be signed for"
+
+[params.max_object_mib]
+type = "integer"
+default = 1024
+min = 1
+max = 1024
+description = "Largest object accepted, MiB; a loam object is at most 1 GiB"
+
+[params.part_min_kib]
+type = "integer"
+default = 5120
+min = 0
+max = 1048576
+description = "Smallest multipart part but the last, KiB"
+
+[params.ns_wal]
+type = "string"
+required = true
+example = "/var/lib/loam/ns.wal"
+description = "The namespace's write-ahead log; its snapshots live beside it"
+
+[params.obj_wal]
+type = "string"
+required = true
+example = "/var/lib/loam/obj.wal"
+description = "The object index's write-ahead log"
+
+[params.body_dir]
+type = "string"
+required = true
+example = "/var/lib/loam/bodies"
+description = "Directory holding the bodies, one file per content digest"
+
+[params.spool_dir]
+type = "string"
+required = true
+example = "/var/lib/loam/spool"
+description = "Directory streamed writes are spooled in until they commit"
+
+[params.gc_interval]
+type = "integer"
+default = 0
+min = 0
+max = 4294967295
+description = "Steps between orphan-sweep pages; 0 leaves the sweep off"

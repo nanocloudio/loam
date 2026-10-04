@@ -1,36 +1,81 @@
 version = "0.1.0"
 hardware_targets = ["bcm2712"]
 
-# Front-door admin router. Translates external admin requests
-# (loam_admin_wire format) into the public-surface PICs' native
-# channel formats, and routes responses back tagged with the
-# caller's correlation_id.
+# Composes the admin wire's operations over the namespace, object and
+# body planes, answering each request under the caller's
+# correlation_id. `admin_in` / `admin_out` are one record per buffer
+# (wire them with a `buffer_group`); the body pair carries body frames.
 #
-# Port order: admin_in first (inbound), then admin_out (slot-0
-# output → reply channel), then the downstream namespace pair.
-# `module_new` receives only the slot-0 in_chan / out_chan pair,
-# so the remaining channels are resolved by explicit
-# `dev_channel_port` lookup or by graph-side wiring overrides.
+# Port order is the lookup order: `module_new` receives the first
+# input and the first output; the rest are resolved by index.
 
 [[ports]]
 name = "admin_in"
 direction = "input"
 content_type = "OctetStream"
-
-[[ports]]
-name = "admin_out"
-direction = "output"
-content_type = "OctetStream"
-
-[[ports]]
-name = "ns_req"
-direction = "output"
-content_type = "OctetStream"
+buffer_size = 131072
 
 [[ports]]
 name = "ns_resp"
 direction = "input"
 content_type = "OctetStream"
+buffer_size = 16384
+
+[[ports]]
+name = "obj_resp"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+
+[[ports]]
+name = "body_resp"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 131072
+
+[[ports]]
+name = "admin_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 131072
+
+[[ports]]
+name = "ns_req"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+
+[[ports]]
+name = "obj_req"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+
+[[ports]]
+name = "body_req"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 131072
 
 [observability]
 exempt = "in-arena state counters (ops/errors/scrub tallies) readable by the host harness; typed MSG_METRIC_SAMPLE emission is not wired yet"
+
+# Capacity profiles (modules/common/mechanics/loam_limits.rs). A graph
+# picks one with `variant: <profile>`; the default is the bare-metal
+# budget a Pi 5 / CM5 affords.
+[[variant]]
+name = "embedded"
+features = ["embedded"]
+default = true
+
+[[variant]]
+name = "minimal"
+features = ["minimal"]
+
+[[variant]]
+name = "node"
+features = ["node"]
+
+[[variant]]
+name = "server"
+features = ["server"]

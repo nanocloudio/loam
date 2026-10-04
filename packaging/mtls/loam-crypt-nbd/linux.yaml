@@ -1,0 +1,81 @@
+# The loam-crypt-nbd template: an encrypted block device over a remote
+# Loam volume. Fluxor's
+# `crypt_block` encrypts on the node, and the node reaches Loam through
+# Fluxor's own `tls` module under the node's certificate — so Loam holds
+# only ciphertext.
+#
+#   nbd-client → nbd_serve → crypt_block → loam_volume
+#                                            ⇅ admin wire (net_proto)
+#                                         tls (client, node certificate)
+#                                            ⇅ ciphertext
+#                                         linux_net → a loam-admin node
+#
+# `loam_volume` dials the node itself and presents the capabilities in
+# `capability` — a grant on the volume's root and one on the body plane —
+# before anything else; the node binds the writer lease to this session's
+# identity. The volume must already exist (`loam volume create`) with
+# power-of-two extents of at most 32 KiB. Everything crypt_block writes
+# to it — superblocks, journal, unit metadata, data — is ciphertext;
+# Loam never sees a key or a plaintext byte.
+#
+# The node's certificate is checked against the host's trusted CAs
+# (`FLUXOR_CA_BUNDLE` names another bundle). Linux attaches the export
+# with `nbd-client <host> <port> /dev/nbd0` and puts its own filesystem
+# on it. `crypt_key` names the key in the node's key vault.
+
+target: linux
+
+tick_us: 100
+
+# loam_volume ⇄ tls ⇄ linux_net: request/answer cycles by construction.
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+
+modules:
+  - name: tls
+    mode: 0                       # client
+    peer_auth: ca_dns
+    trust: system
+    cert_file: "${param:cert}"
+    key_file: "${param:key}"
+  - name: loam_volume
+    variant: node
+    admin: "${param:admin}"
+    capability: "${param:capability}"
+    root: "${param:root}"
+    path: "${param:path}"
+    lease_ttl_ms: ${param:lease_ttl_ms}
+    block_size: 512
+  # The raw-device container (formats §2): superblocks, journal and unit
+  # metadata live in the volume's blocks as ciphertext.
+  - name: crypt_block
+    key: "${param:crypt_key}"
+    format: 1
+    block_size: 512
+    unit_size: 4096
+    journal_units: 64
+  - name: nbd_serve
+    port: ${param:port}
+
+wiring:
+  - from: linux_net.net_out
+    to: tls.cipher_in
+  - from: tls.cipher_out
+    to: linux_net.net_in
+  - from: tls.clear_out
+    to: loam_volume.admin_in
+  - from: loam_volume.admin_out
+    to: tls.clear_in
+
+  - from: linux_net.net_out
+    to: nbd_serve.net_in
+  - from: nbd_serve.net_out
+    to: linux_net.net_in
+
+  - from: loam_volume.blocks
+    to: crypt_block.lower
+  - from: crypt_block.blocks
+    to: nbd_serve.blocks

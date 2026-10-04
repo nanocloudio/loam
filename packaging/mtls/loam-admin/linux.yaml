@@ -1,0 +1,90 @@
+# The loam-admin template: one storage node, its admin plane behind
+# mutual TLS.
+#
+#   linux_net ⇄ tls (server, client cert required) ⇄ admin_gate
+#                                     peer_identity ┘     ⇅ admitted requests
+#                                                    admin_router
+#                                  ⇅                    ⇅                ⇅
+#                          namespace_router        object_index      body_store
+#                          (WAL + snapshots)          (WAL)          (directory)
+#
+# `admin_gate` holds each session's grants and admits a request only
+# under one; `admin_router` composes the admitted requests across the
+# namespace, the object index and the body plane.
+target: linux
+tick_us: 100
+
+# Every pair below is a bidirectional feedback pair.
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+
+modules:
+  - name: admin_tls
+    type: tls
+    mode: 1                       # server
+    verify_peer: 1
+    peer_auth: ca_dns
+    trust: "${file:${param:ca}}"
+    cert_file: "${param:cert}"
+    key_file: "${param:key}"
+
+  - name: admin_gate
+    variant: node
+    port: ${param:port}
+    mesh_roots: ${param:mesh_roots}
+
+  - name: admin_router
+    variant: node
+    gc_interval: ${param:gc_interval}
+
+  - name: namespace_router
+    variant: node
+    wal_path: "${param:ns_wal}"
+
+  - name: object_index
+    variant: node
+    wal_path: "${param:obj_wal}"
+
+  - name: body_store
+    variant: node
+    root_dir: "${param:body_dir}"
+
+wiring:
+  - from: linux_net.net_out
+    to: admin_tls.cipher_in
+  - from: admin_tls.cipher_out
+    to: linux_net.net_in
+  - from: admin_tls.clear_out
+    to: admin_gate.net_in
+  - from: admin_gate.net_out
+    to: admin_tls.clear_in
+  - from: admin_tls.peer_identity
+    to: admin_gate.peer_identity
+
+  # One request, and one answer, per buffer: the router and the gate
+  # each read a record whole. The object index likewise. The namespace
+  # and body edges are byte streams their readers reassemble.
+  - from: admin_gate.admin_req
+    to: admin_router.admin_in
+    buffer_group: 1
+  - from: admin_router.admin_out
+    to: admin_gate.admin_resp
+    buffer_group: 2
+
+  - from: admin_router.ns_req
+    to: namespace_router.requests
+  - from: namespace_router.responses
+    to: admin_router.ns_resp
+  - from: admin_router.obj_req
+    to: object_index.object_requests
+    buffer_group: 3
+  - from: object_index.object_responses
+    to: admin_router.obj_resp
+    buffer_group: 4
+  - from: admin_router.body_req
+    to: body_store.body_requests
+  - from: body_store.body_responses
+    to: admin_router.body_resp

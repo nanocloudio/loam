@@ -1,9 +1,9 @@
 # Loam Architecture
 
-Loam is fluxor-native. Every line of production storage logic runs
-in a fluxor PIC module under [`modules/`](../modules/); the host
-crate under [`src/`](../src/) is a vocabulary library that consumers
-(the loam CLI, the daemon, the fluxor build tool) all speak.
+Loam is fluxor-native. Every line of storage logic runs in a fluxor
+PIC module under [`modules/`](../modules/), composed into graphs that
+`fluxor run` runs; the operator's applet is a PIC module too, run by
+`fluxor exec`. Nothing on the shipping path is a host binary.
 
 ## Layout
 
@@ -12,56 +12,51 @@ loam/
 ├── modules/                  # fluxor PIC modules — all runtime logic
 │   ├── app/                  # one directory per module: mod.rs + manifest.toml
 │   │   ├── namespace_router/     # storage.namespace (BIND / RENAME / UNBIND / LOOKUP)
-│   │   ├── object_index/         # storage.object metadata (PUT / UPDATE / REMOVE / GET)
-│   │   ├── block_allocator/      # storage.block surface
+│   │   ├── object_provider/      # storage.object: objects as files, per-caller capabilities
+│   │   ├── object_index/         # object descriptors (PUT / UPDATE / REMOVE / GET)
+│   │   ├── block_allocator/      # block volume metadata
+│   │   ├── loam_volume/          # storage.block: one volume as a block device
 │   │   ├── raft_metadata_client/ # proposes through a replica group
 │   │   ├── clustor_bridge/       # decision records across the group's envelope
 │   │   ├── body_store/           # content-addressed body blobs
-│   │   ├── admin_router/         # front-door admin ops
+│   │   ├── admin_gate/           # the admin plane's sessions and authority
+│   │   ├── admin_router/         # the admin op surface
 │   │   ├── block_log/            # channel-fronted append-only log
 │   │   ├── placement_router/     # fleet table + FleetEpoch broadcast
 │   │   ├── body_fanout_router/   # replicated bodies: fan-out, fallback, read repair
 │   │   ├── ec_body_router/       # erasure-coded bodies: k+m shards, reconstructing GET
+│   │   ├── loam_cli/             # the operator applet (`fluxor exec loam`)
 │   │   ├── loam_load_gen/        # offers Propose records at a controlled rate
 │   │   ├── loam_throughput_counter/  # counts resolved records per window
 │   │   ├── metadata_e2e_probe/   # single-shot metadata round trip
 │   │   ├── body_e2e_probe/       # single-shot body round trip
-
 │   │   └── telemetry_agg/        # reserved name, stub body
 │   └── common/               # shared no_std source, split by storage tier
 │       ├── mechanics/        #   single-node fence classes; fluxor-only
 │       └── replicated/       #   quorum fence classes; may reach clustor
-├── src/                      # config vocabulary only — no runtime
-│   ├── lib.rs
-│   ├── core/                 # Config, Error
-│   ├── fluxor.rs             # FluxorTarget, FluxorGraphProfile
-│   └── storage/              # AchievableFence
-├── config/loam.toml          # the config `loam validate` / `loam plan` parse
-├── tools/loam-cli/           # host crate: the loam CLI + loam-server daemon
-├── tools/loam-client/        # host crate: client library for the admin surface
+├── packaging/                # service bundles and templates, the applet's bundle
+├── examples/                 # reference graphs
+├── tests/harness/            # the module harness: every unit test
+├── tools/                    # CI, graph and service gates; diagnostics
 ├── docs/
 └── target/fluxor/            # staged by `fluxor sync`: every declared
                               #   dependency's modules + source artefacts
 ```
 
-## Config vocabulary, not runtime
+## Graphs are the configuration
 
-`src/` holds the types `config/loam.toml` is written in, and
-nothing else. Anything that mutates state lives in a PIC:
+A deployment is a graph: which modules run, how their ports are
+wired, and the parameters each takes — WAL paths, a body root, a
+listening port, the mesh roots a gate trusts, a capacity profile
+(`variant:`). `fluxor build` validates a graph against the modules'
+manifests, so a misnamed port or parameter is refused before
+anything runs. A module's surface is what its `manifest.toml`
+declares and its fence is what its dispatch returns; nothing else
+restates either. A service bundle (`packaging/service/`) is a graph
+plus the modules it pins plus a declared parameter schema, run with
+`fluxor run <bundle> --param …`.
 
-- **Configuration + project errors** (`Config`, `Error`, `Result`)
-- **Target/profile enums** (`FluxorTarget`, `FluxorGraphProfile`)
-- **Declared fence intent** (`AchievableFence`)
-
-There is deliberately no module→surface table here. A module's
-surface is what its `manifest.toml` declares and its fence is what
-its dispatch returns, so a table in `src/` would be a second copy
-of both, free to drift from the thing it describes while still
-compiling. `loam surfaces --modules modules` reads the manifests
-instead.
-
-Fence + storage-handle types come from `fluxor-contracts` and are
-re-exported through the `prelude`.
+Fence + storage-handle types come from `fluxor-contracts`.
 
 ## PIC durability
 
@@ -107,9 +102,9 @@ single-shot cap (`PUT_FILE_OPEN` / `_CHUNK` / `_COMMIT` and
 `READ_FILE_RANGE`), `LOOKUP` (a path's object id, revision and kind
 without its body), the raw body ops (`PUT_BODY`, `GET_BODY`,
 `PUT_BODY_KEYED`, `DELETE_BODY`), and the volume ops (`LEASE`,
-`VOLUME`), preceded where required by `AUTH`. `loam-server` checks
-each request against the caller's grant before the router sees it
-([Transport security and authorisation](#transport-security-and-authorisation)).
+`VOLUME`). `admin_gate` admits each request under the capabilities
+its session presented before the router sees it
+([Sessions and authority](#sessions-and-authority)).
 The router demuxes each to the right downstream PIC, runs a 3-stage state machine for the composed
 `PUT_FILE`, and hosts the lifecycle sweep that reclaims orphaned body
 blobs and unbound object descriptors. The composed write's crash
@@ -152,87 +147,79 @@ flush whose writer's lease has expired by then — that writer's commit
 is refused anyway — so a crashed writer holds the GC off only until
 its lease lapses.
 
-For multi-client production deployments the `loam-server` binary in
-[`tools/loam-cli/`](../tools/loam-cli/) hosts the full graph and
-exposes it through three surfaces: the unix admin socket
-(`--socket`), an S3-compatible HTTP gateway (`--s3-listen` —
-PUT/GET/HEAD/DELETE per object, buckets are namespace roots), and
-the loam network contract. The contract
-([`modules/common/mechanics/loam_net_wire.rs`](../modules/common/mechanics/loam_net_wire.rs))
-is framed channel bridging over TCP — one channel message per frame,
-per-tag FIFO order preserved — so a channel pair can span machines
-and the PICs on either end can't tell. It carries the body plane:
-`--serve-body` turns a node into a body_store host, and a
-`tcp:ADDR` member in the admin node's `--fleet` list points the body
-channels at it.
+Loam's public surfaces are graphs around that core. The loam-s3
+service puts wave's `http` and `s3_serve` in front of
+`object_provider`, which answers fluxor's `storage.object` contract
+with objects named `bucket/key` as files under namespace root
+`bucket`: buckets are namespace roots and ETags are content digests.
+SigV4 is verified by `s3_serve`, which owns the S3 protocol, and each
+access key acts under the capability its credentials line carries.
+The loam-admin service exposes the admin wire itself over mutual
+TLS, for the operator's applet and for a volume's `loam_volume` on
+another node.
 
-On the gateway, a bucket is a namespace root and an ETag is the
-content digest. `--s3-credentials FILE` turns on AWS SigV4
-verification with per-access-key bucket scopes, which is what makes
-the bucket a tenancy boundary; without it the gateway is anonymous.
-Verification is loam's
-([`tools/loam-cli/src/sigv4.rs`](../tools/loam-cli/src/sigv4.rs));
-signing belongs to wave, which owns the S3 protocol.
+The body plane spans machines through fluxor's `remote_channel`. A
+body channel carries `[len:u32][cid:u32][record]` frames whether its
+peer is in the graph or not, so a `body_fanout_router` member port is
+wired either to a local `body_store` or to a `remote_channel` that
+dials a loam-body node through a client-mode `tls`; the node is a
+`body_store` behind a server `tls` and a listening `remote_channel`
+that takes only a session whose peer certificate verified. The
+correlation id is what lets the router put a deadline on each answer
+and drop one that arrives after it: a member across a network can
+lose the requests in flight when its session ends.
 
-## Transport security and authorisation
+## Sessions and authority
 
-Two ways in, one per kind of caller:
+mTLS authenticates a connection; a capability authorises what is
+done on it. `admin_gate` holds the admin plane's sessions: one per
+connection on the clear side of a server `tls` — bound to the peer
+certificate `tls` verified, by connection id and generation — and one
+per in-graph link (`[session:u32][frame]` records), for a module in
+the same graph such as `object_provider` or `loam_volume`.
 
-- **The unix socket** is the local operator's: full authority,
-  reachable only by the host's own users, and optionally gated by
-  `AUTH` with the `--admin-token` secret. `AUTH` is
-  connection-scoped: the boundary is who is on the far end of the
-  socket, established once rather than re-argued per op. The token is
-  the one field an unauthenticated peer can make the server hold,
-  which is why `MAX_TOKEN` is bounded low.
-- **`--admin-listen`** is TLS 1.3 only (rustls, ring provider, no TLS
-  1.2 compiled in), and REFUSED at startup without a server
-  certificate, a client CA and a grant table. A client must present a
-  certificate chaining to the CA; its URI SAN, else DNS SAN, else
-  CommonName is its identity. Resumption is off, so each connection
-  is judged on the certificate it presents.
+A session presents capability chains with `MSG_CAP_PRESENT` before
+its first request. Each is verified against the `mesh_roots` the gate
+is configured with and the trusted clock, and recorded against the
+session (at most `MAX_SESSION_GRANTS`); it dies with the session.
 
-**Every request is checked where it is framed: in `loam-server`, before
-it reaches `admin_router`.** The router is a PIC that sees channel
-frames and cannot know which certificate a request came under; the
-host terminates TLS, holds the identity for the connection's life,
-and already has to frame each request out of the byte stream
-(`loam_admin_wire::request_len`). The check decodes the opcode and
-the namespace root with the wire's own decoders and applies the grant
-table — identity → roots and classes (`read`, `write`, `lease`,
-`admin`). Default deny throughout: no grant, no access; an opcode the
-table does not name is refused and the connection closed. A refusal
-is `STATUS_FORBIDDEN`, distinct from `STATUS_NAK` because the remedy
-is a grant, not a retry, and it is encoded in the op's own ack shape
-so a client decodes it with the decoder it was already waiting on.
-The class of every op, and the file format, are in
-[running.md](running.md#remote-admin).
+**Every request is admitted where it is framed, in the gate, before
+it reaches `admin_router`.** The gate frames each request out of the
+session's byte stream (`loam_admin_wire::request_len`) and names what
+it touches with the wire's own decoders (`request_scope`): a key
+under a namespace root, the content-addressed body plane, or a
+stream. A key is admitted by a grant whose object is
+`grant::scope_object` of a `/`-terminated prefix of `root/path` —
+the storage contract's scope rule, so a grant minted with
+`--scope photos/` reaches the same keys here as through
+`storage.object` — and the body plane by a grant on its own object.
+Reads need `ReadState`, writes and leases `SendCommand`, the keyed
+body plane (`PUT_BODY_KEYED`, `DELETE_BODY`) `Admin`; a lease may not
+reach past the grant that admitted it. A refusal is
+`STATUS_FORBIDDEN`, distinct from `STATUS_NAK` because the remedy is
+a capability, not a retry, and it is encoded in the op's own ack
+shape so a client decodes it with the decoder it was already waiting
+on. A byte that names no request closes the session.
 
-Ops that name no root are judged by where their effect lands. A
-content-addressed `PUT_BODY` or `GET_BODY` needs its class on some
-root: a put cannot change bytes anyone else reads (one digest is one
-set of bytes), and what it stores stays an unreferenced orphan until
-a bind or a volume commit on a granted root names it. The keyed
-body plane (`PUT_BODY_KEYED`, `DELETE_BODY`) overwrites and deletes
-across every root and is `admin`. A streamed write's chunks and commit
-name only a stream id, so they are accepted only on the connection
-that opened the stream.
+Ops that name no key are judged by where their effect lands. A
+content-addressed `PUT_BODY` or `GET_BODY` cannot change bytes anyone
+else reads (one digest is one set of bytes), and what it stores stays
+an unreferenced orphan until a bind or a volume commit on a granted
+key names it. A streamed write's chunks and commit name only a
+stream id, so they are admitted only on the session that opened the
+stream.
 
-**Lease holders are bound to identity.** For a TLS caller the server
-rewrites the holder in every `LEASE` and `VOLUME` request to a hash of
-the identity and the holder the caller chose. An identity cannot
-acquire, renew, release or commit under another's holder, even by
+**Lease holders are bound to identity.** The gate rewrites the holder
+in every `LEASE` and `VOLUME` request to a hash of the session's
+identity and the holder the caller chose. A session cannot acquire,
+renew, release or commit under another identity's holder, even by
 sending its bytes, and one identity's writers still exclude each
-other. The local operator's holders pass through: it has authority
-over a stuck writer's lease.
+other.
 
-**Replies go only to the connection that asked.** The loop serves
-every open admin connection — a control plane holds one for its
-creates and deletes while each attached volume's node holds its own —
-and forwards each request under a server-assigned correlation id
-that names the connection, mapping the reply back to the client's.
-A reply that arrives after its connection closed is discarded, never
-delivered to another connection.
+**Replies go only to the session that asked.** The gate forwards each
+request under a correlation id it assigns and maps the reply back to
+the session's own; a reply that arrives after its session closed is
+discarded, never delivered to another.
 
 ## block_log: channel-fronted durability
 

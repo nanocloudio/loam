@@ -26,10 +26,6 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
-#[allow(
-    dead_code,
-    reason = "shared PIC body; each module shim drives a subset"
-)]
 #[path = "../../common/mechanics/loam_limits.rs"]
 mod limits;
 
@@ -39,10 +35,6 @@ mod hash;
 #[path = "../../common/mechanics/loam_decision_wire.rs"]
 mod wire;
 
-#[allow(
-    dead_code,
-    reason = "shared PIC body; each module shim drives a subset"
-)]
 #[path = "../../common/mechanics/fs_names.rs"]
 mod fs_names;
 
@@ -99,9 +91,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// The module ABI's constructor: `state_ptr` points to `state_size`
+/// zeroed bytes this module owns, `params` to `params_len` bytes, and
+/// `syscalls` to the runtime's table, all valid for the call.
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -133,7 +129,10 @@ pub extern "C" fn module_new(
         if rc != 0 {
             return rc;
         }
-        body::decode_wal_path_params(state_ptr, params, params_len);
+        let rc = body::decode_wal_path_params(state_ptr, params, params_len);
+        if rc != 0 {
+            return rc;
+        }
         // Decode mode from the same TLV blob if present.
         if !params.is_null() && params_len >= 4 {
             let is_tlv = *params == 0xFE && *params.add(1) == 0x01;
@@ -156,9 +155,12 @@ pub extern "C" fn module_new(
     }
 }
 
+/// # Safety
+/// The module ABI's step: the state pointer is the state `module_new`
+/// initialised, and the runtime steps it from one caller at a time.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
     let rc = unsafe { body::module_step_impl(state_ptr) };
     unsafe { heartbeat(state_ptr) };
     rc

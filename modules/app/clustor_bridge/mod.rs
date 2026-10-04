@@ -42,10 +42,6 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
 
-#[allow(
-    dead_code,
-    reason = "shared PIC body; each module shim drives a subset"
-)]
 #[path = "../../common/mechanics/loam_limits.rs"]
 mod limits;
 
@@ -67,8 +63,8 @@ mod proof;
 // reassembly) and the committed-entry payload decode, so the bridge holds no
 // copy of Clustor's wire vocabulary and cannot drift from it.
 #[allow(
-    dead_code,
-    reason = "shared consumer facade; the bridge drives a subset"
+    unexpected_cfgs,
+    reason = "clustor's facade source carries its host unit tests under cfg(test), which a PIC compile does not declare"
 )]
 #[path = "../../../target/fluxor/clustor-common/replica_facade.rs"]
 mod facade;
@@ -143,9 +139,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[no_mangle]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// The module ABI's constructor: `state_ptr` points to `state_size`
+/// zeroed bytes this module owns, `params` to `params_len` bytes, and
+/// `syscalls` to the runtime's table, all valid for the call.
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -186,9 +186,12 @@ pub extern "C" fn module_new(
     }
 }
 
+/// # Safety
+/// The module ABI's step: the state pointer is the state `module_new`
+/// initialised, and the runtime steps it from one caller at a time.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
@@ -278,8 +281,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // frame atomic against the reader splitting the stream.
                 match facade::frame(&mut s.buf, facade::MSG_CLIENT_PROPOSAL, rec) {
                     Ok(total) => {
-                        let framed =
-                            core::slice::from_raw_parts(s.buf.as_ptr(), total) as *const [u8];
+                        let framed = core::ptr::slice_from_raw_parts(s.buf.as_ptr(), total);
                         if s.out_owed.stage(&*framed) {
                             if s.out_owed.flush(sys.channel_write, s.clustor_out) {
                                 s.forwarded = s.forwarded.wrapping_add(1);

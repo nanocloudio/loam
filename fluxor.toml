@@ -9,17 +9,17 @@ version = "0.0.1"
 [dependencies]
 fluxor  = "0.0.1"
 clustor = "0.0.1"
-# wave owns the S3 protocol tier: the `s3` module plus the wave-common
-# source artefact (SigV4 signing, S3 wire records).
+# wave owns the HTTP and S3 protocol tier: the loam-s3 bundle runs its
+# `http` and `s3_serve` modules in front of loam's `storage.object`.
 wave    = "0.0.1"
 
 [ci]
 targets = ["bcm2712"]
 [ci.hygiene]
-# Tiers where inline tests are banned: PIC modules are no_std (test
-# code can't even compile there) and src/ keeps tests in tests/
+# Inline tests are banned in modules: PIC modules are no_std (test code
+# cannot compile there), and every unit test lives in tests/harness
 # (enforced by `fluxor lint hygiene`).
-forbid_inline_tests = ["modules", "src"]
+forbid_inline_tests = ["modules"]
 mode                = "strict"
 
 # Crate-root suppressions, per standards/lints.md §4. Each prefix names
@@ -38,61 +38,58 @@ attribute onto: it is a property of how a PIC module is built."""
 [[ci.hygiene.allow_crate_root]]
 prefix = "modules/common/"
 reason = """Shared step bodies and wire vocabularies, #[path]-mounted into several \
-PIC modules and into the host crates and tests. Each consumer uses a different \
+PIC modules and into the test harness. Each consumer uses a different \
 subset, so an item dead in one consumer is live in another. A per-item \
 #[expect] cannot express that — it errors in every consumer where the item is \
 used — and a per-item #[allow] on several hundred items would say less than one \
 statement of what these files are."""
 
 [[ci.hygiene.allow_crate_root]]
-prefix = "tests/common/"
+prefix = "tests/harness/tests/common/"
 reason = """The PIC harness, #[path]-mounted into every test crate. Each suite \
 drives the channels and syscalls it needs and none drives all of them — the \
 same multi-consumer cause as modules/common/, on the test side."""
 
 [ci.test]
-# Shadow-checkout hard-fail guard:
-# tests/ and examples/ are shadow-tracked in .git-shadow/, so a
-# checkout of the primary repo alone has zero files there — the cargo
-# test phases would pass vacuously and the e2e would have no graph to
-# boot. The guard fails CI instead.
+# Module harness tests (tests/harness) are not listed: `fluxor ci` runs
+# them in its own module-tests phase, under the default profile.
 #
-# `s3_driven.sh` is the connector's behavioural gate: it stands up loam's own
-# `--s3-listen` gateway and drives PUT/GET/HEAD/DELETE through the s3_client
-# graph, chosen at runtime and signed per request, then reads the object back
-# with curl INDEPENDENTLY of the connector. The host vectors in
-# `tests/s3_wire_core.rs` pin the framing and the signature; this pins that a
-# real endpoint accepts them.
-# `tier_guard.sh` enforces the storage tier boundary: mechanics vs
-# replicated rosters, no upward common/ reach, no clustor from the
-# mechanics tier.
+# Structural gates — what the tree must be:
+# `shadow_guard.sh` fails CI when the shadow-tracked tests/ and examples/
+# are not materialised, so the harness and the graph gates cannot pass
+# vacuously. `shipping_surface.sh` asserts the shipping surface carries
+# no cargo dependency. `tier_guard.sh` enforces the storage tier
+# boundary (mechanics vs replicated rosters, no upward reach, no clustor
+# from mechanics). `limit_guard.sh` checks the limit register against the
+# capacity profiles. `profile_matrix.sh` runs the harness under the
+# minimal, embedded and server profiles.
+#
+# Graph gates — the built modules, run by the fluxor-linux runtime:
 # `metadata_load.sh` drives the replicated metadata plane under offered
-# load and gates on conservation — every record the plane accepts is
-# either committed or refused, never dropped. Host tests cover the
-# splitting logic; only a real graph under load covers the seams
-# between the modules that carry it.
-# `composed_node.sh` puts a public surface on that plane in one graph and
-# gates both conservation claims at once: every proposal resolved, and
-# every request answered. It also runs a module the way a module is
-# actually run — loaded, at an address it was not linked for — which is
-# the one thing no host test can do.
-# `body_publication.sh` gates the fence the body store negotiates from a
-# live filesystem provider, and that the artefact lands under it with no
-# staging file beside it. Host tests present synthetic capability
-# bitmaps; only a real graph shows the bitmap a real provider returns.
+# load and gates on conservation: every record accepted is committed or
+# refused, never dropped. `composed_node.sh` puts a public surface on
+# that plane in one graph and gates every proposal resolved and every
+# request answered. `body_publication.sh` gates the fence the body store
+# negotiates from a live filesystem provider.
+#
+# Service gates — loam's bundles run as an operator runs them and driven
+# from outside: `s3_service.sh` (the loam-s3 bundle under curl and wave's
+# S3 traffic driver, and restart durability), `admin_tls.sh` (the admin
+# plane over mutual TLS, driven by the `loam` applet), `nbd.sh` (a volume
+# as an NBD device: durability across kill -9, the writer lease) and
+# `fleet.sh` (bodies on two nodes over remote_channel, one node lost and
+# regained).
 scripts = [
   "tools/ci/shadow_guard.sh",
+  "tools/ci/shipping_surface.sh",
   "tools/ci/tier_guard.sh",
   "tools/ci/limit_guard.sh",
   "tools/ci/profile_matrix.sh",
-  "tools/e2e/s3_driven.sh",
   "tools/e2e/metadata_load.sh",
   "tools/e2e/composed_node.sh",
   "tools/e2e/body_publication.sh",
+  "tools/e2e/s3_service.sh",
+  "tools/e2e/admin_tls.sh",
+  "tools/e2e/nbd.sh",
+  "tools/e2e/fleet.sh",
 ]
-
-[ci.cargo]
-# Loam is a plain host workspace (no embedded-only root features):
-# the cargo-test phase runs at the project root and covers every
-# workspace member via default-members.
-host_tools_crate = "."

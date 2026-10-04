@@ -244,6 +244,10 @@ fn weight(key: &[u8; DIGEST_LEN], member: u8) -> u64 {
 ///
 /// `n == 0` returns 0. `fleet.count == 0` returns 0. Otherwise the
 /// result count is `min(n, fleet.count)`.
+#[allow(
+    clippy::needless_range_loop,
+    reason = "indexed loops keep the PIC build panic-free: iterator adapters and slice ranges pull core::panicking paths the bare-metal SDK does not carry"
+)]
 pub fn pick_targets(key: &[u8; DIGEST_LEN], n: u8, fleet: &Fleet, out: &mut [u8]) -> usize {
     let take = (n as usize).min(fleet.count as usize).min(out.len());
     if take == 0 {

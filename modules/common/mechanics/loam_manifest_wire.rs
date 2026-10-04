@@ -23,10 +23,12 @@
 // ## Layout
 //
 //   header  [magic u32 "LMAN"][count u32][root_len u16][root]
-//   record  [digest 32][key_len u16][kind u8][key]      × count
+//   record  [digest 32][key_len u16][kind u8][size u64][ctype_len u8]
+//           [key][ctype]                                   × count
 //
-// `kind` is the binding's namespace kind, so a restore binds each entry
-// as what it was. It matters for a volume: its entry is the digest of
+// A record carries what its binding records — kind, size, content type —
+// so a restore binds each entry as what it was, and a clone reads back
+// exactly as its source did. `kind` matters most. It matters for a volume: its entry is the digest of
 // its map root, and the orphan GC walks the maps of VOLUME bindings
 // only — a volume restored as a plain file would have its extents
 // collected.
@@ -49,8 +51,8 @@ pub const DIGEST_LEN: usize = 32;
 /// Fixed part of the header, before the root bytes.
 pub const HEADER: usize = 4 + 4 + 2;
 
-/// Fixed part of a record, before the key bytes.
-pub const REC_HEADER: usize = DIGEST_LEN + 2 + 1;
+/// Fixed part of a record, before the key and content-type bytes.
+pub const REC_HEADER: usize = DIGEST_LEN + 2 + 1 + 8 + 1;
 
 /// A plain file's kind (`loam_wire::KIND_FILE`). Restated so this
 /// wire stays includable on its own.
@@ -93,9 +95,16 @@ pub enum ManifestError {
     BadKind { observed: u8 },
 }
 
-/// One manifest record: a key, the digest it was bound to, and the
-/// binding's namespace kind.
-pub type Entry<'a> = (&'a [u8], [u8; DIGEST_LEN], u8);
+/// One manifest record: a key, the digest it was bound to, and what the
+/// binding records — its namespace kind, size and content type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Entry<'a> {
+    pub key: &'a [u8],
+    pub digest: [u8; DIGEST_LEN],
+    pub kind: u8,
+    pub size: u64,
+    pub content_type: &'a [u8],
+}
 
 /// Exact encoded size for `root` and `entries`. A caller allocates
 /// this and passes it to `encode`; the two are kept in step by
@@ -103,8 +112,8 @@ pub type Entry<'a> = (&'a [u8], [u8; DIGEST_LEN], u8);
 /// same records the same way.
 pub fn encoded_len(root: &[u8], entries: &[Entry<'_>]) -> usize {
     let mut n = HEADER + root.len();
-    for (key, _, _) in entries {
-        n += REC_HEADER + key.len();
+    for e in entries {
+        n += REC_HEADER + e.key.len() + e.content_type.len();
     }
     n
 }
@@ -116,28 +125,14 @@ pub fn encoded_len(root: &[u8], entries: &[Entry<'_>]) -> usize {
 /// on a sort, and imposing one would only invite a reader to rely on
 /// it.
 pub fn encode(out: &mut [u8], root: &[u8], entries: &[Entry<'_>]) -> Result<usize, ManifestError> {
-    if root.len() > super::limits::MAX_ROOT {
-        return Err(ManifestError::TooLong {
-            len: root.len(),
-            max: super::limits::MAX_ROOT,
-        });
-    }
     if entries.len() > MAX_ENTRIES as usize {
         return Err(ManifestError::TooManyEntries {
             count: entries.len(),
             max: MAX_ENTRIES,
         });
     }
-    for &(key, _, kind) in entries {
-        if key.len() > super::limits::MAX_PATH {
-            return Err(ManifestError::TooLong {
-                len: key.len(),
-                max: super::limits::MAX_PATH,
-            });
-        }
-        if kind > LAST_KIND {
-            return Err(ManifestError::BadKind { observed: kind });
-        }
+    for e in entries {
+        check_record(e)?;
     }
     let needed = encoded_len(root, entries);
     if out.len() < needed {
@@ -146,25 +141,153 @@ pub fn encode(out: &mut [u8], root: &[u8], entries: &[Entry<'_>]) -> Result<usiz
             actual: out.len(),
         });
     }
-
-    out[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-    out[4..8].copy_from_slice(&(entries.len() as u32).to_le_bytes());
-    out[8..10].copy_from_slice(&(root.len() as u16).to_le_bytes());
-    let mut o = HEADER;
-    out[o..o + root.len()].copy_from_slice(root);
-    o += root.len();
-
-    for &(key, digest, kind) in entries {
-        out[o..o + DIGEST_LEN].copy_from_slice(&digest);
-        o += DIGEST_LEN;
-        out[o..o + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-        o += 2;
-        out[o] = kind;
-        o += 1;
-        out[o..o + key.len()].copy_from_slice(key);
-        o += key.len();
+    let mut o = encode_header(out, root, entries.len() as u32)?;
+    for e in entries {
+        o += encode_record(&mut out[o..], e)?;
     }
     Ok(o)
+}
+
+/// The largest record: the longest key and content type.
+pub const RECORD_MAX: usize =
+    REC_HEADER + super::limits::MAX_PATH + super::limits::CONTENT_TYPE_MAX;
+
+/// The largest header: the longest root.
+pub const HEADER_MAX: usize = HEADER + super::limits::MAX_ROOT;
+
+fn check_record(e: &Entry<'_>) -> Result<(), ManifestError> {
+    if e.key.len() > super::limits::MAX_PATH {
+        return Err(ManifestError::TooLong {
+            len: e.key.len(),
+            max: super::limits::MAX_PATH,
+        });
+    }
+    if e.content_type.len() > super::limits::CONTENT_TYPE_MAX {
+        return Err(ManifestError::TooLong {
+            len: e.content_type.len(),
+            max: super::limits::CONTENT_TYPE_MAX,
+        });
+    }
+    if e.kind > LAST_KIND {
+        return Err(ManifestError::BadKind { observed: e.kind });
+    }
+    Ok(())
+}
+
+/// Write a manifest's header declaring `count` records. A writer that
+/// learns the count only as it goes writes the header first and this
+/// again over it at the end; the header's length does not depend on
+/// the count.
+pub fn encode_header(out: &mut [u8], root: &[u8], count: u32) -> Result<usize, ManifestError> {
+    if root.len() > super::limits::MAX_ROOT {
+        return Err(ManifestError::TooLong {
+            len: root.len(),
+            max: super::limits::MAX_ROOT,
+        });
+    }
+    let needed = HEADER + root.len();
+    if out.len() < needed {
+        return Err(ManifestError::BufferTooSmall {
+            needed,
+            actual: out.len(),
+        });
+    }
+    out[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+    out[4..8].copy_from_slice(&count.to_le_bytes());
+    out[8..10].copy_from_slice(&(root.len() as u16).to_le_bytes());
+    let mut i = 0;
+    while i < root.len() {
+        out[HEADER + i] = root[i];
+        i += 1;
+    }
+    Ok(needed)
+}
+
+/// Write one record; its length.
+pub fn encode_record(out: &mut [u8], e: &Entry<'_>) -> Result<usize, ManifestError> {
+    check_record(e)?;
+    let needed = REC_HEADER + e.key.len() + e.content_type.len();
+    if out.len() < needed {
+        return Err(ManifestError::BufferTooSmall {
+            needed,
+            actual: out.len(),
+        });
+    }
+    out[..DIGEST_LEN].copy_from_slice(&e.digest);
+    let mut o = DIGEST_LEN;
+    out[o..o + 2].copy_from_slice(&(e.key.len() as u16).to_le_bytes());
+    out[o + 2] = e.kind;
+    out[o + 3..o + 11].copy_from_slice(&e.size.to_le_bytes());
+    out[o + 11] = e.content_type.len() as u8;
+    o = REC_HEADER;
+    for part in [e.key, e.content_type] {
+        let mut i = 0;
+        while i < part.len() {
+            out[o + i] = part[i];
+            i += 1;
+        }
+        o += part.len();
+    }
+    Ok(needed)
+}
+
+/// A manifest header: its root, declared count and length.
+pub type Header<'a> = (&'a [u8], u32, usize);
+
+/// The header at the front of `src`: its root, declared count and
+/// length. `Ok(None)` until the whole header has arrived, for a reader
+/// filling a buffer as it goes.
+pub fn read_header(src: &[u8]) -> Result<Option<Header<'_>>, ManifestError> {
+    match split_header(src) {
+        Ok(h) => Ok(Some(h)),
+        Err(ManifestError::Truncated) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The record at the front of `src` and its length. `Ok(None)` until the
+/// whole record has arrived.
+pub fn read_record(src: &[u8]) -> Result<Option<(Entry<'_>, usize)>, ManifestError> {
+    if src.len() < REC_HEADER {
+        return Ok(None);
+    }
+    let mut digest = [0u8; DIGEST_LEN];
+    digest.copy_from_slice(&src[..DIGEST_LEN]);
+    let o = DIGEST_LEN;
+    let key_len = u16::from_le_bytes([src[o], src[o + 1]]) as usize;
+    let kind = src[o + 2];
+    let mut size = [0u8; 8];
+    size.copy_from_slice(&src[o + 3..o + 11]);
+    let ct_len = src[o + 11] as usize;
+    if key_len > super::limits::MAX_PATH {
+        return Err(ManifestError::TooLong {
+            len: key_len,
+            max: super::limits::MAX_PATH,
+        });
+    }
+    if ct_len > super::limits::CONTENT_TYPE_MAX {
+        return Err(ManifestError::TooLong {
+            len: ct_len,
+            max: super::limits::CONTENT_TYPE_MAX,
+        });
+    }
+    if kind > LAST_KIND {
+        return Err(ManifestError::BadKind { observed: kind });
+    }
+    let n = REC_HEADER + key_len + ct_len;
+    if src.len() < n {
+        return Ok(None);
+    }
+    Ok(Some((
+        Entry {
+            key: &src[REC_HEADER..REC_HEADER + key_len],
+            digest,
+            kind,
+            size: u64::from_le_bytes(size),
+            content_type: &src[REC_HEADER + key_len..n],
+        },
+        n,
+    )))
 }
 
 /// The root a manifest was taken under, and how many entries it
@@ -207,7 +330,7 @@ fn split_header(manifest: &[u8]) -> Result<(&[u8], u32, usize), ManifestError> {
     ))
 }
 
-/// Visit every `(key, digest, kind)` in order.
+/// Visit every entry in order.
 ///
 /// The whole manifest is validated as it is walked: a record that
 /// runs past the end, or a declared count the bytes do not support,
@@ -215,36 +338,16 @@ fn split_header(manifest: &[u8]) -> Result<(&[u8], u32, usize), ManifestError> {
 /// snapshot must be able to tell "this snapshot has three entries"
 /// from "this snapshot had more and I could only read three" — the
 /// second silently restores an incomplete volume.
-pub fn for_each(
-    manifest: &[u8],
-    mut f: impl FnMut(&[u8], &[u8; DIGEST_LEN], u8),
-) -> Result<usize, ManifestError> {
+pub fn for_each(manifest: &[u8], mut f: impl FnMut(&Entry<'_>)) -> Result<usize, ManifestError> {
     let (_, count, mut o) = split_header(manifest)?;
     for _ in 0..count {
-        if o + REC_HEADER > manifest.len() {
-            return Err(ManifestError::Truncated);
+        match read_record(&manifest[o..])? {
+            Some((e, n)) => {
+                f(&e);
+                o += n;
+            }
+            None => return Err(ManifestError::Truncated),
         }
-        let mut digest = [0u8; DIGEST_LEN];
-        digest.copy_from_slice(&manifest[o..o + DIGEST_LEN]);
-        o += DIGEST_LEN;
-        let key_len = u16::from_le_bytes([manifest[o], manifest[o + 1]]) as usize;
-        o += 2;
-        let kind = manifest[o];
-        o += 1;
-        if key_len > super::limits::MAX_PATH {
-            return Err(ManifestError::TooLong {
-                len: key_len,
-                max: super::limits::MAX_PATH,
-            });
-        }
-        if kind > LAST_KIND {
-            return Err(ManifestError::BadKind { observed: kind });
-        }
-        if o + key_len > manifest.len() {
-            return Err(ManifestError::Truncated);
-        }
-        f(&manifest[o..o + key_len], &digest, kind);
-        o += key_len;
     }
     Ok(count as usize)
 }

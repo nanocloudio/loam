@@ -56,10 +56,6 @@ mod limits;
 #[path = "../../common/mechanics/loam_wire.rs"]
 mod wire;
 
-#[allow(
-    dead_code,
-    reason = "shared PIC body; each module shim drives a subset"
-)]
 #[path = "../../common/mechanics/loam_decision_wire.rs"]
 mod decision;
 
@@ -138,9 +134,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// The module ABI's constructor: `state_ptr` points to `state_size`
+/// zeroed bytes this module owns, `params` to `params_len` bytes, and
+/// `syscalls` to the runtime's table, all valid for the call.
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     _in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -224,9 +224,12 @@ fn write_hex(dst: &mut [u8], end: usize, width: usize, value: u32) {
     }
 }
 
+/// # Safety
+/// The module ABI's step: the state pointer is the state `module_new`
+/// initialised, and the runtime steps it from one caller at a time.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
     unsafe {
         if state_ptr.is_null() {
             return -1;
@@ -274,7 +277,7 @@ pub extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
             let mut oid_bytes = *b"o000000";
             write_hex(&mut oid_bytes, 7, 6, s.seq);
 
-            let mut inner = [0u8; 64];
+            let mut inner = [0u8; 160];
             let inner_len = match wire::encode_bind(
                 &mut inner,
                 NAMESPACE_ROOT,
@@ -282,6 +285,9 @@ pub extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
                 &oid_bytes,
                 0,
                 s.seq as u64 + 1,
+                &wire::BindMeta::NONE,
+                wire::COND_ANY,
+                0,
             ) {
                 Ok(n) => n,
                 Err(_) => break,

@@ -3,9 +3,10 @@
     dead_code,
     reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
 )]
-// Runtime e2e probe: PUT → GET → verify against the body_store PIC.
-// Step 1 sends the PUT; subsequent steps read the response channel,
-// then send the GET, then verify the returned bytes byte-for-byte.
+// Runtime e2e probe: PUT → GET → verify against the body plane.
+// Step 1 sends the PUT; later steps read the answer, send the GET,
+// and verify the returned bytes byte-for-byte. Requests and answers
+// are body frames, and each answer must carry its request's cid.
 
 use core::ffi::c_void;
 
@@ -20,14 +21,15 @@ use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 
-#[allow(
-    dead_code,
-    reason = "shared PIC body; each module shim drives a subset"
-)]
 #[path = "../../common/mechanics/loam_body_wire.rs"]
-mod wire;
+mod body_wire;
+
+#[path = "../../common/mechanics/body_frame.rs"]
+mod body_frame;
 
 const BODY: &[u8] = b"loam disk-backed body e2e";
+const PUT_CID: u32 = 1;
+const GET_CID: u32 = 2;
 
 #[repr(C)]
 pub struct ModuleState {
@@ -35,8 +37,15 @@ pub struct ModuleState {
     resp_in: i32,
     req_out: i32,
     phase: u8, // 0 = send PUT, 1 = await digest, 2 = await body, 3 = done
-    digest: [u8; wire::DIGEST_LEN],
-    buf: [u8; 4096],
+    digest: [u8; body_wire::DIGEST_LEN],
+    tx: body_frame::Sender,
+    tx_buf: [u8; 128],
+    rx: body_frame::Inbox<256>,
+}
+
+unsafe fn fail(sys: &SyscallTable, s: &mut ModuleState, why: &[u8]) {
+    dev_log(sys, 3, why.as_ptr(), why.len());
+    s.phase = 3;
 }
 
 #[no_mangle]
@@ -48,9 +57,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[no_mangle]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// The module ABI's constructor: `state_ptr` points to `state_size`
+/// zeroed bytes this module owns, `params` to `params_len` bytes, and
+/// `syscalls` to the runtime's table, all valid for the call.
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -67,6 +80,7 @@ pub extern "C" fn module_new(
         if state_size < core::mem::size_of::<ModuleState>() {
             return -2;
         }
+        core::ptr::write_bytes(state, 0u8, state_size);
         let s = &mut *(state as *mut ModuleState);
         s.syscalls = syscalls as *const SyscallTable;
         s.resp_in = in_chan;
@@ -76,64 +90,65 @@ pub extern "C" fn module_new(
     }
 }
 
+/// # Safety
+/// The module ABI's step: the state pointer is the state `module_new`
+/// initialised, and the runtime steps it from one caller at a time.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
+        if !s.tx.flush(sys, s.req_out, &s.tx_buf) {
+            return 0;
+        }
         match s.phase {
             0 => {
-                let n = match wire::encode_put_req(&mut s.buf, BODY) {
-                    Ok(n) => n,
-                    Err(_) => {
-                        dev_log(sys, 3, b"[body_e2e] FAIL encode".as_ptr(), 22);
-                        s.phase = 3;
-                        return 0;
-                    }
+                let Ok(n) = body_wire::encode_put_req(&mut s.tx_buf, BODY) else {
+                    fail(sys, s, b"[body_e2e] FAIL encode");
+                    return 0;
                 };
-                (sys.channel_write)(s.req_out, s.buf.as_ptr(), n);
+                s.tx.stage(PUT_CID, n);
+                s.tx.flush(sys, s.req_out, &s.tx_buf);
                 s.phase = 1;
             }
-            1 => {
-                let n = (sys.channel_read)(s.resp_in, s.buf.as_mut_ptr(), s.buf.len());
-                if n <= 0 {
+            1 | 2 => {
+                if s.rx.pull(sys, s.resp_in) != body_frame::Pull::Record {
                     return 0;
                 }
-                match wire::decode_put_resp(&s.buf[..n as usize]) {
-                    Ok(d) => {
-                        s.digest.copy_from_slice(d);
-                        let m = match wire::encode_get_req(&mut s.buf, &s.digest) {
-                            Ok(m) => m,
-                            Err(_) => {
-                                dev_log(sys, 3, b"[body_e2e] FAIL get-enc".as_ptr(), 23);
-                                s.phase = 3;
-                                return 0;
-                            }
-                        };
-                        (sys.channel_write)(s.req_out, s.buf.as_ptr(), m);
-                        s.phase = 2;
-                    }
-                    Err(_) => {
-                        dev_log(sys, 3, b"[body_e2e] FAIL put-resp".as_ptr(), 24);
-                        s.phase = 3;
-                    }
-                }
-            }
-            2 => {
-                let n = (sys.channel_read)(s.resp_in, s.buf.as_mut_ptr(), s.buf.len());
-                if n <= 0 {
+                let want = if s.phase == 1 { PUT_CID } else { GET_CID };
+                if s.rx.cid() != want {
+                    fail(sys, s, b"[body_e2e] FAIL cid");
                     return 0;
                 }
-                match wire::decode_get_resp(&s.buf[..n as usize]) {
-                    Ok(body) if body == BODY => {
-                        dev_log(sys, 3, b"[body_e2e] PASS".as_ptr(), 15);
+                if s.phase == 1 {
+                    match body_wire::decode_put_resp(s.rx.record()) {
+                        Ok(d) => s.digest.copy_from_slice(d),
+                        Err(_) => {
+                            fail(sys, s, b"[body_e2e] FAIL put-resp");
+                            return 0;
+                        }
                     }
-                    _ => {
-                        dev_log(sys, 3, b"[body_e2e] FAIL body".as_ptr(), 20);
+                    s.rx.take();
+                    let Ok(m) = body_wire::encode_get_req(&mut s.tx_buf, &s.digest) else {
+                        fail(sys, s, b"[body_e2e] FAIL get-enc");
+                        return 0;
+                    };
+                    s.tx.stage(GET_CID, m);
+                    s.tx.flush(sys, s.req_out, &s.tx_buf);
+                    s.phase = 2;
+                } else {
+                    match body_wire::decode_get_resp(s.rx.record()) {
+                        Ok(body) if body == BODY => {
+                            dev_log(sys, 3, b"[body_e2e] PASS".as_ptr(), 15);
+                        }
+                        _ => {
+                            dev_log(sys, 3, b"[body_e2e] FAIL body".as_ptr(), 20);
+                        }
                     }
+                    s.rx.take();
+                    s.phase = 3;
                 }
-                s.phase = 3;
             }
             _ => {}
         }

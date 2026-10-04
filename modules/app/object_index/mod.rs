@@ -21,10 +21,6 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
-#[allow(
-    dead_code,
-    reason = "shared PIC body; each module shim drives a subset"
-)]
 #[path = "../../common/mechanics/loam_hash.rs"]
 mod hash;
 
@@ -40,17 +36,9 @@ mod fs_names;
 #[path = "../../common/mechanics/loam_object_wire.rs"]
 mod wire;
 
-#[allow(
-    dead_code,
-    reason = "shared PIC body; each module shim drives a subset"
-)]
 #[path = "../../common/mechanics/object_pic_state.rs"]
 mod state;
 
-#[allow(
-    dead_code,
-    reason = "shared PIC body; each module shim drives a subset"
-)]
 #[path = "../../common/mechanics/wal_io.rs"]
 mod wal;
 
@@ -90,9 +78,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// The module ABI's constructor: `state_ptr` points to `state_size`
+/// zeroed bytes this module owns, `params` to `params_len` bytes, and
+/// `syscalls` to the runtime's table, all valid for the call.
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -108,14 +100,20 @@ pub extern "C" fn module_new(
         if rc != 0 {
             return rc;
         }
-        body::decode_wal_path_params(state_ptr, params, params_len);
+        let rc = body::decode_wal_path_params(state_ptr, params, params_len);
+        if rc != 0 {
+            return rc;
+        }
         body::open_wal_from_state(state_ptr)
     }
 }
 
+/// # Safety
+/// The module ABI's step: the state pointer is the state `module_new`
+/// initialised, and the runtime steps it from one caller at a time.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
     unsafe { body::module_step_impl(state_ptr) }
 }
 

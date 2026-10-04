@@ -76,9 +76,9 @@ where it is stated.
   lists, and reverse lookups. Two tenants may legitimately hold the
   same path string bound to different objects; the path is qualified
   by its namespace root, so collisions across tenants are
-  impossible. On the S3 gateway the bucket is the namespace root,
-  which is what makes a SigV4 credential's per-bucket scope a
-  tenancy boundary.
+  impossible. Through `storage.object` the bucket is the namespace
+  root, which is what makes a capability's scope — and an S3
+  credential's, which acts under one — a tenancy boundary.
 
 ## Storage Surfaces
 

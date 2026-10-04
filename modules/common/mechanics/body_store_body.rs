@@ -19,8 +19,7 @@
 // content path, read to EOF, digest-verified, and the slot is
 // rehydrated. Content addressing makes the verification exact.
 
-const READ_BUF: usize = super::wire::MAX_BODY + 64;
-const SCRATCH_OUT: usize = super::wire::MAX_BODY + 64;
+const SCRATCH_OUT: usize = super::wire::RECORD_MAX;
 
 // Capacity profile — see namespace_pic_body.rs.
 pub use super::limits::BODY_SLOTS;
@@ -104,19 +103,20 @@ pub struct ModuleState {
     pub out_chan: i32,
     pub root_dir: [u8; ROOT_DIR_BUF],
     pub root_dir_len: u16,
+    /// The request being assembled from `body_requests`, framed
+    /// (`body_frame.rs`).
+    pub inbox: super::body_frame::Inbox<{ super::body_frame::RECORD_MAX }>,
+    /// The correlation id of the request being answered; its response
+    /// echoes it.
+    pub cid: u32,
     pub scratch: [u8; SCRATCH_OUT],
-    /// The response owed on `body_responses`, held in `scratch`.
-    /// `resp_len` is its length and `resp_sent` how much the channel
-    /// has taken; both zero means nothing is owed.
+    /// The response owed on `body_responses`: its frame header here,
+    /// its record in `scratch`.
     ///
-    /// This tracks the existing buffer rather than mounting
-    /// `reply_out.rs` as the arena PICs do: a body response is up to
-    /// `SCRATCH_OUT`, so a second copy would double the largest
-    /// allocation in this module for no gain. The discipline is the
-    /// same — an answer refused by the channel is retained, and no new
-    /// request is read while one is owed.
-    pub resp_len: u32,
-    pub resp_sent: u32,
+    /// An answer refused by the channel is retained, and no new
+    /// request is read while one is owed, because the next response
+    /// would overwrite `scratch`.
+    pub out: super::body_frame::Sender,
     pub slots: [DiskSlot; BODY_SLOTS],
     pub wsessions: [WriteSession; WRITE_SESSIONS],
     /// Provider capability bitmap, queried once. `caps_known` is what
@@ -188,27 +188,42 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         None => return -1,
     };
 
-    // An owed response owns the step until the channel takes it. It
-    // lives in `scratch`, which the next request would overwrite.
+    // An owed response owns the step until the channel takes it. Its
+    // record lives in `scratch`, which the next request would
+    // overwrite.
     if !flush_resp(s) {
         return 0;
     }
 
     let mut handled: u32 = 0;
     while handled < super::limits::OPS_PER_STEP {
-        if s.resp_len != 0 {
+        if !s.out.is_idle() {
             break;
         }
-        let mut buf = [0u8; READ_BUF];
-        let n = (syscalls.channel_read)(s.in_chan, buf.as_mut_ptr(), READ_BUF);
-        if n <= 0 {
-            break;
+        match s.inbox.pull(syscalls, s.in_chan) {
+            super::body_frame::Pull::Record => {}
+            super::body_frame::Pull::Empty => break,
+            super::body_frame::Pull::Oversize(cid) => {
+                s.cid = cid;
+                nak(s, super::wire::ERR_TOO_LARGE);
+                handled = handled.wrapping_add(1);
+                continue;
+            }
+            super::body_frame::Pull::Malformed => {
+                s.apply_errors = s.apply_errors.wrapping_add(1);
+                break;
+            }
         }
-        let bytes = &buf[..n as usize];
+        s.cid = s.inbox.cid();
+        // The record is borrowed from the inbox while the handlers
+        // mutate the rest of the state; the inbox is not touched
+        // until `take` below.
+        let bytes: &[u8] = &*(s.inbox.record() as *const [u8]);
         let op = match super::wire::peek_opcode(bytes) {
             Some(op) => op,
             None => {
                 nak(s, super::wire::ERR_BAD_REQ);
+                s.inbox.take();
                 handled = handled.wrapping_add(1);
                 continue;
             }
@@ -227,6 +242,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
             super::wire::OP_RANGE => handle_range(s, bytes),
             _ => nak(s, super::wire::ERR_BAD_REQ),
         }
+        s.inbox.take();
         handled = handled.wrapping_add(1);
     }
     reap_stale_sessions(s);
@@ -403,10 +419,14 @@ unsafe fn write_and_fence(
     if fd < 0 {
         return false;
     }
-    let wrote = (sys.provider_call)(fd, FS_WRITE, bytes.as_ptr() as *mut u8, bytes.len());
-    if wrote < 0 || (wrote as usize) != bytes.len() {
-        let _ = (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        return false;
+    // An empty body is a file with nothing in it: there is nothing to
+    // write, and the fs surface refuses a zero-length write.
+    if !bytes.is_empty() {
+        let wrote = (sys.provider_call)(fd, FS_WRITE, bytes.as_ptr() as *mut u8, bytes.len());
+        if wrote < 0 || (wrote as usize) != bytes.len() {
+            let _ = (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            return false;
+        }
     }
     let fenced = (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0) >= 0;
     let _ = (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
@@ -1497,42 +1517,25 @@ unsafe fn write_resp(s: &mut ModuleState, n: usize) {
         s.apply_errors = s.apply_errors.wrapping_add(1);
         return;
     }
-    s.resp_len = n as u32;
-    s.resp_sent = 0;
+    s.out.stage(s.cid, n);
     let _ = flush_resp(s);
 }
 
 /// Offer the owed response. True once every byte has been accepted,
 /// and when nothing is owed, so a caller can gate on it directly.
 unsafe fn flush_resp(s: &mut ModuleState) -> bool {
-    if s.resp_len == 0 {
-        return true;
-    }
     let sys = match s.syscalls.as_ref() {
         Some(t) => t,
         None => return false,
     };
-    if s.out_chan < 0 {
-        return false;
-    }
-    let at = s.resp_sent as usize;
-    let rc = (sys.channel_write)(
-        s.out_chan,
-        s.scratch.as_ptr().add(at),
-        s.resp_len as usize - at,
-    );
-    if rc <= 0 {
-        return false;
-    }
-    s.resp_sent = (s.resp_sent + rc as u32).min(s.resp_len);
-    if s.resp_sent < s.resp_len {
-        return false;
-    }
-    s.resp_len = 0;
-    s.resp_sent = 0;
-    true
+    let chan = s.out_chan;
+    s.out.flush(sys, chan, &s.scratch)
 }
 
+#[allow(
+    clippy::manual_find,
+    reason = "an explicit scan keeps the PIC build panic-free: iterator adapters pull core::panicking paths the bare-metal SDK does not carry"
+)]
 fn find_slot<'a>(
     s: &'a mut ModuleState,
     digest: &[u8; super::wire::DIGEST_LEN],
@@ -1545,6 +1548,10 @@ fn find_slot<'a>(
     None
 }
 
+#[allow(
+    clippy::manual_find,
+    reason = "an explicit scan keeps the PIC build panic-free: iterator adapters pull core::panicking paths the bare-metal SDK does not carry"
+)]
 fn find_empty_slot(s: &mut ModuleState) -> Option<&mut DiskSlot> {
     for slot in s.slots.iter_mut() {
         if slot.in_use == 0 {

@@ -1,10 +1,10 @@
 # Running Loam
 
 This guide brings loam up on one Linux machine, from a single smoke
-graph to a multi-node body plane, and finishes with the replicated
-metadata shape. Every command was run as written; the graphs are
-embedded and pipe straight into `fluxor run`, so there is nothing
-else to fetch.
+graph to a body plane spread across nodes, and finishes with the
+replicated metadata shape. Everything runs under the fluxor runtime:
+graphs with `fluxor run`, the operator applet with `fluxor exec`. The
+service gates under `tools/e2e/` run each shape below as written.
 
 ## Prerequisites
 
@@ -17,20 +17,13 @@ make -C ../fluxor install    # put the fluxor CLI launcher on PATH
 make -C ../fluxor publish    # publish SDK, runtime, and foundation modules
 
 # in this repository
-make build                   # workspace crates + PIC module artefacts
+make build                   # the PIC module artefacts
 ```
 
-`make build` compiles the host crates (the `loam` CLI and the
-`loam-server` daemon land under `target/debug/`) and packs each PIC
-module into a `.fmod` artefact. Dependencies materialise from the
-local OCI store per `fluxor.lock`; if the store has moved on since
-the lockfile was written, `fluxor sync` re-resolves and restages.
-
-The examples below call the binaries bare; put them on PATH first:
-
-```sh
-export PATH=$PWD/target/debug:$PATH
-```
+`make build` packs each PIC module into a `.fmod` artefact under
+`target/fluxor/`. Dependencies materialise from the local OCI store
+per `fluxor.lock`; if the store has moved on since the lockfile was
+written, `fluxor sync` re-resolves and restages.
 
 ## Body-plane smoke graph
 
@@ -68,263 +61,208 @@ Smoke checks:
 `scheduler: accept_cycles: true` is required because the probe and
 the store form a request/response cycle. Stop the graph with Ctrl-C.
 
-## The CLI, in process
+## Identities and capabilities
 
-Each `loam` subcommand spins up the PIC bodies it needs in process,
-drives one request through the wire format, and prints JSON. State
-lives wherever the `--wal` and `--body-root` arguments point, so a
-scratch directory is enough:
-
-```sh
-mkdir -p data/quickstart
-loam validate --config config/loam.toml
-loam surfaces --modules modules   # reads modules/app/*/manifest.toml
-echo "hello loam" | loam put-file --wal data/quickstart/ns.wal \
-    --body-root data/quickstart/bodies acme /notes/hello.txt -
-loam read --wal data/quickstart/ns.wal acme /notes/hello.txt
-```
-
-`put-file` answers with the content digest and the fences achieved
-(`"fence_body": "ContentHashed"`, `"fence_binding": "LocalDurable"`);
-`read` returns the binding — object id, revision, kind. The `-`
-argument reads content from stdin.
-
-## Single-node daemon
-
-`loam-server` hosts the long-running graph (admin_router +
-namespace_router + body_store + object_index) and exposes it through
-a unix admin socket and an S3-compatible HTTP gateway:
+Two things stand between a client and loam's state. mTLS
+authenticates the connection: the services that take connections
+from other machines verify the peer's certificate against a CA they
+are given. A capability authorises what is done on it: a chain
+minted from the mesh root, presented before the first request, whose
+scope and permissions admit each request.
 
 ```sh
-mkdir -p data/srv
-loam-server --socket /tmp/loam.sock --s3-listen 127.0.0.1:9000 \
-            --ns-wal data/srv/ns.wal --obj-wal data/srv/obj.wal \
-            --fleet dir:data/srv/bodies
-```
+mkdir -p /etc/loam
+head -c 32 /dev/urandom > /etc/loam/root.seed
+fluxor modules keygen --key /etc/loam/root.seed | tail -1 > /etc/loam/mesh_root
 
-Smoke checks, from another shell:
-
-```sh
-loam admin-bind --socket /tmp/loam.sock acme /users/alice sha256:cafe
-echo "report body" > report.txt
-curl -T report.txt http://127.0.0.1:9000/docs/report.txt
-curl http://127.0.0.1:9000/docs/report.txt
-curl "http://127.0.0.1:9000/docs?prefix=&delimiter=/"
-```
-
-`admin-bind` answers `"status": "ok"` over the socket; the second
-curl returns the uploaded bytes; the third returns a
-ListBucketResult XML document listing `report.txt`. Buckets are
-namespace roots and ETags are content digests. Stop the daemon with
-Ctrl-C (or `kill`); state is in the WALs and the body root, so a
-restart replays to the same contents.
-
-`--s3-credentials FILE` turns on SigV4 verification with
-per-access-key bucket scopes; without it the gateway is anonymous.
-`--gc-interval N` sweeps orphaned body blobs and unbound object
-descriptors every N ticks — see [durability.md](durability.md).
-
-## Remote admin
-
-The admin surface is reached off-box over TLS 1.3 with mutual
-authentication, for a consumer that runs somewhere other than the
-storage node — a volume backend, a CSI plugin. There is no plaintext
-TCP admin surface: `--admin-listen` is REFUSED at startup unless all
-four of its flags are given.
-
-| Flag | Holds |
-|---|---|
-| `--admin-tls-cert` | PEM certificate chain the server presents |
-| `--admin-tls-key` | PEM private key for it |
-| `--admin-client-ca` | PEM CA certificate(s); a client must present a certificate chaining to one |
-| `--admin-grants` | JSON grant table, below |
-
-```sh
-loam-server --socket /tmp/loam.sock --admin-listen 0.0.0.0:7788 \
-            --admin-tls-cert /etc/loam/server.pem \
-            --admin-tls-key /etc/loam/server.key \
-            --admin-client-ca /etc/loam/clients-ca.pem \
-            --admin-grants /etc/loam/grants.json \
-            --ns-wal data/srv/ns.wal --obj-wal data/srv/obj.wal \
-            --fleet dir:data/srv/bodies
-```
-
-A client's **identity** is read from its verified leaf certificate:
-the first URI subject alternative name, else the first DNS SAN, else
-the subject CommonName. A certificate naming none, or an identity
-longer than 256 bytes, is refused at the handshake. Session
-resumption is off, so every connection is judged on the certificate
-it presents.
-
-The **grant table** maps each identity to namespace roots and op
-classes. An identity it does not name can do nothing:
-
-```json
+now=$(date +%s)
+mint() { fluxor modules cap mint --key /etc/loam/root.seed "$@" \
+           --not-before $((now - 60)) --not-after $((now + 86400 * 30)) | tail -1; }
 {
-  "grants": [
-    { "identity": "spiffe://site/node/7", "roots": ["tenant-a"], "ops": ["read", "write", "lease"] },
-    { "identity": "backup.site.example", "roots": ["*"], "ops": ["read"] },
-    { "identity": "operator.site.example", "roots": ["*"], "ops": ["read", "write", "lease", "admin"] }
-  ]
-}
+  mint --scope tenant/ --perms read_state,send_command
+  # the body plane's object: SHA-256("loam.body-plane\0"), first 16 bytes
+  mint --object "$(printf 'loam.body-plane\0' | sha256sum | cut -c1-32)" \
+       --perms read_state,send_command
+} > /etc/loam/ops.cap
 ```
 
-- `roots` are exact namespace-root strings, or `"*"` for every root.
-- `ops` are classes, and a grant's classes apply to all its roots.
-  Classes are independent: `admin` is the keyed body plane and
-  nothing more, so a grant wanting everything lists all four.
+A grant's scope is a `/`-terminated prefix of `root/path`: the chain
+above reaches every key under root `tenant`, and `--scope tenant/docs/`
+would reach only those under `/docs/`. The same rule decides an S3
+key under bucket `tenant`. Reads need `read_state`; writes and leases
+`send_command`; the keyed body plane (`PUT_BODY_KEYED`, `DELETE_BODY`)
+`admin`. A request no presented chain admits is answered `FORBIDDEN`
+in its own ack shape, and the session stays open: the remedy is a
+capability, not a retry. A byte that names no request closes it.
 
-| Class | Admin ops |
-|---|---|
-| `read` | `GET_FILE`, `STAT_FILE`, `READ_FILE_RANGE`, `LIST_FILES`, `LOOKUP`; `GET_BODY` |
-| `write` | `BIND`, `PUT_FILE`, `DELETE_FILE`, `PUT_FILE_OPEN`, `VOLUME` (begin, commit, abort, delete); `PUT_BODY` |
-| `lease` | `LEASE` (acquire, renew, release) |
-| `admin` | `PUT_BODY_KEYED`, `DELETE_BODY` |
+A lease or volume request's holder is replaced, on the way in, with
+one bound to the session's identity, so no client can name another's
+writer, while one identity's writers still tell each other apart by
+the holders they choose.
 
-- An op that names a root needs its class on that root.
-  Content-addressed `PUT_BODY` and `GET_BODY` name none and need the
-  class on some root: an extent is an unreferenced orphan until a
-  bind or a volume commit on a granted root names it.
-- The keyed body plane overwrites and deletes by key across every
-  root, so it is `admin`.
-- A streamed write's `PUT_FILE_CHUNK` and `PUT_FILE_COMMIT` are
-  accepted only on the connection that opened the stream.
-- A volume writer needs `lease` and `write`: the lease to hold the
-  volume, `write` to commit it.
-- `AUTH` over TLS, and any opcode the table does not name, is
-  refused; an unknown opcode also closes the connection.
+## An S3 endpoint
 
-A refusal is `STATUS_FORBIDDEN` (`0x08`) in the op's own ack shape,
-and the connection stays open: the remedy is a grant, not a retry.
-The file is checked at startup, and a server with a malformed entry,
-an unknown class, a duplicate identity, an empty root list, or an
-entry for the reserved name `local-operator` does not start. At most
-1024 identities and 256 roots per identity.
+The loam-s3 service is wave's `http` and `s3_serve` in front of
+loam's `storage.object` provider, the admin plane and one body store:
 
-**Lease holders are bound to the identity.** The server replaces the
-16-byte holder in every `LEASE` and `VOLUME` request from a TLS
-client with `SHA-256("loam-lease-holder\0" ‖ u16le(len) ‖ identity ‖ holder)`
-truncated to 16 bytes. No identity can name another's holder, even
-by sending its bytes, while one identity's writers still tell each
-other apart by the holders they choose. The mapping is the server's:
-a client names its writer with the holder it chose, every time.
+```sh
+mkdir -p /var/lib/loam/bodies /var/lib/loam/spool
+echo "AKTENANT000000000001 tenant-secret tenant/ $(mint --scope tenant/ --perms read_state,send_command)" \
+  > /etc/loam/s3.credentials
+fluxor run packaging/service/loam-s3/workload.toml \
+  --param port=9000 --param credentials=/etc/loam/s3.credentials \
+  --param mesh_roots=$(cat /etc/loam/mesh_root) \
+  --param ns_wal=/var/lib/loam/ns.wal --param obj_wal=/var/lib/loam/obj.wal \
+  --param body_dir=/var/lib/loam/bodies --param spool_dir=/var/lib/loam/spool
+```
 
-`loam-client` connects with `connect_tls(addr, server_name, ca_pem,
-cert_pem, key_pem)`. A certificate the server refuses fails the first
-request rather than the connect: in TLS 1.3 the client finishes its
-handshake before the server has judged its certificate.
+Each credentials line is an access key, its secret, the bucket scope
+it may sign for, and the capability it acts under. Every request is
+SigV4-signed; an unsigned one is refused. Smoke checks:
 
-The **unix socket** stays the local operator's path, with full
-authority and holders passed through unchanged. It is reachable only
-by the host's own users; `--admin-token FILE` additionally requires a
-secret there, presented once per connection with `authenticate`.
+```sh
+S="--aws-sigv4 aws:amz:us-east-1:s3 --user AKTENANT000000000001:tenant-secret"
+echo "report body" > report.txt
+curl $S -T report.txt http://127.0.0.1:9000/tenant/docs/report.txt
+curl $S http://127.0.0.1:9000/tenant/docs/report.txt
+curl $S "http://127.0.0.1:9000/tenant?list-type=2&prefix=docs/"
+```
+
+Buckets are namespace roots and ETags are content digests. A body
+larger than one record streams: `object_provider` spools it under
+`spool_dir` and writes it as one `PUT_FILE` stream, and reads come
+back in ranges pinned to the object they started on. State is in the
+WALs and the body directory, so a restart replays to the same
+contents. `gc_interval` (ticks; 0 is off) sweeps orphaned bodies and
+unbound object descriptors — see [durability.md](durability.md).
+
+## The admin plane and the applet
+
+The loam-admin service is a node's admin plane over mutual TLS. Its
+CA, certificate and key are read when the graph is built, so it is a
+template under `packaging/mtls/` rendered with its values:
+
+```sh
+python3 tools/e2e/render_service.py packaging/mtls/loam-admin/linux.yaml node.yaml \
+  port=7443 mesh_roots=$(cat /etc/loam/mesh_root) gc_interval=0 \
+  ns_wal=/var/lib/loam/ns.wal obj_wal=/var/lib/loam/obj.wal body_dir=/var/lib/loam/bodies \
+  ca=/etc/loam/ca.pem cert=/etc/loam/server.der key=/etc/loam/server.key.der
+fluxor run node.yaml
+```
+
+A client certificate must chain to `ca`. The operator applet is the
+client: installed once, with its certificate and key under
+`~/.config/loam/` (`client.der`, `client.key.der`, DER), and run with
+the node's address and a capability file:
+
+```sh
+fluxor install packaging/cli/workload.toml
+L="fluxor exec loam -- --admin storage-node:7443 --capability /etc/loam/ops.cap"
+$L put tenant /docs/report.txt report.txt --type text/plain
+$L ls tenant /docs/
+$L get tenant /docs/report.txt back.txt
+$L put tenant /docs/report.txt report.txt --if-absent     # refused: bound
+$L rm tenant /docs/report.txt
+```
+
+The node's certificate is checked against the host's trusted CAs, or
+those in the bundle `FLUXOR_CA_BUNDLE` names, and must name the host
+dialled.
 
 ## Block volumes over NBD
 
 A volume is a copy-on-write map of fixed-size extents, each an
 ordinary body replicated like any other, committed by binding the
-volume's path to the map's root. `loam-nbd` exports one as an NBD
-device, so a kernel (`nbd-client`) or a hypervisor (qemu's `nbd:`
-driver) can mount it. The volume must already exist — `loam-client`'s
-`create_volume` makes one, with any extent size up to 60 KiB. A volume
-a node's `loam_volume` module will serve needs a power-of-two extent
-of at most 32 KiB, since that module moves through a volume by
-shifts:
+volume's path to the map's root. Its extents are a power of two of
+at most 32 KiB.
 
 ```sh
-loam-nbd --socket /tmp/loam.sock --volume vol:/disks/data \
-         --listen 127.0.0.1:10809
+$L volume create tenant /vols/db0 1073741824 32768
+python3 tools/e2e/render_service.py packaging/mtls/loam-nbd/linux.yaml nbd.yaml \
+  port=10809 admin=storage-node:7443 capability=/etc/loam/ops.cap \
+  root=tenant path=/vols/db0 block_size=4096 lease_ttl_ms=30000 \
+  cert=/etc/loam/client.der key=/etc/loam/client.key.der
+fluxor run nbd.yaml
+nbd-client 127.0.0.1 10809 /dev/nbd0
 ```
 
-Against a remote node, which is the shape a volume backend runs in:
-
-```sh
-loam-nbd --admin storage-node:7788 \
-         --tls-ca /etc/loam/ca.pem --tls-cert /etc/loam/nbd.pem \
-         --tls-key /etc/loam/nbd.key \
-         --volume vol:/disks/data --listen 127.0.0.1:10809
-```
-
-The server's certificate is checked for `--tls-server-name`, or the
-host part of `--admin` without it. The device's identity needs
-`read`, `write` and `lease` on the volume's root. Against a unix
-socket started with `--admin-token`, pass `--token-file`.
-
-The server takes the volume's writer lease at start
-(`--lease-ttl-ms`, default 30000) and renews it every third of the
-TTL. A second server on the same volume is refused the lease and
-exits; one whose lease has passed on is refused at its next commit.
+`loam_volume` takes the volume's writer lease when it starts and
+renews it every half TTL; a second device on the same volume is
+refused (`the volume has another writer`) while the lease is held.
 Writes are staged: `FLUSH`, and a write carrying `FUA`, is answered
 only once the commit has landed, and until then a crash loses the
-staged writes without tearing anything committed. `SIGINT` or
-`SIGTERM` commits what is staged and releases the lease; a server
-killed outright holds the volume until its lease lapses.
+staged writes without tearing anything committed. Drained, the
+device commits what is staged and releases the lease; a device
+stopped without draining, or killed, holds the volume until its
+lease lapses. `$L volume read tenant /vols/db0 <offset> <length> <file>`
+reads what is committed, from any client.
+
+The loam-crypt-nbd template
+([`packaging/mtls/loam-crypt-nbd/`](../packaging/mtls/loam-crypt-nbd/))
+puts fluxor's `crypt_block` between the device and the volume, so the
+node holding the volume stores only ciphertext; it takes loam-nbd's
+values and `crypt_key`, the key vault entry it encrypts under.
 
 ## Snapshots, clones and export
 
-A snapshot is a manifest — a `(key, digest, kind)` listing — and
-nothing more. It pins its bodies by BINDING them under a root the caller
-names, so they are protected by the same reachability answer the
-orphan GC already computes for ordinary bindings: no per-body
-refcount appears, and the collector needs no snapshot-shaped query.
-The manifest itself is returned to the caller as bytes, to store
-wherever it belongs.
+A snapshot is a manifest — a `(key, digest, kind, size, content
+type)` listing — and nothing more. It pins its bodies by BINDING them
+under a root the caller names, so they are protected by the same
+reachability answer the orphan GC already computes for ordinary
+bindings: no per-body refcount appears, and the collector needs no
+snapshot-shaped query. The manifest itself is written to a file, to
+store wherever it belongs.
 
-`loam-client` carries the operations: `snapshot_create` writes the
-manifest, `snapshot_restore` binds its entries under a new root (a
-clone — bodies are shared, not copied), and `snapshot_delete` drops
-it, after which the GC reclaims whatever nothing else references.
+```sh
+$L snapshot create tenant snap-1 snap-1.manifest
+$L snapshot restore snap-1.manifest tenant-clone     # bodies shared, not copied
+$L snapshot delete snap-1                            # the GC reclaims the rest
+$L export snap-1.manifest tenant --to node2:7443 --to-capability /etc/loam/node2.cap
+```
 
 Each manifest entry carries its binding's kind, so a volume restores
 as a volume — the GC walks the maps of volume bindings only.
 
-Export between two clusters is a function over two clients rather
-than a protocol. `export_snapshot` asks the destination which
-digests it lacks — every entry's, and for a volume every page and
-extent its root reaches — sends only those, then binds the
-manifest's entries — so deduplication is free and the
-transfer is ordinary reads and writes. The manifest is
-encryption-agnostic and its digests are over plaintext, so it means
-the same thing on both sides whatever keys each cluster holds.
+Export is two sessions rather than a protocol: the applet asks the
+destination which digests it lacks — every entry's, and for a volume
+every page and extent its root reaches — sends only those, then
+binds the manifest's entries, so deduplication is free and a second
+export of the same manifest sends nothing. Each body moves whole,
+in one admin answer. The manifest is encryption-agnostic and its
+digests are over plaintext, so it means the same thing on both sides
+whatever keys each cluster holds.
 
-## Replicated body plane
+## Body plane across nodes
 
-The loam network contract bridges channel pairs between processes
-over TCP, so the body plane can live on other machines.
-`--serve-body` turns a node into a body host; `--fleet` gives the
-admin node its member list, in the order that defines rendezvous
-identity. All three processes below can also run on separate hosts;
-only the addresses change.
+A body node is a `body_store` behind one mutually authenticated
+`remote_channel` session — the loam-body template:
 
 ```sh
-# body nodes
-mkdir -p data/2node/bodies-b data/2node/bodies-c
-loam-server --serve-body 127.0.0.1:7101 --body-root data/2node/bodies-b &
-loam-server --serve-body 127.0.0.1:7102 --body-root data/2node/bodies-c &
-
-# admin node: gateway + metadata, bodies on the two hosts above
-loam-server --s3-listen 127.0.0.1:9011 \
-            --ns-wal data/2node/ns.wal --obj-wal data/2node/obj.wal \
-            --fleet tcp:127.0.0.1:7101,tcp:127.0.0.1:7102 \
-            --replica-count 2 --scrub-interval 5000 &
+python3 tools/e2e/render_service.py packaging/mtls/loam-body/linux.yaml body-b.yaml \
+  port=7101 body_dir=/var/lib/loam/bodies-b \
+  ca=/etc/loam/ca.pem cert=/etc/loam/server.der key=/etc/loam/server.key.der
+fluxor run body-b.yaml
 ```
 
-Smoke checks:
+The node at the front runs `body_fanout_router`, each member port
+wired to a `remote_channel` that dials one body node through a
+client-mode `tls`. [`tools/e2e/graphs/fleet_s3.yaml`](../tools/e2e/graphs/fleet_s3.yaml)
+is that graph: the loam-s3 shape with two remote members and
+`replicas: 2`. Every record on a body channel is
+`[len:u32][cid:u32][record]`, so a member is wired the same way
+whether its store is in the graph or on another node; `remote_channel`
+carries the frames record for record, and refuses a session whose
+peer states a different channel table.
 
-```sh
-echo "two node body" > tn.txt
-curl -T tn.txt http://127.0.0.1:9011/docs/tn.txt
-curl http://127.0.0.1:9011/docs/tn.txt
-ls data/2node/bodies-b data/2node/bodies-c   # same digest on both
-```
-
-With `--replica-count 2` every PUT lands on both nodes before it is
+With `replicas: 2` every PUT lands on both nodes before it is
 acknowledged — desired replicas and required synchronous replicas are
-one number, for the reasons in [durability.md](durability.md). Kill
-one body node and the GET still answers from the survivor;
-`--scrub-interval` heals under-replication in the background once the
-fleet is whole again. Stop everything with `kill` on the three
-processes.
+one number, for the reasons in [durability.md](durability.md). Lose
+one body node and reads are answered by the survivor; a member that
+misses an answer's deadline (`MEMBER_DEADLINE_MS`) is asked last
+until it answers again, so a read waits out at most one deadline.
+Writes are refused while a replica is missing, and land on both once
+its member has redialled. `scrub_interval` heals under-replication in
+the background once the fleet is whole.
 
 ## Replicated metadata
 
@@ -340,7 +278,7 @@ are replicated.
 
 Composing that graph needs clustor's published module palette in the
 store alongside loam's (declared in `fluxor.toml`, staged by
-`fluxor sync`). The composed deployment profiles are part of the
-replication work in flight and are not yet published as a
-self-contained public recipe; the single-node shapes above are the
-supported bring-up today.
+`fluxor sync`). [`examples/linux/clustor_multi3.yaml`](../examples/linux/clustor_multi3.yaml)
+is the three-node shape and `tools/e2e/multi3_bringup.sh` brings it
+up; the composed deployment profiles are not yet published as
+self-contained service bundles.

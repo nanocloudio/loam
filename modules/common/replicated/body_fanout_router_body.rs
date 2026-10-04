@@ -39,17 +39,27 @@
 //          under-replication is found and healed without waiting
 //          for a client read.
 //
-// Bounded step contract: at most OPS_PER_STEP upstream
-// requests + OPS_PER_STEP responses-per-target are handled
-// per `module_step` call. Per-request join state lives in a fixed-
-// size super::limits::ROUTER_JOINS table; join slots carry a generation stamp so a
-// late response for a freed-and-reused slot is dropped instead of
-// misattributed.
+// Channels: every request and answer, upstream and to members, is a
+// body frame (`body_frame.rs`) carrying a correlation id. Upstream
+// answers carry the id of the request they answer, in whatever order
+// joins complete; member answers are matched by member and id
+// (`member_io.rs`), and one that does not come by the member deadline
+// is that member's failure.
+//
+// Bounded step contract: at most OPS_PER_STEP upstream requests and
+// OPS_PER_STEP member answers per wired member are handled per
+// `module_step` call, and new work is admitted only while every
+// member has taken what it was sent and the upstream queue has room
+// for an answer. Per-request join state lives in a fixed-size
+// super::limits::ROUTER_JOINS table; join slots carry a generation
+// stamp so a late answer for a freed-and-reused slot is dropped
+// instead of misattributed.
 
 // Buffers derive from the wire cap so a max-size body can't be
-// truncated on the way through the router (body_store idiom).
-const READ_BUF: usize = super::body_wire::MAX_BODY + 64;
-const SCRATCH: usize = super::body_wire::MAX_BODY + 64;
+// truncated on the way through the router.
+const SCRATCH: usize = super::body_wire::RECORD_MAX;
+/// Upstream answers queued while the channel drains: two whole frames.
+const UP_QUEUE: usize = 2 * super::body_frame::FRAME_MAX;
 const DEFAULT_REPLICA_COUNT: u8 = 1;
 
 const KIND_CLIENT: u8 = 0;
@@ -67,8 +77,12 @@ const KIND_ADMIN_SCAN: u8 = 9;
 /// Concurrent upstream streams the router can fan out.
 const ROUTER_STREAMS: usize = 4;
 
+use super::member_io::{now_ms, Inflight, MemberPull, Members};
 use super::placement::Fleet;
 use super::placement_wire::MAX_FLEET;
+
+/// Member port pairs this router wires.
+pub const MEMBERS: usize = super::limits::ROUTER_MEMBERS;
 
 /// Per-target FIFO entry: which join slot (and which incarnation of
 /// it) this downstream response is expected to satisfy. Channels
@@ -101,8 +115,10 @@ pub struct JoinSlot {
     pub present_mask: u16, // SCRUB_PROBE: ranked indices that HeadResp'd
     pub repair_count: u8,  // SCRUB_FETCH: members to re-PUT on success
     pub stream_idx: u8,    // KIND_STREAM_*: which RouterStream
-    pub range_off: u64,    // OP_RANGE walk: request offset
-    pub range_len: u32,    // OP_RANGE walk: request length
+    /// The correlation id of the upstream request this join answers.
+    pub up_cid: u32,
+    pub range_off: u64, // OP_RANGE walk: request offset
+    pub range_len: u32, // OP_RANGE walk: request length
     pub repair_targets: [u8; MAX_FLEET],
     pub targets: [u8; MAX_FLEET],
     /// PUT: digest from the first replica OK. GET/HEAD: the
@@ -129,19 +145,25 @@ pub struct RouterStream {
 #[repr(C)]
 pub struct ModuleState {
     pub syscalls: *const super::SyscallTable,
-    /// Upstream-facing input (admin_router speaks body_wire here).
-    pub admin_in_chan: i32,
-    /// Upstream-facing output (PutResp / NAK back to admin_router).
-    pub admin_out_chan: i32,
+    /// Upstream requests (admin_router speaks body frames here).
+    pub up_in_chan: i32,
+    /// Upstream answers.
+    pub up_out_chan: i32,
     /// FleetEpoch subscription. -1 disables placement updates;
-    /// the cached fleet stays whatever it was last initialized to.
+    /// the cached fleet stays whatever it was last set to.
     pub fleet_in_chan: i32,
-    /// Per-target downstream request channels. Slot i corresponds
-    /// to fleet member index i (not member ID); `body_fleet_count`
-    /// determines which slots are wired.
-    pub body_req_chans: [i32; MAX_FLEET],
-    pub body_resp_chans: [i32; MAX_FLEET],
-    pub body_fleet_count: u8,
+    /// The upstream request being assembled.
+    pub up_rx: super::body_frame::Inbox<{ super::body_frame::RECORD_MAX }>,
+    /// The correlation id of the upstream request being handled.
+    pub up_cid: u32,
+    /// Upstream answers owed.
+    pub up_tx: super::body_frame::Ring<UP_QUEUE>,
+    /// The members: slot i is fleet member index i (not member ID).
+    pub members: Members<MEMBERS>,
+    /// Every answer awaited from a member.
+    pub inflight: Inflight<{ super::limits::ROUTER_PENDING }>,
+    /// The clock at the start of this step.
+    pub now_ms: u64,
     /// Replica count config. PUT/DELETE fan out to (and GET/HEAD
     /// fall back through) min(this, fleet.count) targets.
     pub replica_count: u8,
@@ -149,14 +171,6 @@ pub struct ModuleState {
     pub fleet_epoch: u64,
     pub fleet_members: [u8; MAX_FLEET],
     pub fleet_count: u8,
-    /// Per-target FIFO ring (channels are FIFO; entry order = response
-    /// order). `head/tail/pending` are parallel arrays indexed by
-    /// target slot.
-    /// Per-member dispatch FIFOs — the shared engine
-    /// (`replicated/fanout_engine.rs`). Both routers fan one upstream
-    /// request to several members and rejoin by arrival order; that
-    /// queue is the seam where they genuinely agree.
-    pub queues: super::fanout_engine::TargetQueues<MAX_FLEET, { super::limits::ROUTER_PENDING }>,
     pub joins: [JoinSlot; super::limits::ROUTER_JOINS],
     pub join_gen: u16,
     /// Upstream chunked streams fanned to the replica set:
@@ -172,14 +186,19 @@ pub struct ModuleState {
     pub repairs_started: u32,
     pub repairs_ok: u32,
     pub repairs_failed: u32,
+    /// Answers that matched no awaited request — late past their
+    /// deadline, or for a freed join.
+    pub stale_answers: u32,
+    /// Awaited answers that did not come by the member deadline.
+    pub member_timeouts: u32,
     /// Background scrub: every `scrub_interval` ticks (0 = scrub
     /// off) the router SCANs one page of one target's digest
     /// inventory, HEAD-probes each digest's ranked replica set,
     /// and re-replicates bodies that are present somewhere but
     /// missing from a ranked replica. Targets are walked
-    /// round-robin over ALL wired channel slots — so bodies
-    /// stranded on a member that left the fleet still get probed
-    /// (and repaired onto the current fleet).
+    /// round-robin over ALL wired members — so bodies stranded
+    /// on a member that left the fleet still get probed (and
+    /// repaired onto the current fleet).
     pub scrub_interval: u32,
     pub scrub_target: u8,
     pub scrub_cursor: u32,
@@ -191,78 +210,19 @@ pub struct ModuleState {
     pub apply_errors: u32,
 }
 
-/// Init with no downstream targets wired and an empty fleet.
-/// Mainly useful for incremental host-test setup; production
-/// callers should use `module_new_with_targets_impl`.
+/// Construct the router: the upstream pair, the FleetEpoch input (-1
+/// for none), and one request/answer channel pair per member.
+/// `req_chans` and `resp_chans` are the same length, at most
+/// `MEMBERS`. The fleet starts as every wired member at epoch 1, the
+/// static fleet a graph without a `placement_router` runs; a FleetEpoch
+/// replaces it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "bounded no_std step functions pass explicit scalar params"
+)]
 pub unsafe fn module_new_impl(
-    admin_in_chan: i32,
-    admin_out_chan: i32,
-    fleet_in_chan: i32,
-    state_ptr: *mut u8,
-    state_size: usize,
-    syscalls: *const super::SyscallTable,
-) -> i32 {
-    init_state(
-        admin_in_chan,
-        admin_out_chan,
-        fleet_in_chan,
-        &[],
-        &[],
-        DEFAULT_REPLICA_COUNT,
-        0,
-        state_ptr,
-        state_size,
-        syscalls,
-    )
-}
-
-/// Init with the downstream body channel arrays + replica count.
-/// `req_chans` and `resp_chans` must be the same length (the
-/// number of body_store fleet members this router fronts). The
-/// cached fleet is empty until the first FleetEpoch arrives; in
-/// the absence of a placement_router subscription, callers can
-/// drive `set_fleet_for_test` to seed the snapshot directly.
-pub unsafe fn module_new_with_targets_impl(
-    admin_in_chan: i32,
-    admin_out_chan: i32,
-    fleet_in_chan: i32,
-    req_chans: &[i32],
-    resp_chans: &[i32],
-    replica_count: u8,
-    scrub_interval: u32,
-    state_ptr: *mut u8,
-    state_size: usize,
-    syscalls: *const super::SyscallTable,
-) -> i32 {
-    init_state(
-        admin_in_chan,
-        admin_out_chan,
-        fleet_in_chan,
-        req_chans,
-        resp_chans,
-        replica_count,
-        scrub_interval,
-        state_ptr,
-        state_size,
-        syscalls,
-    )
-}
-
-/// Host-test helper: directly seed the cached fleet snapshot so a
-/// PUT can be exercised without a live placement_router on the
-/// fleet_in_chan side. Members must reference slot indices in
-/// `body_req_chans[0..body_fleet_count]`.
-pub unsafe fn set_fleet_for_test(state_ptr: *mut u8, epoch: u64, members: &[u8]) {
-    let s = &mut *(state_ptr as *mut ModuleState);
-    let take = members.len().min(MAX_FLEET);
-    s.fleet_members[..take].copy_from_slice(&members[..take]);
-    s.fleet_count = take as u8;
-    s.fleet_epoch = epoch;
-}
-
-unsafe fn init_state(
-    admin_in_chan: i32,
-    admin_out_chan: i32,
+    up_in_chan: i32,
+    up_out_chan: i32,
     fleet_in_chan: i32,
     req_chans: &[i32],
     resp_chans: &[i32],
@@ -278,23 +238,17 @@ unsafe fn init_state(
     if state_size < core::mem::size_of::<ModuleState>() {
         return -2;
     }
-    if req_chans.len() != resp_chans.len() || req_chans.len() > MAX_FLEET {
+    if req_chans.len() != resp_chans.len() || req_chans.len() > MEMBERS {
         return -3;
     }
     core::ptr::write_bytes(state_ptr, 0u8, state_size);
     let s = &mut *(state_ptr as *mut ModuleState);
     s.syscalls = syscalls;
-    s.admin_in_chan = admin_in_chan;
-    s.admin_out_chan = admin_out_chan;
+    s.up_in_chan = up_in_chan;
+    s.up_out_chan = up_out_chan;
     s.fleet_in_chan = fleet_in_chan;
-    s.body_fleet_count = req_chans.len() as u8;
-    for i in 0..req_chans.len() {
-        s.body_req_chans[i] = req_chans[i];
-        s.body_resp_chans[i] = resp_chans[i];
-    }
-    for i in req_chans.len()..MAX_FLEET {
-        s.body_req_chans[i] = -1;
-        s.body_resp_chans[i] = -1;
+    if !s.members.wire(req_chans, resp_chans) {
+        return -3;
     }
     s.replica_count = if replica_count == 0 {
         DEFAULT_REPLICA_COUNT
@@ -302,7 +256,22 @@ unsafe fn init_state(
         replica_count
     };
     s.scrub_interval = scrub_interval;
+    let n = req_chans.len();
+    for i in 0..n {
+        s.fleet_members[i] = i as u8;
+    }
+    s.fleet_count = n as u8;
+    s.fleet_epoch = 1;
     0
+}
+
+/// Replace the cached fleet snapshot. Members are member slot indices.
+pub unsafe fn set_fleet(state_ptr: *mut u8, epoch: u64, members: &[u8]) {
+    let s = &mut *(state_ptr as *mut ModuleState);
+    let take = members.len().min(MAX_FLEET);
+    s.fleet_members[..take].copy_from_slice(&members[..take]);
+    s.fleet_count = take as u8;
+    s.fleet_epoch = epoch;
 }
 
 fn body_key_from_bytes(body: &[u8]) -> [u8; super::placement::DIGEST_LEN] {
@@ -317,6 +286,7 @@ unsafe fn alloc_join(s: &mut ModuleState) -> Option<u16> {
         if s.joins[i].in_use == 0 {
             s.join_gen = s.join_gen.wrapping_add(1);
             let gen = s.join_gen;
+            let up_cid = s.up_cid;
             let slot = &mut s.joins[i];
             *slot = JoinSlot {
                 in_use: 1,
@@ -335,6 +305,7 @@ unsafe fn alloc_join(s: &mut ModuleState) -> Option<u16> {
                 present_mask: 0,
                 repair_count: 0,
                 stream_idx: 0,
+                up_cid,
                 range_off: 0,
                 range_len: 0,
                 repair_targets: [0u8; MAX_FLEET],
@@ -365,6 +336,12 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         Some(t) => t,
         None => return -1,
     };
+    s.now_ms = now_ms(syscalls);
+
+    // ── 0. Offer what is owed, upstream and to members. ─────────
+    s.up_tx.flush(syscalls, s.up_out_chan);
+    s.members
+        .flush(syscalls, s.now_ms, super::limits::MEMBER_DEADLINE_MS);
 
     // ── 1. Drain FleetEpoch updates. ────────────────────────────
     if s.fleet_in_chan >= 0 {
@@ -390,24 +367,50 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         }
     }
 
-    // ── 2. Background scrub: kick one SCAN when due. ────────────
+    // ── 2. Answers past the member deadline are failures. ───────
+    while admits(s) {
+        let Some(e) = s
+            .inflight
+            .take_expired(s.now_ms, super::limits::MEMBER_DEADLINE_MS)
+        else {
+            break;
+        };
+        s.member_timeouts = s.member_timeouts.wrapping_add(1);
+        s.members.mark_quiet(e.target);
+        let nak = [super::body_wire::OP_NAK, super::body_wire::ERR_IO];
+        answer_join(s, syscalls, e.join_idx, e.join_gen, e.target, &nak);
+    }
+
+    // ── 3. Background scrub: kick one SCAN when due. ────────────
     if s.scrub_interval != 0
-        && s.body_fleet_count != 0
+        && s.members.count != 0
         && s.scrub_scan_inflight == 0
-        && s.ticks % s.scrub_interval == 0
+        && s.ticks.is_multiple_of(s.scrub_interval)
+        && admits(s)
     {
         scrub_kick(s, syscalls);
     }
 
-    // ── 3. Drain upstream body requests, fan out / route. ───────
+    // ── 4. Drain upstream body requests, fan out / route. ───────
     let mut handled: u32 = 0;
-    while handled < super::limits::OPS_PER_STEP {
-        let mut buf = [0u8; READ_BUF];
-        let n = (syscalls.channel_read)(s.admin_in_chan, buf.as_mut_ptr(), buf.len());
-        if n <= 0 {
-            break;
+    while handled < super::limits::OPS_PER_STEP && admits(s) {
+        match s.up_rx.pull(syscalls, s.up_in_chan) {
+            super::body_frame::Pull::Record => {}
+            super::body_frame::Pull::Empty => break,
+            super::body_frame::Pull::Oversize(cid) => {
+                emit_nak(s, cid, super::body_wire::ERR_TOO_LARGE);
+                handled = handled.wrapping_add(1);
+                continue;
+            }
+            super::body_frame::Pull::Malformed => {
+                s.apply_errors = s.apply_errors.wrapping_add(1);
+                break;
+            }
         }
-        let bytes = &buf[..n as usize];
+        s.up_cid = s.up_rx.cid();
+        // Borrowed from the inbox while the handlers work; the inbox
+        // is not touched until `take` below.
+        let bytes: &[u8] = &*(s.up_rx.record() as *const [u8]);
         let op = super::body_wire::peek_opcode(bytes).unwrap_or(0xFF);
         match op {
             super::body_wire::OP_PUT => handle_put(s, syscalls, bytes),
@@ -427,49 +430,75 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
             super::body_wire::OP_RANGE => handle_range_read(s, syscalls, bytes),
             super::body_wire::OP_SCAN => handle_admin_scan(s, syscalls, bytes),
             _ => {
-                emit_nak(s, syscalls, super::body_wire::ERR_BAD_REQ);
+                emit_nak(s, s.up_cid, super::body_wire::ERR_BAD_REQ);
             }
         }
+        s.up_rx.take();
         handled = handled.wrapping_add(1);
     }
 
-    // ── 4. Drain per-target responses, aggregate into joins. ───
-    for t in 0..s.body_fleet_count as usize {
-        let resp_chan = s.body_resp_chans[t];
-        if resp_chan < 0 {
-            continue;
-        }
-        let mut drained: u32 = 0;
-        while drained < super::limits::OPS_PER_STEP {
-            let mut buf = [0u8; READ_BUF];
-            let n = (syscalls.channel_read)(resp_chan, buf.as_mut_ptr(), buf.len());
-            if n <= 0 {
-                break;
-            }
-            let resp = &buf[..n as usize];
-            match s.queues.dequeue(t as u8) {
-                Some(pending) => {
-                    let ji = pending.join_idx as usize;
-                    if ji >= super::limits::ROUTER_JOINS
-                        || s.joins[ji].in_use == 0
-                        || s.joins[ji].gen != pending.join_gen
-                    {
-                        // Stale response — join was resolved/freed
-                        // (and possibly reallocated). Drop.
-                        s.apply_errors = s.apply_errors.wrapping_add(1);
-                    } else {
-                        apply_join_response(s, syscalls, pending.join_idx, t as u8, resp);
-                    }
+    // ── 5. Drain member answers, aggregate into joins. ──────────
+    let budget = super::limits::OPS_PER_STEP * s.members.count.max(1) as u32;
+    let mut drained: u32 = 0;
+    while drained < budget && admits(s) {
+        match s.members.pull(syscalls) {
+            MemberPull::Empty => break,
+            MemberPull::Record(t, cid) => {
+                let resp: &[u8] = &*(s.members.record() as *const [u8]);
+                match s.inflight.resolve(t, cid) {
+                    Some(e) => answer_join(s, syscalls, e.join_idx, e.join_gen, t, resp),
+                    None => s.stale_answers = s.stale_answers.wrapping_add(1),
                 }
-                None => {
-                    s.apply_errors = s.apply_errors.wrapping_add(1);
-                }
+                s.members.take();
             }
-            drained = drained.wrapping_add(1);
+            MemberPull::Oversize(t, cid) => match s.inflight.resolve(t, cid) {
+                Some(e) => {
+                    let nak = [super::body_wire::OP_NAK, super::body_wire::ERR_TOO_LARGE];
+                    answer_join(s, syscalls, e.join_idx, e.join_gen, t, &nak);
+                }
+                None => s.stale_answers = s.stale_answers.wrapping_add(1),
+            },
         }
+        drained = drained.wrapping_add(1);
     }
 
+    s.up_tx.flush(syscalls, s.up_out_chan);
     0
+}
+
+/// New work may be taken: the upstream queue has room for the one
+/// answer it can produce, and no member is part-way through taking a
+/// frame, so every send the work makes reaches a member that can take
+/// it or is refused for a reason that will not pass on its own.
+fn admits(s: &ModuleState) -> bool {
+    s.up_tx.has_room_for_frame() && s.members.settled()
+}
+
+/// Queue one upstream answer under `cid`.
+unsafe fn emit(s: &mut ModuleState, cid: u32, record: &[u8]) {
+    if !s.up_tx.push(cid, record) {
+        // `admits` reserved room for it; this is unreachable short of
+        // a handler answering twice.
+        s.apply_errors = s.apply_errors.wrapping_add(1);
+    }
+}
+
+/// Deliver a member's answer (or a synthesised failure) to its join,
+/// if the join is still the one that asked.
+unsafe fn answer_join(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    join_idx: u16,
+    join_gen: u16,
+    target: u8,
+    resp: &[u8],
+) {
+    let ji = join_idx as usize;
+    if ji >= super::limits::ROUTER_JOINS || s.joins[ji].in_use == 0 || s.joins[ji].gen != join_gen {
+        s.stale_answers = s.stale_answers.wrapping_add(1);
+        return;
+    }
+    apply_join_response(s, syscalls, join_idx, target, resp);
 }
 
 /// Rank the replica set for `key` from the cached fleet snapshot.
@@ -487,11 +516,15 @@ unsafe fn rank_targets(
     super::placement::pick_targets(key, effective as u8, &fleet, out)
 }
 
+#[allow(
+    clippy::needless_range_loop,
+    reason = "indexed loops keep the PIC build panic-free: iterator adapters and slice ranges pull core::panicking paths the bare-metal SDK does not carry"
+)]
 unsafe fn handle_put(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) {
     let body = match super::body_wire::decode_put_req(bytes) {
         Ok(b) => b,
         Err(_) => {
-            emit_nak(s, syscalls, super::body_wire::ERR_BAD_REQ);
+            emit_nak(s, s.up_cid, super::body_wire::ERR_BAD_REQ);
             s.apply_errors = s.apply_errors.wrapping_add(1);
             return;
         }
@@ -502,7 +535,7 @@ unsafe fn handle_put(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes:
     let chosen = rank_targets(s, &key, &mut targets_buf);
     if chosen == 0 {
         // No fleet — nothing to write to.
-        emit_nak(s, syscalls, super::body_wire::ERR_IO);
+        emit_nak(s, s.up_cid, super::body_wire::ERR_IO);
         s.apply_errors = s.apply_errors.wrapping_add(1);
         return;
     }
@@ -510,7 +543,7 @@ unsafe fn handle_put(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes:
     let join_idx = match alloc_join(s) {
         Some(i) => i,
         None => {
-            emit_nak(s, syscalls, super::body_wire::ERR_IO);
+            emit_nak(s, s.up_cid, super::body_wire::ERR_IO);
             s.apply_errors = s.apply_errors.wrapping_add(1);
             return;
         }
@@ -521,14 +554,13 @@ unsafe fn handle_put(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes:
         j.need = chosen as u8;
     }
 
-    // Encode the body once into scratch and forward to each chosen
-    // target's request channel. The fleet member IDs ARE the
-    // target-slot indices in `body_req_chans[..body_fleet_count]`.
+    // Encode the body once into scratch and send it to each chosen
+    // target. The fleet member IDs ARE the member slot indices.
     let req_n = match super::body_wire::encode_put_req(&mut s.scratch, body) {
         Ok(n) => n,
         Err(_) => {
             free_join(s, join_idx);
-            emit_nak(s, syscalls, super::body_wire::ERR_BAD_REQ);
+            emit_nak(s, s.up_cid, super::body_wire::ERR_BAD_REQ);
             s.apply_errors = s.apply_errors.wrapping_add(1);
             return;
         }
@@ -546,7 +578,7 @@ unsafe fn handle_put(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes:
     let j = s.joins[join_idx as usize];
     if j.fail == j.need {
         free_join(s, join_idx);
-        emit_nak(s, syscalls, super::body_wire::ERR_IO);
+        emit_nak(s, s.up_cid, super::body_wire::ERR_IO);
     }
 }
 
@@ -554,11 +586,15 @@ unsafe fn handle_put(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes:
 /// placement key IS the request's explicit key (so extents and EC
 /// shards land on the replica set a later GET-by-key will rank),
 /// and the ack echoes the key instead of a computed digest.
+#[allow(
+    clippy::needless_range_loop,
+    reason = "indexed loops keep the PIC build panic-free: iterator adapters and slice ranges pull core::panicking paths the bare-metal SDK does not carry"
+)]
 unsafe fn handle_put_keyed(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) {
     let (key_bytes, blob) = match super::body_wire::decode_put_keyed_req(bytes) {
         Ok(v) => v,
         Err(_) => {
-            emit_nak(s, syscalls, super::body_wire::ERR_BAD_REQ);
+            emit_nak(s, s.up_cid, super::body_wire::ERR_BAD_REQ);
             s.apply_errors = s.apply_errors.wrapping_add(1);
             return;
         }
@@ -568,14 +604,14 @@ unsafe fn handle_put_keyed(s: &mut ModuleState, syscalls: &super::SyscallTable, 
     let mut targets_buf = [0u8; MAX_FLEET];
     let chosen = rank_targets(s, &key, &mut targets_buf);
     if chosen == 0 {
-        emit_nak(s, syscalls, super::body_wire::ERR_IO);
+        emit_nak(s, s.up_cid, super::body_wire::ERR_IO);
         s.apply_errors = s.apply_errors.wrapping_add(1);
         return;
     }
     let join_idx = match alloc_join(s) {
         Some(i) => i,
         None => {
-            emit_nak(s, syscalls, super::body_wire::ERR_IO);
+            emit_nak(s, s.up_cid, super::body_wire::ERR_IO);
             s.apply_errors = s.apply_errors.wrapping_add(1);
             return;
         }
@@ -591,7 +627,7 @@ unsafe fn handle_put_keyed(s: &mut ModuleState, syscalls: &super::SyscallTable, 
         Ok(n) => n,
         Err(_) => {
             free_join(s, join_idx);
-            emit_nak(s, syscalls, super::body_wire::ERR_BAD_REQ);
+            emit_nak(s, s.up_cid, super::body_wire::ERR_BAD_REQ);
             s.apply_errors = s.apply_errors.wrapping_add(1);
             return;
         }
@@ -606,14 +642,14 @@ unsafe fn handle_put_keyed(s: &mut ModuleState, syscalls: &super::SyscallTable, 
     let j = s.joins[join_idx as usize];
     if j.fail == j.need {
         free_join(s, join_idx);
-        emit_nak(s, syscalls, super::body_wire::ERR_IO);
+        emit_nak(s, s.up_cid, super::body_wire::ERR_IO);
     }
 }
 
-/// Write `req_n` bytes of `s.scratch` to `member_id`'s request
-/// channel with a pending-FIFO entry for the join. Returns false
-/// (with the enqueue unwound) if the target is unwired or the
-/// write fails — no response will arrive for a false return.
+/// Send `req_n` bytes of `s.scratch` to `member_id`, awaiting its
+/// answer for the join. False, with nothing awaited, when the member
+/// is unwired, stalled or broken, or the in-flight table is full — no
+/// answer will arrive for a false return.
 unsafe fn dispatch_to_target(
     s: &mut ModuleState,
     syscalls: &super::SyscallTable,
@@ -622,19 +658,18 @@ unsafe fn dispatch_to_target(
     join_gen: u16,
     req_n: usize,
 ) -> bool {
-    if (member_id as usize) >= s.body_fleet_count as usize {
+    if !s.members.can_send(member_id) {
         return false;
     }
-    let req_chan = s.body_req_chans[member_id as usize];
-    if req_chan < 0 {
+    let Some(cid) = s.inflight.issue(member_id, join_idx, join_gen, s.now_ms) else {
         return false;
-    }
-    if !s.queues.enqueue(member_id, join_idx, join_gen) {
-        return false;
-    }
-    let wrote = (syscalls.channel_write)(req_chan, s.scratch.as_ptr(), req_n);
-    if wrote < 0 || (wrote as usize) != req_n {
-        s.queues.unenqueue_tail(member_id);
+    };
+    let now = s.now_ms;
+    if !s
+        .members
+        .send(syscalls, member_id, cid, &s.scratch[..req_n], now)
+    {
+        s.inflight.unissue(cid);
         return false;
     }
     s.fanned_out = s.fanned_out.wrapping_add(1);
@@ -644,7 +679,7 @@ unsafe fn dispatch_to_target(
 /// GET / HEAD: serial fallback through the ranked replica set.
 unsafe fn handle_read(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) {
     if bytes.len() < 1 + super::body_wire::DIGEST_LEN {
-        emit_nak(s, syscalls, super::body_wire::ERR_BAD_REQ);
+        emit_nak(s, s.up_cid, super::body_wire::ERR_BAD_REQ);
         s.apply_errors = s.apply_errors.wrapping_add(1);
         return;
     }
@@ -652,15 +687,17 @@ unsafe fn handle_read(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes
     key.copy_from_slice(&bytes[1..1 + super::body_wire::DIGEST_LEN]);
     let mut targets_buf = [0u8; MAX_FLEET];
     let chosen = rank_targets(s, &key, &mut targets_buf);
+    // Ask a member that is answering before one that is quiet.
+    s.members.quiet_last(&mut targets_buf[..chosen]);
     if chosen == 0 {
-        emit_nak(s, syscalls, super::body_wire::ERR_NOT_FOUND);
+        emit_nak(s, s.up_cid, super::body_wire::ERR_NOT_FOUND);
         s.apply_errors = s.apply_errors.wrapping_add(1);
         return;
     }
     let join_idx = match alloc_join(s) {
         Some(i) => i,
         None => {
-            emit_nak(s, syscalls, super::body_wire::ERR_IO);
+            emit_nak(s, s.up_cid, super::body_wire::ERR_IO);
             s.apply_errors = s.apply_errors.wrapping_add(1);
             return;
         }
@@ -705,7 +742,7 @@ unsafe fn advance_read(s: &mut ModuleState, syscalls: &super::SyscallTable, join
                 } else {
                     last_errno
                 };
-                emit_nak(s, syscalls, errno);
+                emit_nak(s, s.joins[join_idx as usize].up_cid, errno);
                 s.upstream_naked = s.upstream_naked.wrapping_add(1);
             }
             return;
@@ -721,7 +758,11 @@ unsafe fn advance_read(s: &mut ModuleState, syscalls: &super::SyscallTable, join
                 Ok(n) => n,
                 Err(_) => {
                     free_join(s, join_idx);
-                    emit_nak(s, syscalls, super::body_wire::ERR_BAD_REQ);
+                    emit_nak(
+                        s,
+                        s.joins[join_idx as usize].up_cid,
+                        super::body_wire::ERR_BAD_REQ,
+                    );
                     return;
                 }
             }
@@ -746,9 +787,13 @@ unsafe fn advance_read(s: &mut ModuleState, syscalls: &super::SyscallTable, join
 
 /// DELETE: fan out to the full ranked replica set. A primary-only
 /// delete would leave the blob live on the secondaries forever.
+#[allow(
+    clippy::needless_range_loop,
+    reason = "indexed loops keep the PIC build panic-free: iterator adapters and slice ranges pull core::panicking paths the bare-metal SDK does not carry"
+)]
 unsafe fn handle_delete(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) {
     if bytes.len() < 1 + super::body_wire::DIGEST_LEN {
-        emit_nak(s, syscalls, super::body_wire::ERR_BAD_REQ);
+        emit_nak(s, s.up_cid, super::body_wire::ERR_BAD_REQ);
         s.apply_errors = s.apply_errors.wrapping_add(1);
         return;
     }
@@ -757,14 +802,14 @@ unsafe fn handle_delete(s: &mut ModuleState, syscalls: &super::SyscallTable, byt
     let mut targets_buf = [0u8; MAX_FLEET];
     let chosen = rank_targets(s, &key, &mut targets_buf);
     if chosen == 0 {
-        emit_nak(s, syscalls, super::body_wire::ERR_NOT_FOUND);
+        emit_nak(s, s.up_cid, super::body_wire::ERR_NOT_FOUND);
         s.apply_errors = s.apply_errors.wrapping_add(1);
         return;
     }
     let join_idx = match alloc_join(s) {
         Some(i) => i,
         None => {
-            emit_nak(s, syscalls, super::body_wire::ERR_IO);
+            emit_nak(s, s.up_cid, super::body_wire::ERR_IO);
             s.apply_errors = s.apply_errors.wrapping_add(1);
             return;
         }
@@ -786,7 +831,7 @@ unsafe fn handle_delete(s: &mut ModuleState, syscalls: &super::SyscallTable, byt
     let j = s.joins[join_idx as usize];
     if j.fail == j.need {
         free_join(s, join_idx);
-        emit_nak(s, syscalls, super::body_wire::ERR_IO);
+        emit_nak(s, s.up_cid, super::body_wire::ERR_IO);
     }
 }
 
@@ -798,7 +843,7 @@ unsafe fn handle_range_read(s: &mut ModuleState, syscalls: &super::SyscallTable,
     let (digest_bytes, off, len) = match super::body_wire::decode_range_req(bytes) {
         Ok(v) => v,
         Err(_) => {
-            emit_nak(s, syscalls, super::body_wire::ERR_BAD_REQ);
+            emit_nak(s, s.up_cid, super::body_wire::ERR_BAD_REQ);
             return;
         }
     };
@@ -806,14 +851,16 @@ unsafe fn handle_range_read(s: &mut ModuleState, syscalls: &super::SyscallTable,
     digest.copy_from_slice(digest_bytes);
     let mut targets_buf = [0u8; MAX_FLEET];
     let chosen = rank_targets(s, &digest, &mut targets_buf);
+    // Ask a member that is answering before one that is quiet.
+    s.members.quiet_last(&mut targets_buf[..chosen]);
     if chosen == 0 {
-        emit_nak(s, syscalls, super::body_wire::ERR_NOT_FOUND);
+        emit_nak(s, s.up_cid, super::body_wire::ERR_NOT_FOUND);
         return;
     }
     let join_idx = match alloc_join(s) {
         Some(i) => i,
         None => {
-            emit_nak(s, syscalls, super::body_wire::ERR_IO);
+            emit_nak(s, s.up_cid, super::body_wire::ERR_IO);
             return;
         }
     };
@@ -872,11 +919,15 @@ unsafe fn abort_stream_members(s: &mut ModuleState, syscalls: &super::SyscallTab
 /// WOPEN: rank the replica set for the DECLARED digest (that is
 /// what makes streamed placement identical to single-shot) and
 /// open a session on every member.
+#[allow(
+    clippy::needless_range_loop,
+    reason = "indexed loops keep the PIC build panic-free: iterator adapters and slice ranges pull core::panicking paths the bare-metal SDK does not carry"
+)]
 unsafe fn handle_stream_open(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) {
     let (digest_bytes, total_len) = match super::body_wire::decode_wopen_req(bytes) {
         Ok(v) => v,
         Err(_) => {
-            emit_nak(s, syscalls, super::body_wire::ERR_BAD_REQ);
+            emit_nak(s, s.up_cid, super::body_wire::ERR_BAD_REQ);
             return;
         }
     };
@@ -885,13 +936,13 @@ unsafe fn handle_stream_open(s: &mut ModuleState, syscalls: &super::SyscallTable
     let mut targets_buf = [0u8; MAX_FLEET];
     let chosen = rank_targets(s, &digest, &mut targets_buf);
     if chosen == 0 {
-        emit_nak(s, syscalls, super::body_wire::ERR_IO);
+        emit_nak(s, s.up_cid, super::body_wire::ERR_IO);
         return;
     }
     let sid = match (0..ROUTER_STREAMS).find(|&i| s.streams[i].in_use == 0) {
         Some(i) => i,
         None => {
-            emit_nak(s, syscalls, super::body_wire::ERR_IO);
+            emit_nak(s, s.up_cid, super::body_wire::ERR_IO);
             return;
         }
     };
@@ -906,7 +957,7 @@ unsafe fn handle_stream_open(s: &mut ModuleState, syscalls: &super::SyscallTable
         Some(i) => i,
         None => {
             free_stream(s, sid);
-            emit_nak(s, syscalls, super::body_wire::ERR_IO);
+            emit_nak(s, s.up_cid, super::body_wire::ERR_IO);
             return;
         }
     };
@@ -925,12 +976,13 @@ unsafe fn handle_stream_open(s: &mut ModuleState, syscalls: &super::SyscallTable
         Err(_) => {
             free_join(s, join_idx);
             free_stream(s, sid);
-            emit_nak(s, syscalls, super::body_wire::ERR_BAD_REQ);
+            emit_nak(s, s.up_cid, super::body_wire::ERR_BAD_REQ);
             return;
         }
     };
     for i in 0..chosen {
-        if !dispatch_to_target(s, syscalls, targets_buf[i], join_idx, gen, req_n) {
+        let member_id = targets_buf[i];
+        if !dispatch_to_target(s, syscalls, member_id, join_idx, gen, req_n) {
             s.joins[join_idx as usize].fail = s.joins[join_idx as usize].fail.wrapping_add(1);
         }
     }
@@ -938,7 +990,7 @@ unsafe fn handle_stream_open(s: &mut ModuleState, syscalls: &super::SyscallTable
     if j.fail > 0 {
         free_join(s, join_idx);
         abort_stream_members(s, syscalls, sid);
-        emit_nak(s, syscalls, super::body_wire::ERR_IO);
+        emit_nak(s, s.up_cid, super::body_wire::ERR_IO);
     }
 }
 
@@ -947,12 +999,12 @@ unsafe fn handle_stream_append(s: &mut ModuleState, syscalls: &super::SyscallTab
     let (sid, chunk_len) = match super::body_wire::decode_wappend_req(bytes) {
         Ok((sid, chunk)) => (sid as usize, chunk.len()),
         Err(_) => {
-            emit_nak(s, syscalls, super::body_wire::ERR_BAD_REQ);
+            emit_nak(s, s.up_cid, super::body_wire::ERR_BAD_REQ);
             return;
         }
     };
     if sid >= ROUTER_STREAMS || s.streams[sid].in_use == 0 {
-        emit_nak(s, syscalls, super::body_wire::ERR_BAD_REQ);
+        emit_nak(s, s.up_cid, super::body_wire::ERR_BAD_REQ);
         return;
     }
     let stream = s.streams[sid];
@@ -960,7 +1012,7 @@ unsafe fn handle_stream_append(s: &mut ModuleState, syscalls: &super::SyscallTab
         Some(i) => i,
         None => {
             abort_stream_members(s, syscalls, sid);
-            emit_nak(s, syscalls, super::body_wire::ERR_IO);
+            emit_nak(s, s.up_cid, super::body_wire::ERR_IO);
             return;
         }
     };
@@ -987,7 +1039,7 @@ unsafe fn handle_stream_append(s: &mut ModuleState, syscalls: &super::SyscallTab
     if j.fail > 0 {
         free_join(s, join_idx);
         abort_stream_members(s, syscalls, sid);
-        emit_nak(s, syscalls, super::body_wire::ERR_IO);
+        emit_nak(s, s.up_cid, super::body_wire::ERR_IO);
     }
 }
 
@@ -1001,12 +1053,12 @@ unsafe fn handle_stream_ctl(
     let sid = match super::body_wire::decode_wid_req(bytes, op) {
         Ok(w) => w as usize,
         Err(_) => {
-            emit_nak(s, syscalls, super::body_wire::ERR_BAD_REQ);
+            emit_nak(s, s.up_cid, super::body_wire::ERR_BAD_REQ);
             return;
         }
     };
     if sid >= ROUTER_STREAMS || s.streams[sid].in_use == 0 {
-        emit_nak(s, syscalls, super::body_wire::ERR_BAD_REQ);
+        emit_nak(s, s.up_cid, super::body_wire::ERR_BAD_REQ);
         return;
     }
     let stream = s.streams[sid];
@@ -1014,7 +1066,7 @@ unsafe fn handle_stream_ctl(
         Some(i) => i,
         None => {
             abort_stream_members(s, syscalls, sid);
-            emit_nak(s, syscalls, super::body_wire::ERR_IO);
+            emit_nak(s, s.up_cid, super::body_wire::ERR_IO);
             return;
         }
     };
@@ -1042,14 +1094,14 @@ unsafe fn handle_stream_ctl(
     if j.fail > 0 && kind == KIND_STREAM_COMMIT {
         free_join(s, join_idx);
         abort_stream_members(s, syscalls, sid);
-        emit_nak(s, syscalls, super::body_wire::ERR_IO);
+        emit_nak(s, s.up_cid, super::body_wire::ERR_IO);
     } else if j.fail == j.need {
         // Abort with every dispatch failed: nothing to wait for.
         free_join(s, join_idx);
         free_stream(s, sid);
         let mut out = [0u8; 1];
         if super::body_wire::encode_wabort_resp(&mut out).is_ok() {
-            let _ = (syscalls.channel_write)(s.admin_out_chan, out.as_ptr(), 1);
+            emit(s, s.up_cid, &out[..1]);
         }
     }
 }
@@ -1061,9 +1113,9 @@ unsafe fn apply_join_response(
     from_target: u8,
     resp: &[u8],
 ) {
-    let (j_op, j_kind) = {
+    let (j_op, j_kind, up_cid) = {
         let j = &s.joins[join_idx as usize];
-        (j.op, j.kind)
+        (j.op, j.kind, j.up_cid)
     };
     let resp_op = super::body_wire::peek_opcode(resp).unwrap_or(0xFF);
     let succeeded = resp_op == j_op;
@@ -1088,11 +1140,9 @@ unsafe fn apply_join_response(
     if j_kind == KIND_ADMIN_SCAN {
         free_join(s, join_idx);
         if succeeded {
-            let n = resp.len().min(s.scratch.len());
-            s.scratch[..n].copy_from_slice(&resp[..n]);
-            let _ = (syscalls.channel_write)(s.admin_out_chan, s.scratch.as_ptr(), n);
+            emit(s, up_cid, resp);
         } else {
-            emit_nak(s, syscalls, nak_errno);
+            emit_nak(s, up_cid, nak_errno);
         }
         return;
     }
@@ -1140,14 +1190,14 @@ unsafe fn apply_join_response(
                 free_join(s, join_idx);
                 let mut out = [0u8; 2];
                 if super::body_wire::encode_wopen_resp(&mut out, sid as u8).is_ok() {
-                    let _ = (syscalls.channel_write)(s.admin_out_chan, out.as_ptr(), 2);
+                    emit(s, up_cid, &out[..2]);
                 }
                 s.upstream_acked = s.upstream_acked.wrapping_add(1);
             }
         } else {
             free_join(s, join_idx);
             abort_stream_members(s, syscalls, sid);
-            emit_nak(s, syscalls, nak_errno);
+            emit_nak(s, up_cid, nak_errno);
             s.upstream_naked = s.upstream_naked.wrapping_add(1);
         }
         return;
@@ -1161,14 +1211,14 @@ unsafe fn apply_join_response(
                 free_join(s, join_idx);
                 let mut out = [0u8; 2];
                 if super::body_wire::encode_wappend_resp(&mut out, sid as u8).is_ok() {
-                    let _ = (syscalls.channel_write)(s.admin_out_chan, out.as_ptr(), 2);
+                    emit(s, up_cid, &out[..2]);
                 }
                 s.upstream_acked = s.upstream_acked.wrapping_add(1);
             }
         } else {
             free_join(s, join_idx);
             abort_stream_members(s, syscalls, sid);
-            emit_nak(s, syscalls, nak_errno);
+            emit_nak(s, up_cid, nak_errno);
             s.upstream_naked = s.upstream_naked.wrapping_add(1);
         }
         return;
@@ -1189,7 +1239,7 @@ unsafe fn apply_join_response(
                 free_stream(s, sid);
                 let mut out = [0u8; 1 + super::body_wire::DIGEST_LEN];
                 if super::body_wire::encode_wcommit_resp(&mut out, &j.digest).is_ok() {
-                    let _ = (syscalls.channel_write)(s.admin_out_chan, out.as_ptr(), out.len());
+                    emit(s, up_cid, &out);
                 }
                 s.upstream_acked = s.upstream_acked.wrapping_add(1);
             }
@@ -1200,7 +1250,7 @@ unsafe fn apply_join_response(
             // resolve by digest, and the digest was never returned.
             free_join(s, join_idx);
             abort_stream_members(s, syscalls, sid);
-            emit_nak(s, syscalls, nak_errno);
+            emit_nak(s, up_cid, nak_errno);
             s.upstream_naked = s.upstream_naked.wrapping_add(1);
         }
         return;
@@ -1216,7 +1266,7 @@ unsafe fn apply_join_response(
                 free_stream(s, sid as usize);
                 let mut out = [0u8; 1];
                 if super::body_wire::encode_wabort_resp(&mut out).is_ok() {
-                    let _ = (syscalls.channel_write)(s.admin_out_chan, out.as_ptr(), 1);
+                    emit(s, up_cid, &out[..1]);
                 }
             }
         }
@@ -1242,12 +1292,12 @@ unsafe fn apply_join_response(
                 // Late responses from the other replicas dequeue
                 // against a freed (or reused) slot; the gen check
                 // in the drain loop drops them as stale.
-                emit_nak(s, syscalls, nak_errno);
+                emit_nak(s, up_cid, nak_errno);
                 free_join(s, join_idx);
                 s.upstream_naked = s.upstream_naked.wrapping_add(1);
             } else if j.ack == j.need {
                 if j.digest_set == 0 {
-                    emit_nak(s, syscalls, super::body_wire::ERR_IO);
+                    emit_nak(s, up_cid, super::body_wire::ERR_IO);
                     s.upstream_naked = s.upstream_naked.wrapping_add(1);
                 } else {
                     let mut out = [0u8; 1 + super::body_wire::DIGEST_LEN];
@@ -1257,7 +1307,7 @@ unsafe fn apply_join_response(
                         super::body_wire::encode_put_resp(&mut out, &j.digest).is_ok()
                     };
                     if enc {
-                        let _ = (syscalls.channel_write)(s.admin_out_chan, out.as_ptr(), out.len());
+                        emit(s, up_cid, &out);
                     }
                     s.upstream_acked = s.upstream_acked.wrapping_add(1);
                 }
@@ -1269,7 +1319,7 @@ unsafe fn apply_join_response(
         // back through the ranked replicas. ─────────────────────
         super::body_wire::OP_GET | super::body_wire::OP_HEAD | super::body_wire::OP_RANGE => {
             if succeeded {
-                let _ = (syscalls.channel_write)(s.admin_out_chan, resp.as_ptr(), resp.len());
+                emit(s, up_cid, resp);
                 s.upstream_acked = s.upstream_acked.wrapping_add(1);
                 let j = s.joins[join_idx as usize];
                 free_join(s, join_idx);
@@ -1332,7 +1382,7 @@ unsafe fn apply_join_response(
                 if j.ack > 0 {
                     let mut out = [0u8; 2];
                     if super::body_wire::encode_delete_resp(&mut out, j.existed != 0).is_ok() {
-                        let _ = (syscalls.channel_write)(s.admin_out_chan, out.as_ptr(), out.len());
+                        emit(s, up_cid, &out);
                     }
                     s.upstream_acked = s.upstream_acked.wrapping_add(1);
                 } else {
@@ -1341,7 +1391,7 @@ unsafe fn apply_join_response(
                     } else {
                         j.last_errno
                     };
-                    emit_nak(s, syscalls, errno);
+                    emit_nak(s, up_cid, errno);
                     s.upstream_naked = s.upstream_naked.wrapping_add(1);
                 }
                 free_join(s, join_idx);
@@ -1349,7 +1399,7 @@ unsafe fn apply_join_response(
         }
 
         _ => {
-            emit_nak(s, syscalls, super::body_wire::ERR_BAD_REQ);
+            emit_nak(s, up_cid, super::body_wire::ERR_BAD_REQ);
             free_join(s, join_idx);
         }
     }
@@ -1443,14 +1493,14 @@ unsafe fn spawn_repair_puts(
 /// lifecycle sweep, and a sweep that cannot see something leaves it
 /// alone. Scrub is what converges the members themselves.
 unsafe fn handle_admin_scan(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) {
-    if s.body_fleet_count == 0 {
-        emit_nak(s, syscalls, super::body_wire::ERR_NOT_FOUND);
+    if s.members.count == 0 {
+        emit_nak(s, s.up_cid, super::body_wire::ERR_NOT_FOUND);
         return;
     }
     let join_idx = match alloc_join(s) {
         Some(i) => i,
         None => {
-            emit_nak(s, syscalls, super::body_wire::ERR_IO);
+            emit_nak(s, s.up_cid, super::body_wire::ERR_IO);
             return;
         }
     };
@@ -1465,13 +1515,17 @@ unsafe fn handle_admin_scan(s: &mut ModuleState, syscalls: &super::SyscallTable,
     s.scratch[..req_n].copy_from_slice(&bytes[..req_n]);
     if !dispatch_to_target(s, syscalls, 0, join_idx, gen, req_n) {
         free_join(s, join_idx);
-        emit_nak(s, syscalls, super::body_wire::ERR_IO);
+        emit_nak(s, s.up_cid, super::body_wire::ERR_IO);
     }
 }
 
 /// Send one SCAN page request to the current scrub target.
 unsafe fn scrub_kick(s: &mut ModuleState, syscalls: &super::SyscallTable) {
-    let target = s.scrub_target % s.body_fleet_count;
+    let target = if s.scrub_target >= s.members.count {
+        0
+    } else {
+        s.scrub_target
+    };
     s.scrub_target = target;
     let join_idx = match alloc_join(s) {
         Some(i) => i,
@@ -1507,8 +1561,9 @@ unsafe fn scrub_kick(s: &mut ModuleState, syscalls: &super::SyscallTable) {
 
 unsafe fn scrub_next_target(s: &mut ModuleState) {
     s.scrub_cursor = 0;
-    if s.body_fleet_count != 0 {
-        s.scrub_target = (s.scrub_target + 1) % s.body_fleet_count;
+    if s.members.count != 0 {
+        let next = s.scrub_target + 1;
+        s.scrub_target = if next >= s.members.count { 0 } else { next };
     }
 }
 
@@ -1553,6 +1608,10 @@ unsafe fn scrub_apply_scan(
 }
 
 /// HEAD-probe every ranked replica of `digest`.
+#[allow(
+    clippy::needless_range_loop,
+    reason = "indexed loops keep the PIC build panic-free: iterator adapters and slice ranges pull core::panicking paths the bare-metal SDK does not carry"
+)]
 unsafe fn scrub_spawn_probe(
     s: &mut ModuleState,
     syscalls: &super::SyscallTable,
@@ -1681,9 +1740,9 @@ unsafe fn scrub_spawn_fetch(s: &mut ModuleState, syscalls: &super::SyscallTable,
     advance_read(s, syscalls, join_idx);
 }
 
-unsafe fn emit_nak(s: &ModuleState, syscalls: &super::SyscallTable, errno: u8) {
+unsafe fn emit_nak(s: &mut ModuleState, cid: u32, errno: u8) {
     let mut buf = [0u8; 2];
     if super::body_wire::encode_nak(&mut buf, errno).is_ok() {
-        let _ = (syscalls.channel_write)(s.admin_out_chan, buf.as_ptr(), buf.len());
+        emit(s, cid, &buf);
     }
 }

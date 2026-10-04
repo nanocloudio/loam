@@ -43,3 +43,70 @@ pub fn hex_val(c: u8) -> Option<u8> {
         _ => None,
     }
 }
+
+/// Order two keys: the root's bytes, then the path's. Bytewise by
+/// index, so the comparison links into a module with no `memcmp`.
+pub fn key_cmp(ra: &[u8], pa: &[u8], rb: &[u8], pb: &[u8]) -> core::cmp::Ordering {
+    match bytes_cmp(ra, rb) {
+        core::cmp::Ordering::Equal => bytes_cmp(pa, pb),
+        o => o,
+    }
+}
+
+/// Bytewise order of two slices; a prefix sorts first.
+pub fn bytes_cmp(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+    let n = if a.len() < b.len() { a.len() } else { b.len() };
+    let mut i = 0;
+    while i < n {
+        if a[i] != b[i] {
+            return if a[i] < b[i] {
+                core::cmp::Ordering::Less
+            } else {
+                core::cmp::Ordering::Greater
+            };
+        }
+        i += 1;
+    }
+    a.len().cmp(&b.len())
+}
+
+/// Whether `b` is well-formed UTF-8: shortest-form sequences, no
+/// surrogates, nothing past U+10FFFF. Written out because a PIC cannot
+/// link `core::str::from_utf8`.
+pub fn utf8_valid(b: &[u8]) -> bool {
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        // The sequence length, and the range its second byte must fall
+        // in to be shortest-form, not a surrogate, and in range.
+        let (n, lo, hi) = match c {
+            0x00..=0x7F => {
+                i += 1;
+                continue;
+            }
+            0xC2..=0xDF => (2, 0x80, 0xBF),
+            0xE0 => (3, 0xA0, 0xBF),
+            0xE1..=0xEC | 0xEE..=0xEF => (3, 0x80, 0xBF),
+            0xED => (3, 0x80, 0x9F),
+            0xF0 => (4, 0x90, 0xBF),
+            0xF1..=0xF3 => (4, 0x80, 0xBF),
+            0xF4 => (4, 0x80, 0x8F),
+            _ => return false,
+        };
+        if b.len() - i < n {
+            return false;
+        }
+        if b[i + 1] < lo || b[i + 1] > hi {
+            return false;
+        }
+        let mut k = 2;
+        while k < n {
+            if b[i + k] & 0xC0 != 0x80 {
+                return false;
+            }
+            k += 1;
+        }
+        i += n;
+    }
+    true
+}

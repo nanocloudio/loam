@@ -10,26 +10,141 @@ hardware_targets = ["bcm2712"]
 # sha256 back to D before it is served.
 
 # Upstream-facing input — admin_router speaks loam_body_wire here.
+# Upstream: body frames from admin_router (`body_frame.rs`).
 [[ports]]
 name = "body_requests"
 direction = "input"
 content_type = "OctetStream"
+buffer_size = 65536
 
-# Upstream-facing output — PutResp / GetResp / NAK back upstream.
-[[ports]]
-name = "body_responses"
-direction = "output"
-content_type = "OctetStream"
-
-# Subscription to placement_router's FleetEpoch broadcast.
+# placement_router's FleetEpoch broadcast; unwired, the fleet is every
+# wired member at epoch 1.
 [[ports]]
 name = "fleet_epoch"
 direction = "input"
 content_type = "OctetStream"
 
-# Per-target body_store request/response channel arrays are wired
-# at instantiation time via channel-port lookup; not enumerable in
-# the manifest port table (same constraint as body_fanout_router).
+[[ports]]
+name = "member0_resp"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 65536
+
+[[ports]]
+name = "member1_resp"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 65536
+
+[[ports]]
+name = "member2_resp"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 65536
+
+[[ports]]
+name = "member3_resp"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 65536
+
+[[ports]]
+name = "member4_resp"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 65536
+
+[[ports]]
+name = "member5_resp"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 65536
+
+[[ports]]
+name = "member6_resp"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 65536
+
+[[ports]]
+name = "member7_resp"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 65536
+
+[[ports]]
+name = "body_responses"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 65536
+
+[[ports]]
+name = "member0_req"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 65536
+
+[[ports]]
+name = "member1_req"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 65536
+
+[[ports]]
+name = "member2_req"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 65536
+
+[[ports]]
+name = "member3_req"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 65536
+
+[[ports]]
+name = "member4_req"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 65536
+
+[[ports]]
+name = "member5_req"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 65536
+
+[[ports]]
+name = "member6_req"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 65536
+
+[[ports]]
+name = "member7_req"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 65536
 
 [observability]
 exempt = "in-arena state counters (ops/errors/scrub tallies) readable by the host harness; typed MSG_METRIC_SAMPLE emission is not wired yet"
+
+# Capacity profiles (modules/common/mechanics/loam_limits.rs). A graph
+# picks one with `variant: <profile>`; the default is the bare-metal
+# budget a Pi 5 / CM5 affords.
+[[variant]]
+name = "embedded"
+features = ["embedded"]
+default = true
+
+[[variant]]
+name = "minimal"
+features = ["minimal"]
+
+[[variant]]
+name = "node"
+features = ["node"]
+
+[[variant]]
+name = "server"
+features = ["server"]

@@ -93,10 +93,32 @@ fn check_strings(strs: &[&[u8]]) -> Result<(), WireError> {
     Ok(())
 }
 
+/// Each descriptor field against its own ceiling: ids and content
+/// hashes are object ids, the namespace a root, the key a path. A key
+/// held to the id ceiling would refuse every path longer than an id,
+/// which the namespace accepts.
+fn check_put(p: &PutFields<'_>) -> Result<(), WireError> {
+    for (s, max) in [
+        (p.id, MAX_STRING),
+        (p.namespace, super::limits::MAX_ROOT),
+        (p.key, super::limits::MAX_PATH),
+        (p.content_hash, MAX_STRING),
+    ] {
+        if s.len() > max {
+            return Err(WireError::StringTooLong { len: s.len(), max });
+        }
+    }
+    Ok(())
+}
+
+/// The largest descriptor record: what a reader must hold.
+pub const PUT_RECORD_MAX: usize =
+    PUT_HEADER + 2 * MAX_STRING + super::limits::MAX_ROOT + super::limits::MAX_PATH;
+
 const PUT_HEADER: usize = 1 + 2 + 2 + 2 + 2 + 8 + 8 + 1 + 1 + 1 + 1 + 1;
 
 fn encode_put_inner(dst: &mut [u8], op: u8, p: &PutFields<'_>) -> Result<usize, WireError> {
-    check_strings(&[p.id, p.namespace, p.key, p.content_hash])?;
+    check_put(p)?;
     let body = p.id.len() + p.namespace.len() + p.key.len() + p.content_hash.len();
     let needed = PUT_HEADER + body;
     if dst.len() < needed {
@@ -175,7 +197,7 @@ fn decode_put_inner(src: &[u8], expected_op: u8) -> Result<PutFields<'_>, WireEr
     let key = &src[c..c + key_len];
     c += key_len;
     let hash = &src[c..c + hash_len];
-    Ok(PutFields {
+    let p = PutFields {
         id,
         namespace: ns,
         key,
@@ -185,7 +207,9 @@ fn decode_put_inner(src: &[u8], expected_op: u8) -> Result<PutFields<'_>, WireEr
         data_class,
         replica_count,
         erasure,
-    })
+    };
+    check_put(&p)?;
+    Ok(p)
 }
 
 pub fn encode_put(dst: &mut [u8], p: &PutFields<'_>) -> Result<usize, WireError> {
@@ -495,6 +519,14 @@ pub fn request_record_len(src: &[u8]) -> Result<Option<usize>, WireError> {
             let mut total = PUT_HEADER;
             for at in [1usize, 3, 5, 7] {
                 total += u16::from_le_bytes([src[at], src[at + 1]]) as usize;
+            }
+            // A record no reader could hold would wait forever for the
+            // rest of itself.
+            if total > PUT_RECORD_MAX {
+                return Err(WireError::StringTooLong {
+                    len: total,
+                    max: PUT_RECORD_MAX,
+                });
             }
             Ok(if src.len() >= total {
                 Some(total)

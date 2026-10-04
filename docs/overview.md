@@ -10,17 +10,16 @@ changes.
 
 ## Start here
 
-- [running.md](running.md) — validated bring-up: the body-plane
-  smoke graph, the CLI, the `loam-server` daemon, and the replicated
-  shapes
+- [running.md](running.md) — bring-up: the body-plane smoke graph,
+  the services, the operator applet, and the replicated shapes
 - [architecture.md](architecture.md) — layout, the two-plane model,
   durability, and how the design scales
 
 ## Architecture reference
 
-- [architecture.md](architecture.md) — repository layout, the
-  vocabulary crate, PIC durability, the two-plane model, arena
-  scaling, topology invariance
+- [architecture.md](architecture.md) — repository layout, graphs as
+  configuration, PIC durability, sessions and authority, the
+  two-plane model, arena scaling, topology invariance
 - [native_fluxor.md](native_fluxor.md) — how loam sits on fluxor:
   surface visibility, the step contract, the WAL write path, and the
   operational rules bare-metal bring-up imposes
@@ -32,5 +31,7 @@ changes.
 
 ## Guides
 
-- [running.md](running.md) — bring-up, smoke checks, daemon surfaces,
+- [running.md](running.md) — bring-up, smoke checks, the services,
   replicated deployment shapes
+- [limit_register.md](limit_register.md) — every ceiling, per
+  capacity profile, and what refuses past it

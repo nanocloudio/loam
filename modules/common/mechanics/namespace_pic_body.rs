@@ -26,7 +26,7 @@
 // WAL is replayed straight into it on init, so the cap is the total
 // live binding budget per PIC instance, not just a hot cache size.
 // Bump per-instance for larger working sets; multi-PIC deployments
-// shard further by partition (see `src/placement.rs`).
+// shard further by partition (`loam_placement.rs`).
 // ModuleState is dominated by the arena: `BindingSlot` is 384 B on
 // the embedded profile, so 256 slots is ~96 KiB of the ~116 KiB the
 // whole struct occupies there, the rest being the reassembly buffers
@@ -58,7 +58,8 @@ const READ_BUF: usize = 256;
 /// budget plus one more read, so refilling never starves the step: a
 /// buffer that only fits two reads caps intake at two records per step
 /// regardless of what the budget allows.
-const REQ_ASM: usize = READ_BUF * (super::limits::OPS_PER_STEP as usize + 1);
+const REQ_ASM: usize =
+    super::wire::REQUEST_RECORD_MAX + READ_BUF * (super::limits::OPS_PER_STEP as usize + 1);
 
 /// Inline WAL-path buffer in `ModuleState`. The TLV parameter
 /// handler populates this; the PIC mod.rs uses it to drive
@@ -68,7 +69,7 @@ pub const WAL_PATH_BUF: usize = 256;
 
 /// The namespace PIC answers with a 1-byte ack or an encoded lookup /
 /// list / referenced response, all bounded by a read buffer.
-pub type Reply = super::reply_out::ReplyOut<READ_BUF>;
+pub type Reply = super::reply_out::ReplyOut<{ super::wire::LIST_RESP_MAX }>;
 
 #[repr(C)]
 pub struct ModuleState {
@@ -206,8 +207,13 @@ pub struct ModuleState {
     pub cmp_writer_gen: u64,
     pub cmp_snap_idx: u32,
     pub cmp_last_key_valid: u8,
-    pub cmp_last_ns: u64,
-    pub cmp_last_path: u64,
+    /// The key the merge last emitted from the arena: root, then path.
+    pub cmp_last_root_len: u8,
+    pub cmp_last_root: [u8; super::limits::MAX_ROOT],
+    pub cmp_last_path_len: u16,
+    pub cmp_last_path: [u8; super::limits::MAX_PATH],
+    /// One listing page being built.
+    pub list_scratch: [u8; super::wire::LIST_RESP_MAX],
     pub snapshots_written: u32,
     pub evictions: u32,
     pub snap_misses: u32,
@@ -405,34 +411,34 @@ pub unsafe fn open_and_replay_wal(state_ptr: *mut u8, wal_path: &[u8]) -> i32 {
     0
 }
 
-/// Populate `state.wal_path[..wal_path_len]` from the kernel-
-/// supplied params blob. Two recognized encodings:
+/// Populate `state.wal_path[..wal_path_len]` from the kernel-supplied
+/// params blob (`wal_io::decode_wal_path`): 0 with the path set, or
+/// with none for a channel-only module; `-22` when the blob is not a
+/// TLV block or its path does not fit, which `module_new` refuses
+/// rather than run without the log the graph asked for.
 ///
-/// 1. TLV (`[0xFE, 0x01, payload_len:u16 LE, entries…]`) — what
-///    the fluxor build tool packs from YAML
-///    `params: { wal_path: "..." }`. We scan for `tag=1` and copy
-///    its bytes verbatim.
-/// 2. Raw byte string — direct path; backward-compat path for
-///    host test harnesses that pre-date the TLV schema.
+/// This decoder lives in the body file (rather than mod.rs) so host
+/// tests can drive it through the path-included `body` module. The
+/// PIC mod.rs's `define_params!` owns the schema metadata embedded in
+/// `.param_schema` for the fluxor build tool.
 ///
-/// Empty/null `params` leaves the state in channel-only mode.
-///
-/// This decoder lives in the body file (rather than mod.rs) so
-/// host tests can drive it through the path-included `body`
-/// module. The PIC mod.rs's `define_params!` still owns the
-/// schema metadata embedded in `.param_schema` for the fluxor
-/// build tool.
-///
-/// SAFETY: `state_ptr` must reference an initialized
-/// `ModuleState`; `params` must be a valid byte slice for the
-/// duration of the call.
-pub unsafe fn decode_wal_path_params(state_ptr: *mut u8, params: *const u8, params_len: usize) {
+/// SAFETY: `state_ptr` must reference an initialized `ModuleState`;
+/// `params` must be a valid byte slice for the duration of the call.
+pub unsafe fn decode_wal_path_params(
+    state_ptr: *mut u8,
+    params: *const u8,
+    params_len: usize,
+) -> i32 {
     if state_ptr.is_null() {
-        return;
+        return -22;
     }
     let s = &mut *(state_ptr as *mut ModuleState);
-    if let Some(n) = super::wal::decode_wal_path(params, params_len, &mut s.wal_path) {
-        s.wal_path_len = n as u16;
+    match super::wal::decode_wal_path(params, params_len, &mut s.wal_path) {
+        Ok(n) => {
+            s.wal_path_len = n as u16;
+            0
+        }
+        Err(()) => -22,
     }
 }
 
@@ -1006,49 +1012,58 @@ unsafe fn handle_lookup(s: &mut ModuleState, syscalls: &super::SyscallTable, byt
             return;
         }
     };
-    let (ns_h, p_h) = super::state::key_hash(req.namespace_root, req.path);
-    let arena_hit = s
-        .bindings
-        .lookup_hashed(ns_h, p_h, req.namespace_root, req.path)
-        .copied();
-    let n = match arena_hit {
-        Some(slot) if slot.kind == super::state::KIND_TOMBSTONE => {
-            // A tombstone masks any on-disk snapshot record.
-            super::wire::encode_lookup_not_found(&mut s.append_scratch)
-        }
-        Some(slot) => {
-            let oid = slot.object_id();
-            super::wire::encode_lookup_found(&mut s.append_scratch, oid, slot.revision, slot.kind)
-        }
-        None if s.snap_active != 0 => {
-            // MISS PATH: binary-search the on-disk snapshot —
-            // the arena is a hot cache, not the whole set.
-            let snap = super::snapshot::OpenSnapshot {
-                fd: s.snap_fd,
-                count: s.snap_count,
-                generation: s.snap_gen,
+    let n = match current(s, syscalls, req.namespace_root, req.path) {
+        Some(Current::Arena(slot)) if slot.kind != super::state::KIND_TOMBSTONE => {
+            let b = super::wire::Binding {
+                object_id: slot.object_id(),
+                revision: slot.revision,
+                kind: slot.kind,
+                meta: wire_meta(&slot.meta()),
             };
-            match super::snapshot::snap_search(syscalls, &snap, ns_h, p_h) {
-                Some(rec) => {
-                    s.snap_misses = s.snap_misses.wrapping_add(1);
-                    super::wire::encode_lookup_found(
-                        &mut s.append_scratch,
-                        &rec.oid[..rec.oid_len as usize],
-                        rec.revision,
-                        rec.kind,
-                    )
-                }
-                None => super::wire::encode_lookup_not_found(&mut s.append_scratch),
-            }
+            super::wire::encode_lookup_found(&mut s.list_scratch, &b)
         }
-        None => super::wire::encode_lookup_not_found(&mut s.append_scratch),
+        Some(Current::Snapshot(rec)) => {
+            s.snap_misses = s.snap_misses.wrapping_add(1);
+            let b = super::wire::Binding {
+                object_id: rec.oid(),
+                revision: rec.revision,
+                kind: rec.kind,
+                meta: super::wire::BindMeta {
+                    stamp_ms: rec.stamp_ms,
+                    size: rec.size,
+                    content_type: rec.content_type(),
+                },
+            };
+            super::wire::encode_lookup_found(&mut s.list_scratch, &b)
+        }
+        // A tombstone masks any on-disk record, and its revision is
+        // what a write must exceed.
+        Some(Current::Arena(slot)) => {
+            super::wire::encode_lookup_not_found(&mut s.list_scratch, slot.revision)
+        }
+        None => super::wire::encode_lookup_not_found(&mut s.list_scratch, 0),
+        Some(Current::Unreadable) => {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            respond(s, syscalls, 0xFF);
+            return;
+        }
     };
+    send_list_scratch(s, syscalls, n);
+}
+
+/// Answer with the record built in `list_scratch`, or a refusal when it
+/// could not be built.
+unsafe fn send_list_scratch(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    n: Result<usize, super::wire::WireError>,
+) {
     match n {
         Ok(n) => {
             if s.out_chan >= 0 {
                 let _ = s
                     .reply
-                    .send(syscalls.channel_write, s.out_chan, &s.append_scratch[..n]);
+                    .send(syscalls.channel_write, s.out_chan, &s.list_scratch[..n]);
             }
         }
         Err(_) => {
@@ -1058,9 +1073,171 @@ unsafe fn handle_lookup(s: &mut ModuleState, syscalls: &super::SyscallTable, byt
     }
 }
 
-/// Serve a LIST request: one page of the namespace's listable
-/// paths from the arena. Read-only, channel-only, cursor-paged —
-/// same discipline as LOOKUP.
+fn wire_meta<'a>(m: &super::state::Meta<'a>) -> super::wire::BindMeta<'a> {
+    super::wire::BindMeta {
+        stamp_ms: m.stamp_ms,
+        size: m.size,
+        content_type: m.content_type,
+    }
+}
+
+/// Where a key's current state lives.
+#[derive(Clone, Copy)]
+enum Current {
+    /// The arena holds it — a live binding or a tombstone. The arena is
+    /// authoritative for any key it holds.
+    Arena(super::state::BindingSlot),
+    /// Only the on-disk snapshot holds it.
+    Snapshot(super::snapshot::SnapRecord),
+    /// The snapshot could not be read, so nothing can be said.
+    Unreadable,
+}
+
+/// The current state of `(root, path)`: the arena's entry, else the
+/// snapshot's record, else `None` (never bound, or a deletion compaction
+/// has since dropped).
+unsafe fn current(
+    s: &ModuleState,
+    syscalls: &super::SyscallTable,
+    root: &[u8],
+    path: &[u8],
+) -> Option<Current> {
+    let (ns_h, p_h) = super::state::key_hash(root, path);
+    if let Some(slot) = s.bindings.lookup_hashed(ns_h, p_h, root, path) {
+        return Some(Current::Arena(*slot));
+    }
+    if s.snap_active == 0 {
+        return None;
+    }
+    let snap = super::snapshot::OpenSnapshot {
+        fd: s.snap_fd,
+        count: s.snap_count,
+        generation: s.snap_gen,
+    };
+    super::snapshot::snap_search(syscalls, &snap, root, path).map(Current::Snapshot)
+}
+
+/// One entry of a name-ordered walk: its path and binding.
+struct Listed<'a> {
+    path: &'a [u8],
+    binding: super::wire::Binding<'a>,
+}
+
+/// Walk the live bindings under `root` whose path starts with `prefix`
+/// and sorts after `after`, in name order, merging the arena (which
+/// wins for any key it holds, a tombstone hiding it) with the snapshot.
+/// `take` answers whether it took an entry; a `false` stops the walk
+/// without consuming it. Returns whether entries remain, or `None` when
+/// the snapshot could not be read — a listing that skipped part of it
+/// would be wrong rather than short.
+unsafe fn walk_ordered(
+    s: &ModuleState,
+    syscalls: &super::SyscallTable,
+    root: &[u8],
+    prefix: &[u8],
+    after: &[u8],
+    mut take: impl FnMut(&Listed<'_>) -> bool,
+) -> Option<bool> {
+    let snap = super::snapshot::OpenSnapshot {
+        fd: s.snap_fd,
+        count: s.snap_count,
+        generation: s.snap_gen,
+    };
+    let snap_on = s.snap_active != 0 && s.snap_count > 0;
+    let mut cur_path = [0u8; super::limits::MAX_PATH];
+    let mut cur_len = after.len();
+    cur_path[..cur_len].copy_from_slice(after);
+    let mut idx = if snap_on {
+        super::snapshot::snap_seek_after(syscalls, &snap, root, after)?
+    } else {
+        0
+    };
+    loop {
+        let after_now = &cur_path[..cur_len];
+        let a = s.bindings.next_listed(root, prefix, after_now);
+        // The snapshot's next record in range, if any.
+        let mut b: Option<super::snapshot::SnapRecord> = None;
+        while snap_on && idx < snap.count {
+            let rec = super::snapshot::snap_read_at(syscalls, &snap, idx)?;
+            if super::hash::bytes_cmp(rec.root(), root) != core::cmp::Ordering::Equal {
+                break;
+            }
+            let p = rec.path();
+            if super::hash::bytes_cmp(p, after_now) != core::cmp::Ordering::Greater
+                || super::hash::bytes_cmp(p, prefix) == core::cmp::Ordering::Less
+            {
+                idx += 1;
+                continue;
+            }
+            if p.starts_with(prefix) {
+                b = Some(rec);
+            }
+            break;
+        }
+        let (from_arena, path_len) = match (a, &b) {
+            (None, None) => return Some(false),
+            (Some(i), None) => (Some(i), s.bindings.slot_ref(i)?.path_len as usize),
+            (None, Some(rec)) => (None, rec.path_len as usize),
+            (Some(i), Some(rec)) => {
+                let slot = s.bindings.slot_ref(i)?;
+                match super::hash::bytes_cmp(slot.path(), rec.path()) {
+                    core::cmp::Ordering::Greater => (None, rec.path_len as usize),
+                    order => {
+                        if order == core::cmp::Ordering::Equal {
+                            // The arena's entry supersedes the record.
+                            idx += 1;
+                        }
+                        (Some(i), slot.path_len as usize)
+                    }
+                }
+            }
+        };
+        let took = match from_arena {
+            Some(i) => {
+                let slot = s.bindings.slot_ref(i)?;
+                cur_path[..path_len].copy_from_slice(slot.path());
+                if slot.kind == super::state::KIND_TOMBSTONE {
+                    true
+                } else {
+                    take(&Listed {
+                        path: slot.path(),
+                        binding: super::wire::Binding {
+                            object_id: slot.object_id(),
+                            revision: slot.revision,
+                            kind: slot.kind,
+                            meta: wire_meta(&slot.meta()),
+                        },
+                    })
+                }
+            }
+            None => {
+                let rec = b?;
+                idx += 1;
+                cur_path[..path_len].copy_from_slice(rec.path());
+                take(&Listed {
+                    path: rec.path(),
+                    binding: super::wire::Binding {
+                        object_id: rec.oid(),
+                        revision: rec.revision,
+                        kind: rec.kind,
+                        meta: super::wire::BindMeta {
+                            stamp_ms: rec.stamp_ms,
+                            size: rec.size,
+                            content_type: rec.content_type(),
+                        },
+                    },
+                })
+            }
+        };
+        if !took {
+            return Some(true);
+        }
+        cur_len = path_len;
+    }
+}
+
+/// Serve a LIST request: one page of a root's live bindings under a
+/// prefix, in name order after a cursor. Read-only, channel-only.
 unsafe fn handle_list(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) {
     let req = match super::wire::decode_list_req(bytes) {
         Ok(r) => r,
@@ -1070,93 +1247,26 @@ unsafe fn handle_list(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes
             return;
         }
     };
-    let max = (req.max as usize).min(super::wire::MAX_LIST_PAGE);
-    let mut paths_buf = [[0u8; super::state::MAX_LIST_PATH]; super::wire::MAX_LIST_PAGE];
-    let mut lens = [0usize; super::wire::MAX_LIST_PAGE];
-    let mut count = 0usize;
-    // Cursor space: [0, capacity) walks the arena, then
-    // [capacity, capacity + snap_count) walks the snapshot,
-    // skipping records the arena already answered for (its entry
-    // — live or tombstone — is authoritative).
-    let arena_cap = s.bindings.capacity() as u32;
-    let next_cursor = if req.cursor < arena_cap {
-        let nc = s
-            .bindings
-            .list_page(req.namespace_root, req.cursor, max, |path| {
-                if count < super::wire::MAX_LIST_PAGE {
-                    let take = path.len().min(super::state::MAX_LIST_PATH);
-                    paths_buf[count][..take].copy_from_slice(&path[..take]);
-                    lens[count] = take;
-                    count += 1;
-                }
-            });
-        if nc != 0 {
-            nc
-        } else if s.snap_active != 0 && s.snap_count > 0 {
-            arena_cap // continue into the snapshot region
-        } else {
-            0
-        }
-    } else {
-        req.cursor
+    let max = (req.max as usize).clamp(1, super::wire::MAX_LIST_PAGE);
+    let scratch: &mut [u8] = &mut *(&mut s.list_scratch[..] as *mut [u8]);
+    let Some(mut w) = super::wire::ListWriter::new(scratch) else {
+        respond(s, syscalls, 0xFF);
+        return;
     };
-    let next_cursor = if next_cursor >= arena_cap && s.snap_active != 0 {
-        let ns_h = super::state::fnv1a64(req.namespace_root);
-        let snap = super::snapshot::OpenSnapshot {
-            fd: s.snap_fd,
-            count: s.snap_count,
-            generation: s.snap_gen,
-        };
-        let mut idx = next_cursor - arena_cap;
-        while idx < s.snap_count && count < max {
-            match super::snapshot::snap_read_at(syscalls, &snap, idx) {
-                Some(rec) => {
-                    idx += 1;
-                    if rec.ns_hash != ns_h
-                        || rec.path_len == 0
-                        || s.bindings
-                            .lookup_hashed(
-                                rec.ns_hash,
-                                rec.path_hash,
-                                &rec.root[..rec.root_len as usize],
-                                &rec.path[..rec.path_len as usize],
-                            )
-                            .is_some()
-                    {
-                        continue;
-                    }
-                    let take = (rec.path_len as usize).min(super::state::MAX_LIST_PATH);
-                    paths_buf[count][..take].copy_from_slice(&rec.path[..take]);
-                    lens[count] = take;
-                    count += 1;
-                }
-                None => {
-                    idx = s.snap_count;
-                    break;
-                }
-            }
+    let more = walk_ordered(
+        s,
+        syscalls,
+        req.namespace_root,
+        req.prefix,
+        req.after,
+        |e| w.count() < max && w.push(e.path, &e.binding),
+    );
+    match more {
+        Some(more) => {
+            let n = w.finish(more);
+            send_list_scratch(s, syscalls, Ok(n));
         }
-        if idx >= s.snap_count {
-            0
-        } else {
-            arena_cap + idx
-        }
-    } else {
-        next_cursor
-    };
-    let mut slices: [&[u8]; super::wire::MAX_LIST_PAGE] = [&[]; super::wire::MAX_LIST_PAGE];
-    for i in 0..count {
-        slices[i] = &paths_buf[i][..lens[i]];
-    }
-    match super::wire::encode_list_resp(&mut s.append_scratch, next_cursor, &slices[..count]) {
-        Ok(n) => {
-            if s.out_chan >= 0 {
-                let _ = s
-                    .reply
-                    .send(syscalls.channel_write, s.out_chan, &s.append_scratch[..n]);
-            }
-        }
-        Err(_) => {
+        None => {
             s.apply_errors = s.apply_errors.wrapping_add(1);
             respond(s, syscalls, 0xFF);
         }
@@ -1264,6 +1374,8 @@ unsafe fn respond_applied(
         Ok(op) => respond(s, syscalls, op),
         Err(ApplyFault::Reserved) => respond(s, syscalls, NAK_RESERVED),
         Err(ApplyFault::Fenced) => respond(s, syscalls, super::wire::NAK_FENCED),
+        Err(ApplyFault::Condition) => respond(s, syscalls, super::wire::NAK_CONDITION),
+        Err(ApplyFault::Stale) => respond(s, syscalls, super::wire::NAK_STALE),
         Err(ApplyFault::Rejected) => respond(s, syscalls, 0xFF),
     }
 }
@@ -1279,15 +1391,20 @@ enum ApplyFault {
     /// like `Reserved`, and answered distinctly so a caller can tell a
     /// fenced refusal from an absent key.
     Fenced,
+    /// A record's condition did not hold — decided in log order, like
+    /// `Reserved`.
+    Condition,
+    /// A record's revision is not above the key's current one: a write
+    /// that lost a race, or one already applied and since superseded.
+    Stale,
     Rejected,
 }
 
 /// Apply one op with snapshot semantics wrapped around the pure
 /// arena apply:
 ///
-/// - UNBIND with an active snapshot TOMBSTONES (masking the
-///   on-disk record) instead of clearing, at the binding's
-///   current revision so a later re-bind wins normally.
+/// - UNBIND TOMBSTONES the key at the record's revision, which masks
+///   any on-disk record and is what a later bind must exceed.
 /// - a full arena evicts one snapshot-covered slot and retries
 ///   (never while the compactor is mid-merge — eviction before
 ///   the new generation is durable would serve stale reads).
@@ -1398,6 +1515,67 @@ unsafe fn apply_op(
         {
             return Err(ApplyFault::Fenced);
         }
+        // Decided against the key's current state, wherever it lives,
+        // so a key the arena evicted to the snapshot is gated exactly
+        // as one it holds.
+        let (cur_rev, live, same) = match current(s, syscalls, dec.namespace_root, dec.path) {
+            Some(Current::Arena(slot)) => (
+                slot.revision,
+                slot.kind != super::state::KIND_TOMBSTONE,
+                slot.kind == dec.kind && slot.object_id() == dec.object_id,
+            ),
+            Some(Current::Snapshot(rec)) => (
+                rec.revision,
+                true,
+                rec.kind == dec.kind && rec.oid() == dec.object_id,
+            ),
+            Some(Current::Unreadable) => return Err(ApplyFault::Rejected),
+            None => (0, false, false),
+        };
+        if dec.revision <= cur_rev {
+            // The same write applied again is done, not a conflict.
+            if live && dec.revision == cur_rev && same {
+                return Ok(super::wire::OP_BIND);
+            }
+            return Err(ApplyFault::Stale);
+        }
+        match dec.cond {
+            super::wire::COND_ABSENT if live => return Err(ApplyFault::Condition),
+            super::wire::COND_REVISION if cur_rev != dec.expect => {
+                return Err(ApplyFault::Condition)
+            }
+            _ => {}
+        }
+        let meta = super::state::Meta {
+            stamp_ms: dec.meta.stamp_ms,
+            size: dec.meta.size,
+            content_type: dec.meta.content_type,
+        };
+        let mut res = s.bindings.bind(
+            dec.namespace_root,
+            dec.path,
+            dec.object_id,
+            dec.kind,
+            dec.revision,
+            &meta,
+        );
+        if res == Err(super::state::ApplyError::OutOfCapacity)
+            && s.snap_active != 0
+            && s.bindings.evict_one_snapshotted()
+        {
+            s.evictions = s.evictions.wrapping_add(1);
+            res = s.bindings.bind(
+                dec.namespace_root,
+                dec.path,
+                dec.object_id,
+                dec.kind,
+                dec.revision,
+                &meta,
+            );
+        }
+        return res
+            .map(|_| super::wire::OP_BIND)
+            .map_err(|_| ApplyFault::Rejected);
     }
     if op == super::wire::OP_RENAME {
         let dec = super::wire::decode_rename(payload).map_err(|_| ApplyFault::Rejected)?;
@@ -1412,10 +1590,29 @@ unsafe fn apply_op(
         if is_volume_binding(s, syscalls, dec.namespace_root, dec.path) {
             return Err(ApplyFault::Fenced);
         }
-        if s.snap_active != 0 {
-            return remove_binding(s, syscalls, dec.namespace_root, dec.path)
-                .map(|_| super::wire::OP_UNBIND);
+        let (cur_rev, live) = match current(s, syscalls, dec.namespace_root, dec.path) {
+            Some(Current::Arena(slot)) => {
+                (slot.revision, slot.kind != super::state::KIND_TOMBSTONE)
+            }
+            Some(Current::Snapshot(rec)) => (rec.revision, true),
+            Some(Current::Unreadable) => return Err(ApplyFault::Rejected),
+            None => (0, false),
+        };
+        if !live {
+            // Already gone at this revision: the same delete again.
+            if cur_rev == dec.revision && dec.revision != 0 {
+                return Ok(super::wire::OP_UNBIND);
+            }
+            return Err(ApplyFault::Rejected);
         }
+        if dec.revision <= cur_rev {
+            return Err(ApplyFault::Stale);
+        }
+        if dec.cond == super::wire::COND_REVISION && cur_rev != dec.expect {
+            return Err(ApplyFault::Condition);
+        }
+        return remove_binding(s, dec.namespace_root, dec.path, dec.revision)
+            .map(|_| super::wire::OP_UNBIND);
     }
     match apply_to_arena(&mut s.bindings, payload) {
         Ok(op) => Ok(op),
@@ -1480,39 +1677,17 @@ unsafe fn is_volume_binding(
     )
 }
 
-/// Remove a binding, tombstoning it at its current revision while an
-/// on-disk snapshot may still hold a record for it.
+/// Remove a binding: the key is tombstoned at `revision`. The tombstone
+/// masks any on-disk record for the key, and its revision is what a
+/// later bind must exceed, so a bind redelivered from before the delete
+/// is refused rather than reviving the key. Compaction drops it once the
+/// snapshot no longer holds the key.
 unsafe fn remove_binding(
     s: &mut ModuleState,
-    syscalls: &super::SyscallTable,
     namespace_root: &[u8],
     path: &[u8],
+    revision: u64,
 ) -> Result<(), ApplyFault> {
-    if s.snap_active == 0 {
-        return s
-            .bindings
-            .unbind(namespace_root, path)
-            .map(|_| ())
-            .map_err(|_| ApplyFault::Rejected);
-    }
-    let (ns_h, p_h) = super::state::key_hash(namespace_root, path);
-    let revision = match s.bindings.lookup_hashed(ns_h, p_h, namespace_root, path) {
-        Some(slot) if slot.kind == super::state::KIND_TOMBSTONE => {
-            return Err(ApplyFault::Rejected)
-        }
-        Some(slot) => slot.revision,
-        None => {
-            let snap = super::snapshot::OpenSnapshot {
-                fd: s.snap_fd,
-                count: s.snap_count,
-                generation: s.snap_gen,
-            };
-            match super::snapshot::snap_search(syscalls, &snap, ns_h, p_h) {
-                Some(rec) => rec.revision,
-                None => return Err(ApplyFault::Rejected),
-            }
-        }
-    };
     let mut res = s.bindings.tombstone(namespace_root, path, revision);
     if res == Err(super::state::ApplyError::OutOfCapacity) && s.bindings.evict_one_snapshotted() {
         s.evictions = s.evictions.wrapping_add(1);
@@ -1521,10 +1696,10 @@ unsafe fn remove_binding(
     res.map(|_| ()).map_err(|_| ApplyFault::Rejected)
 }
 
-/// The binding a volume record is judged against: its revision, whether
-/// it is a volume, and whether it already names `object_id` as one.
-/// `None` when the path is unbound or tombstoned. The arena is authoritative for any
-/// key it holds; otherwise the on-disk snapshot answers, as for LOOKUP.
+/// Is `(namespace_root, path)` bound, live, and if so at what revision,
+/// as a volume, and to `object_id`? The arena is authoritative for a
+/// key it holds, tombstone included; otherwise the on-disk snapshot
+/// answers.
 unsafe fn volume_binding(
     s: &ModuleState,
     syscalls: &super::SyscallTable,
@@ -1552,10 +1727,9 @@ unsafe fn volume_binding(
         count: s.snap_count,
         generation: s.snap_gen,
     };
-    let rec = super::snapshot::snap_search(syscalls, &snap, ns_h, p_h)?;
-    let oid = &rec.oid[..(rec.oid_len as usize).min(rec.oid.len())];
+    let rec = super::snapshot::snap_search(syscalls, &snap, namespace_root, path)?;
     let volume = rec.kind == super::wire::KIND_VOLUME;
-    Some((rec.revision, volume, volume && oid == object_id))
+    Some((rec.revision, volume, volume && rec.oid() == object_id))
 }
 
 /// Decide one volume record. Everything it reads is in the record, the
@@ -1648,9 +1822,19 @@ unsafe fn judge_volume(
                 return (super::wire::VOLUME_BAD_REQ, cur_rev);
             }
             let _ = s.leases.set_flushing(root, path, &req.holder, false);
-            let mut res =
-                s.bindings
-                    .commit_bind(root, path, req.object_id, super::wire::KIND_VOLUME, next);
+            let meta = super::state::Meta {
+                stamp_ms: req.now_ms,
+                size: 0,
+                content_type: &[],
+            };
+            let mut res = s.bindings.commit_bind(
+                root,
+                path,
+                req.object_id,
+                super::wire::KIND_VOLUME,
+                next,
+                &meta,
+            );
             if res == Err(super::state::ApplyError::OutOfCapacity)
                 && s.snap_active != 0
                 && s.bindings.evict_one_snapshotted()
@@ -1662,6 +1846,7 @@ unsafe fn judge_volume(
                     req.object_id,
                     super::wire::KIND_VOLUME,
                     next,
+                    &meta,
                 );
             }
             match res {
@@ -1679,7 +1864,7 @@ unsafe fn judge_volume(
                 Some((_, false, _)) => return (super::wire::VOLUME_BAD_REQ, cur_rev),
                 _ => return (super::wire::VOLUME_CONFLICT, cur_rev),
             }
-            match remove_binding(s, syscalls, root, path) {
+            match remove_binding(s, root, path, req.expected + 1) {
                 Ok(()) => (super::wire::VOLUME_OK, req.expected),
                 Err(_) => (super::wire::VOLUME_BAD_REQ, cur_rev),
             }
@@ -1789,21 +1974,36 @@ unsafe fn handle_volume_roots(s: &mut ModuleState, syscalls: &super::SyscallTabl
 }
 
 /// Build a snapshot record from an arena slot (field widths align
-/// by construction: MAX_OBJECT_ID/MAX_LIST_ROOT/MAX_LIST_PATH ==
-/// the snapshot's MAX_OID/MAX_ROOT/MAX_PATH).
+/// by construction: the slot's and the record's ceilings are the same
+/// `loam_limits.rs` names).
 fn snap_record_from_slot(slot: &super::state::BindingSlot) -> super::snapshot::SnapRecord {
     let mut r = super::snapshot::SnapRecord::empty();
-    r.ns_hash = slot.namespace_hash;
-    r.path_hash = slot.path_hash;
-    r.revision = slot.revision;
-    r.kind = slot.kind;
-    r.oid_len = slot.object_id_len;
-    r.oid = slot.object_id_bytes;
     r.root_len = slot.root_len;
     r.root = slot.root_bytes;
     r.path_len = slot.path_len;
     r.path = slot.path_bytes;
+    r.revision = slot.revision;
+    r.kind = slot.kind;
+    r.oid_len = slot.object_id_len;
+    r.oid = slot.object_id_bytes;
+    r.stamp_ms = slot.stamp_ms;
+    r.size = slot.size;
+    r.ctype_len = slot.ctype_len;
+    r.ctype = slot.ctype_bytes;
     r
+}
+
+/// The merge has written every key up to `(root, path)`. The arena is
+/// read from above it from now on: a key bound between steps that sorts
+/// below it — whichever side wrote the last record — waits for the next
+/// generation, so the one being written stays in order and holds each
+/// key once.
+fn set_merge_cursor(s: &mut ModuleState, root: &[u8], path: &[u8]) {
+    s.cmp_last_root[..root.len()].copy_from_slice(root);
+    s.cmp_last_root_len = root.len() as u8;
+    s.cmp_last_path[..path.len()].copy_from_slice(path);
+    s.cmp_last_path_len = path.len() as u16;
+    s.cmp_last_key_valid = 1;
 }
 
 unsafe fn compaction_abort(s: &mut ModuleState, syscalls: &super::SyscallTable) {
@@ -1884,12 +2084,17 @@ unsafe fn compaction_step(s: &mut ModuleState, syscalls: &super::SyscallTable) {
         generation: s.cmp_writer_gen,
     };
     for _ in 0..CMP_RECORDS_PER_STEP {
-        let last = if s.cmp_last_key_valid != 0 {
-            Some((s.cmp_last_ns, s.cmp_last_path))
-        } else {
-            None
+        let arena_next = {
+            let last = if s.cmp_last_key_valid != 0 {
+                Some((
+                    &s.cmp_last_root[..s.cmp_last_root_len as usize],
+                    &s.cmp_last_path[..s.cmp_last_path_len as usize],
+                ))
+            } else {
+                None
+            };
+            s.bindings.min_key_above(last)
         };
-        let arena_next = s.bindings.min_key_above(last);
         let old_next = if s.snap_active != 0 && s.cmp_snap_idx < s.snap_count {
             match super::snapshot::snap_read_at(syscalls, &old_snap, s.cmp_snap_idx) {
                 Some(r) => Some(r),
@@ -1976,19 +2181,21 @@ unsafe fn compaction_step(s: &mut ModuleState, syscalls: &super::SyscallTable) {
                 s.snapshots_written = s.snapshots_written.wrapping_add(1);
                 return;
             }
-            (Some((idx, key)), old) => {
-                let take_arena = match &old {
-                    Some(rec) => key <= rec.key(),
-                    None => true,
+            (Some(idx), old) => {
+                let slot = match s.bindings.slot_ref(idx) {
+                    Some(sl) => *sl,
+                    None => {
+                        compaction_abort(s, syscalls);
+                        return;
+                    }
                 };
-                if take_arena {
-                    let slot = match s.bindings.slot_ref(idx) {
-                        Some(sl) => *sl,
-                        None => {
-                            compaction_abort(s, syscalls);
-                            return;
-                        }
-                    };
+                let order = match &old {
+                    Some(rec) => rec.cmp_key(slot.root(), slot.path()),
+                    None => core::cmp::Ordering::Greater,
+                };
+                if order != core::cmp::Ordering::Less {
+                    // The arena's key comes first, or is the same key:
+                    // the arena's entry is the newer.
                     if slot.kind != super::state::KIND_TOMBSTONE {
                         let rec = snap_record_from_slot(&slot);
                         if !super::snapshot::snap_writer_append(syscalls, &mut writer, &rec) {
@@ -2000,20 +2207,17 @@ unsafe fn compaction_step(s: &mut ModuleState, syscalls: &super::SyscallTable) {
                     // only when this generation is durable.
                     let tag = (s.cmp_writer_gen % 251 + 1) as u8;
                     s.bindings.mark_emitted(idx, tag);
-                    if let Some(rec) = &old {
-                        if rec.key() == key {
-                            s.cmp_snap_idx += 1; // superseded
-                        }
+                    if order == core::cmp::Ordering::Equal {
+                        s.cmp_snap_idx += 1; // superseded
                     }
-                    s.cmp_last_ns = key.0;
-                    s.cmp_last_path = key.1;
-                    s.cmp_last_key_valid = 1;
+                    set_merge_cursor(s, slot.root(), slot.path());
                 } else if let Some(rec) = old {
                     if !super::snapshot::snap_writer_append(syscalls, &mut writer, &rec) {
                         compaction_abort(s, syscalls);
                         return;
                     }
                     s.cmp_snap_idx += 1;
+                    set_merge_cursor(s, rec.root(), rec.path());
                 }
             }
             (None, Some(rec)) => {
@@ -2022,6 +2226,7 @@ unsafe fn compaction_step(s: &mut ModuleState, syscalls: &super::SyscallTable) {
                     return;
                 }
                 s.cmp_snap_idx += 1;
+                set_merge_cursor(s, rec.root(), rec.path());
             }
         }
     }
@@ -2029,42 +2234,21 @@ unsafe fn compaction_step(s: &mut ModuleState, syscalls: &super::SyscallTable) {
     s.cmp_writer_fd = writer.fd;
 }
 
-/// Decode a channel-wire (or WAL-replay) payload and apply it to
-/// the arena. Pure function: no syscalls, no I/O. Used by both
-/// `module_step_impl` (live apply) and `module_new_with_wal_impl`
-/// (replay apply).
+/// Decode a RENAME record and apply it to the arena. Binds and
+/// unbinds are decided in `apply_op`, against the snapshot as well as
+/// the arena.
 pub(super) fn apply_to_arena(
     bindings: &mut super::state::PicNamespaceState<ARENA_CAPACITY>,
     payload: &[u8],
 ) -> Result<u8, ()> {
     let op = super::wire::peek_opcode(payload).ok_or(())?;
     match op {
-        super::wire::OP_BIND => {
-            let dec = super::wire::decode_bind(payload).map_err(|_| ())?;
-            bindings
-                .bind(
-                    dec.namespace_root,
-                    dec.path,
-                    dec.object_id,
-                    dec.kind,
-                    dec.revision,
-                )
-                .map_err(|_| ())?;
-            Ok(super::wire::OP_BIND)
-        }
         super::wire::OP_RENAME => {
             let dec = super::wire::decode_rename(payload).map_err(|_| ())?;
             bindings
                 .rename(dec.namespace_root, dec.from, dec.to, dec.new_revision)
                 .map_err(|_| ())?;
             Ok(super::wire::OP_RENAME)
-        }
-        super::wire::OP_UNBIND => {
-            let dec = super::wire::decode_unbind(payload).map_err(|_| ())?;
-            bindings
-                .unbind(dec.namespace_root, dec.path)
-                .map_err(|_| ())?;
-            Ok(super::wire::OP_UNBIND)
         }
         _ => Err(()),
     }
@@ -2125,39 +2309,9 @@ const E_NOSYS: i32 = -38;
 const E_EXIST: i32 = -17;
 const E_PERM: i32 = -1;
 const E_MFILE: i32 = -24;
-
-/// Write one `LIST` entry into `out`, answering whether it fitted.
-///
-/// `trailer` is the room the mandatory cursor record must keep, reserved
-/// before any entry is written: a full buffer carrying entries and no way to
-/// continue would have the caller parse a page it cannot follow.
-///
-/// A name the entry header cannot express is passed over as though it did
-/// fit. `name_len` is one byte and this namespace binds paths far longer, so
-/// the frame cannot carry such a name and the contract has no "skipped"
-/// signal to report it with. Recorded as a contract gap rather than hidden.
-///
-/// The ceiling is 254, not 255: the trailing cursor record is marked with
-/// `0xFF` in the same position an entry carries `name_len`, so a name of
-/// exactly 255 bytes would produce an entry a consumer reads as the end of
-/// the page — every later entry lost, and silently. Emitting one would be
-/// worse than omitting it, which is why the length a byte can hold is not
-/// the length this writes.
-fn list_take(out: &mut [u8], w: &mut usize, name: &[u8], kind: u8, trailer: usize) -> bool {
-    if name.is_empty() || name.len() >= u8::MAX as usize {
-        return true;
-    }
-    let need = 2 + name.len();
-    if *w + need + trailer > out.len() {
-        return false;
-    }
-    let at = *w;
-    out[at] = name.len() as u8;
-    out[at + 1] = kind;
-    out[at + 2..at + 2 + name.len()].copy_from_slice(name);
-    *w = at + need;
-    true
-}
+const E_IO: i32 = -5;
+const E_NOMEM: i32 = -12;
+const E_OVERFLOW: i32 = -75;
 
 /// The strongest fence this provider can honestly claim right now.
 ///
@@ -2566,7 +2720,10 @@ pub unsafe fn provider_dispatch_impl(
                 None => 1,
             };
 
-            match s.bindings.bind(&[], path, target, kind, revision) {
+            match s
+                .bindings
+                .bind(&[], path, target, kind, revision, &super::state::Meta::NONE)
+            {
                 Ok(_) => {
                     write_fence_out(s, fence_ptr, fence_cap);
                     let k = if existing.is_some() {
@@ -2916,188 +3073,70 @@ pub unsafe fn provider_dispatch_impl(
         //   [prefix_len u16][prefix][cursor_len u16][cursor]
         //   [out_buf u64][out_cap u32][fence_ptr u64][fence_cap u16]
         NS_OP_LIST => {
-            if arg.is_null() || arg_len < 4 || s.syscalls.is_null() {
+            use super::abi::contracts::storage::handle::STORAGE_KEY_MAX;
+            use super::abi::contracts::storage::namespace::list as nl;
+            if arg.is_null() || s.syscalls.is_null() {
                 return E_INVAL;
             }
             let a = core::slice::from_raw_parts(arg, arg_len);
-            let le64 = |at: usize| -> u64 {
-                let mut b = [0u8; 8];
-                let mut i = 0usize;
-                while i < 8 {
-                    b[i] = a[at + i];
-                    i += 1;
-                }
-                u64::from_le_bytes(b)
+            let Some(req) = nl::parse_request(a) else {
+                return E_INVAL;
             };
-            let prefix_len = u16::from_le_bytes([a[0], a[1]]) as usize;
-            let mut p = 2usize;
-            if arg_len < p + prefix_len + 2 {
+            // Key-shaped: a cursor is a whole key under the prefix this
+            // provider issued, and names are UTF-8.
+            if !req.cursor.is_empty()
+                && (!req.cursor.starts_with(req.prefix) || !super::hash::utf8_valid(req.cursor))
+            {
                 return E_INVAL;
             }
-            let prefix = &a[p..p + prefix_len];
-            p += prefix_len;
-            let cursor_len = u16::from_le_bytes([a[p], a[p + 1]]) as usize;
-            p += 2;
-            // Through the output buffer is required; the fence pair after
-            // it is optional, which `read_fence_out` is the reader for.
-            if arg_len < p + cursor_len + 8 + 4 {
-                return E_INVAL;
-            }
-            // The cursor is opaque to the caller and four little-endian
-            // bytes to us: the position in the walk below. A shorter one
-            // is read as far as it goes, and an absent one starts over.
-            let mut cbytes = [0u8; 4];
-            let take = cursor_len.min(4);
-            let mut i = 0usize;
-            while i < take {
-                cbytes[i] = a[p + i];
-                i += 1;
-            }
-            let cursor = u32::from_le_bytes(cbytes);
-            p += cursor_len;
-            let out_ptr = le64(p) as usize as *mut u8;
-            p += 8;
-            let out_cap = u32::from_le_bytes([a[p], a[p + 1], a[p + 2], a[p + 3]]) as usize;
-            p += 4;
-            let (fence_ptr, fence_cap) = read_fence_out(a, p);
-            if out_ptr.is_null() {
-                return E_INVAL;
-            }
-            // The trailing cursor record is mandatory, so its worst case
-            // is reserved before any entry is written. Without that a
-            // full buffer would carry entries and no way to continue.
-            const CURSOR_RECORD_BYTES: usize = 2 + 4;
-            let out = core::slice::from_raw_parts_mut(out_ptr, out_cap);
-            let mut w = 0usize;
-            let arena_cap = s.bindings.capacity() as u32;
-            // The table the loader handed this module, checked non-null
-            // above; the snapshot phase reads through it.
+            let out = core::slice::from_raw_parts_mut(
+                req.out_ptr as usize as *mut u8,
+                req.out_cap as usize,
+            );
+            let mut w = nl::PageWriter::new(out);
+            let mut last = [0u8; STORAGE_KEY_MAX];
+            let mut last_len = 0usize;
+            let mut overflow = false;
             let sys = &*s.syscalls;
-
-            // The arena first, then the snapshot: the same two-phase
-            // cursor space `handle_list` walks, because a key evicted to
-            // the snapshot is still bound and a listing that skipped it
-            // would be wrong rather than short.
-            let mut resume: Option<u32> = None;
-            let mut done = false;
-            if cursor < arena_cap {
-                match s.bindings.list_page_prefixed(
-                    &[],
-                    prefix,
-                    cursor,
-                    usize::MAX,
-                    |path, kind| list_take(out, &mut w, path, kind, CURSOR_RECORD_BYTES),
-                ) {
-                    Some(idx) => resume = Some(idx),
-                    None => {
-                        if s.snap_active != 0 && s.snap_count > 0 {
-                            resume = Some(arena_cap);
-                        } else {
-                            done = true;
-                        }
-                    }
+            // The surface has no roots: its keys are the paths of the
+            // empty root.
+            let more = walk_ordered(s, sys, &[], req.prefix, req.cursor, |e| {
+                if e.path.len() > STORAGE_KEY_MAX {
+                    // Unlistable here: refusing beats a short page the
+                    // caller believes complete.
+                    overflow = true;
+                    return false;
                 }
-            } else {
-                resume = Some(cursor);
-            }
-
-            if !done {
-                if let Some(at) = resume {
-                    if at >= arena_cap && s.snap_active != 0 {
-                        let snap = super::snapshot::OpenSnapshot {
-                            fd: s.snap_fd,
-                            count: s.snap_count,
-                            generation: s.snap_gen,
-                        };
-                        let ns_h = super::state::fnv1a64(&[]);
-                        let mut idx = at - arena_cap;
-                        let mut stalled = false;
-                        while idx < s.snap_count {
-                            match super::snapshot::snap_read_at(sys, &snap, idx) {
-                                Some(rec) => {
-                                    let path = &rec.path[..(rec.path_len as usize)
-                                        .min(super::state::MAX_LIST_PATH)];
-                                    // The arena's entry, live or tombstone,
-                                    // is authoritative for a key it holds.
-                                    let shadowed = s
-                                        .bindings
-                                        .lookup_hashed(
-                                            rec.ns_hash,
-                                            rec.path_hash,
-                                            &rec.root[..rec.root_len as usize],
-                                            path,
-                                        )
-                                        .is_some();
-                                    if rec.ns_hash != ns_h
-                                        || rec.path_len == 0
-                                        || shadowed
-                                        || !path.starts_with(prefix)
-                                    {
-                                        idx += 1;
-                                        continue;
-                                    }
-                                    if !list_take(out, &mut w, path, rec.kind, CURSOR_RECORD_BYTES)
-                                    {
-                                        stalled = true;
-                                        break;
-                                    }
-                                    idx += 1;
-                                }
-                                None => {
-                                    idx = s.snap_count;
-                                    break;
-                                }
-                            }
-                        }
-                        resume = if stalled || idx < s.snap_count {
-                            Some(arena_cap + idx)
-                        } else {
-                            None
-                        };
-                    }
+                if !w.push(e.path, e.binding.kind) {
+                    return false;
                 }
+                last[..e.path.len()].copy_from_slice(e.path);
+                last_len = e.path.len();
+                true
+            });
+            if overflow {
+                return E_OVERFLOW;
             }
-
-            let next = if done { None } else { resume };
-            // A buffer that cannot hold one entry and the trailer cannot
-            // be paged out of: answering an empty page with a cursor that
-            // does not advance would have the caller ask forever. That is
-            // the one case the contract's "page rather than refuse" has
-            // no answer for, so it is refused.
-            if w == 0 && next.is_some() && out_cap < CURSOR_RECORD_BYTES + 3 {
-                return E_INVAL;
+            let Some(more) = more else {
+                return E_IO;
+            };
+            if more && w.count() == 0 {
+                // Not even one entry fits with its trailer.
+                return E_NOMEM;
             }
-            match next {
-                Some(at) => {
-                    if w + 6 > out_cap {
-                        return E_INVAL;
-                    }
-                    out[w] = 0xFF;
-                    out[w + 1] = 4;
-                    out[w + 2..w + 6].copy_from_slice(&at.to_le_bytes());
-                    w += 6;
-                }
-                None => {
-                    if w + 2 > out_cap {
-                        return E_INVAL;
-                    }
-                    out[w] = 0xFF;
-                    out[w + 1] = 0;
-                    w += 2;
-                }
-            }
-
-            if !fence_ptr.is_null() && fence_cap >= super::abi::fence::WIRE_MAX_LEN {
-                let fbuf = core::slice::from_raw_parts_mut(fence_ptr, fence_cap);
-                let _ = achieved_fence(s).encode(fbuf);
-            }
-            w as i32
+            let cursor: &[u8] = if more { &last[..last_len] } else { &[] };
+            let Some(n) = w.finish(cursor) else {
+                return E_NOMEM;
+            };
+            write_view_fence_out(
+                &[],
+                s.bindings.change_seq(),
+                req.fence_out_ptr as usize as *mut u8,
+                req.fence_out_cap as usize,
+            );
+            n as i32
         }
 
-        // Not implemented. For the ops `CAPS` carries a bit for, that
-        // bitmap says so too; for the rest, this errno is the whole of
-        // the answer. Returning it rather than a wrong answer is what
-        // lets a consumer branch on it.
         _ => E_NOSYS,
     }
 }

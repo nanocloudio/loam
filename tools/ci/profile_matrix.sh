@@ -3,42 +3,32 @@
 #
 # A profile that is not built and exercised is a claim, not a
 # capability. Loam has four — `minimal`, `embedded`, `node`,
-# `server` — differing in arena capacity, key ceilings and which
-# optional tiers are compiled in at all. This runs the whole suite
-# against each.
+# `server` — differing in arena capacity, key ceilings, session and
+# member ceilings, and which optional tiers are compiled in at all.
+# A module picks one with its manifest `[[variant]]`; the harness
+# compiles the same sources under the same feature, so this runs the
+# whole harness against each.
 #
-# What it catches, concretely: the first run of this matrix found a
-# test that hard-coded a 234-byte path (fine at the host ceiling of
-# 1024, refused at the embedded ceiling of 160) and another that
-# drove 576 bindings through what became a 64-slot arena with no
-# snapshot tier behind it. Both looked correct on the default
-# profile and were wrong on a real device.
+# What it catches, concretely: a test that hard-coded a 234-byte path
+# (fine at the host ceiling of 1024, refused at the embedded ceiling of
+# 160), another that drove 576 bindings through a 64-slot arena with
+# no snapshot tier behind it, and a snapshot merge that wrote keys out
+# of order once the arena was small enough to evict mid-merge. Each
+# looked correct on the default profile and was wrong on a real device.
 #
-# `node` is the default when nothing is declared, so it is run
-# without a flag — which also proves the fallback still resolves.
-#
-# Wired as `[ci.test] scripts` in fluxor.toml.
+# `fluxor ci` runs the harness on its default feature (`node`); this
+# covers the other three. Wired as `[ci.test] scripts` in fluxor.toml.
 set -euo pipefail
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../../tests/harness"
 
-profiles=(minimal embedded server)
+log_dir="$(mktemp -d "${TMPDIR:-/tmp}/loam-profile-matrix-XXXXXX")"
 fail=0
 
-echo "profile_matrix: node (default — no cfg, exercises the fallback)"
-if ! cargo test --quiet >/tmp/loam_profile_node.log 2>&1; then
-  echo "  FAILED — see /tmp/loam_profile_node.log"
-  tail -30 /tmp/loam_profile_node.log | sed 's/^/    /'
-  fail=1
-else
-  echo "  ok"
-fi
-
-for p in "${profiles[@]}"; do
+for p in minimal embedded server; do
   echo "profile_matrix: $p"
-  if ! RUSTFLAGS="--cfg loam_profile=\"$p\"" \
-       cargo test --quiet >"/tmp/loam_profile_$p.log" 2>&1; then
-    echo "  FAILED — see /tmp/loam_profile_$p.log"
-    tail -30 "/tmp/loam_profile_$p.log" | sed 's/^/    /'
+  if ! cargo test --quiet --no-default-features --features "$p" >"$log_dir/$p.log" 2>&1; then
+    echo "  FAILED — see $log_dir/$p.log"
+    tail -30 "$log_dir/$p.log" | sed 's/^/    /'
     fail=1
   else
     echo "  ok"
@@ -49,4 +39,5 @@ if ((fail)); then
   echo "profile_matrix: at least one profile does not hold"
   exit 1
 fi
-echo "profile_matrix: ok — all four profiles pass the suite"
+rm -rf "$log_dir"
+echo "profile_matrix: ok — minimal, embedded and server pass the harness (node runs in fluxor ci)"

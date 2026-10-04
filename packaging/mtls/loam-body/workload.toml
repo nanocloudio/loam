@@ -1,0 +1,57 @@
+# loam-body: a body node. One `body_store` holding content-addressed
+# bodies in a directory, served to the body routers of other nodes over
+# one mutually authenticated TLS session.
+#
+#   python3 tools/e2e/render_service.py packaging/mtls/loam-body/linux.yaml loam-body.yaml \
+#     <param>=<value> …
+#   fluxor run loam-body.yaml
+#
+# Its TLS identity — the CA, certificate and key — is files the build
+# reads, which a bundle cannot yet take as run-time parameters, so this
+# is a template rendered with its values. The parameters below are its
+# schema; render_service.py refuses a rendering that leaves one out.
+#
+# A router graph reaches it with one member per body node: a
+# `body_fanout_router` member port wired to a `remote_channel` that dials
+# this node through a client-mode `tls` (tools/e2e/graphs/fleet_s3.yaml).
+# The session carries one channel, the body plane's frames, record for
+# record.
+[workload]
+name = "loam-body"
+version = "0.1.0"
+role = "service"
+
+[[implementation]]
+target = "linux"
+graph = "linux.yaml"
+
+[params.port]
+type = "integer"
+default = 7444
+min = 1
+max = 65535
+description = "TCP port the body plane accepts its router's session on"
+
+[params.body_dir]
+type = "string"
+required = true
+example = "/var/lib/loam/bodies"
+description = "Directory holding the bodies, one file per content digest"
+
+[params.ca]
+type = "string"
+required = true
+example = "/etc/loam/ca.pem"
+description = "CA bundle a router's client certificate must chain to (PEM or DER)"
+
+[params.cert]
+type = "string"
+required = true
+example = "/etc/loam/node.der"
+description = "This node's certificate, DER"
+
+[params.key]
+type = "string"
+required = true
+example = "/etc/loam/node.key.der"
+description = "This node's private key, DER"

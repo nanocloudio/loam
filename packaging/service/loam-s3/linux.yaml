@@ -1,0 +1,115 @@
+# The loam-s3 template: S3 over a single loam storage node.
+#
+#   linux_net ⇄ http ⇄ s3_serve ── storage.object ──▶ object_provider
+#                                                         ⇅ link 0
+#                                                     admin_gate
+#                                                         ⇅
+#                                                    admin_router
+#                                  ⇅                     ⇅                ⇅
+#                          namespace_router         object_index      body_store
+#
+# `s3_serve` calls the object surface; `object_provider` answers it,
+# presenting each access key's capability on a session of its own on the
+# gate's link. The link is a channel inside this graph — the wiring is
+# what authenticates it — so the gate needs no network listener here.
+target: linux
+tick_us: 100
+
+# `linux_net` ⇄ `http` ⇄ `s3_serve`, and every admin-plane pair, are
+# request/response cycles by construction.
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+
+modules:
+  - name: http
+    port: ${param:port}
+    # The kernel owns TCP segmentation.
+    host_tcp: 1
+    # The route's body ceiling (1 TiB, in KiB): bodies stream to
+    # `s3_serve` on credit and are never held whole; the object ceiling
+    # a request meets is `s3_serve`'s.
+    route_0_max_body_kib: 1073741824
+    routes:
+      - path: "/"
+        app: true
+
+  - name: s3_serve
+    credentials: ${param:credentials}
+    mesh_roots: ${param:mesh_roots}
+    region: ${param:region}
+    max_object_mib: ${param:max_object_mib}
+    part_min_kib: ${param:part_min_kib}
+
+  - name: object_provider
+    variant: node
+    spool_dir: "${param:spool_dir}"
+
+  - name: admin_gate
+    variant: node
+    mesh_roots: ${param:mesh_roots}
+
+  - name: admin_router
+    variant: node
+    gc_interval: ${param:gc_interval}
+
+  - name: namespace_router
+    variant: node
+    wal_path: "${param:ns_wal}"
+
+  - name: object_index
+    variant: node
+    wal_path: "${param:obj_wal}"
+
+  - name: body_store
+    variant: node
+    root_dir: "${param:body_dir}"
+
+wiring:
+  - from: linux_net.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: linux_net.net_in
+  # One whole record per write: both edges need a buffer group, distinct
+  # because they are independent channels.
+  - from: http.req_out
+    to: s3_serve.request_in
+    buffer_group: 1
+  - from: s3_serve.response_out
+    to: http.resp_in
+    buffer_group: 2
+
+  # The provider's link: one record per buffer, both ways.
+  - from: object_provider.admin_out
+    to: admin_gate.link0_in
+    buffer_group: 3
+  - from: admin_gate.link0_out
+    to: object_provider.admin_in
+    buffer_group: 4
+
+  # One request, and one answer, per buffer: the router and the gate
+  # each read a record whole. The object index likewise. The namespace
+  # and body edges are byte streams their readers reassemble.
+  - from: admin_gate.admin_req
+    to: admin_router.admin_in
+    buffer_group: 5
+  - from: admin_router.admin_out
+    to: admin_gate.admin_resp
+    buffer_group: 6
+
+  - from: admin_router.ns_req
+    to: namespace_router.requests
+  - from: namespace_router.responses
+    to: admin_router.ns_resp
+  - from: admin_router.obj_req
+    to: object_index.object_requests
+    buffer_group: 7
+  - from: object_index.object_responses
+    to: admin_router.obj_resp
+    buffer_group: 8
+  - from: admin_router.body_req
+    to: body_store.body_requests
+  - from: body_store.body_responses
+    to: admin_router.body_resp

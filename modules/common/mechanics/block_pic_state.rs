@@ -120,6 +120,10 @@ impl<const N: usize> PicBlockState<N> {
         self.len() == 0
     }
 
+    #[allow(
+        clippy::manual_find,
+        reason = "an explicit scan keeps the PIC build panic-free: iterator adapters pull core::panicking paths the bare-metal SDK does not carry"
+    )]
     pub fn lookup(&self, volume_id: &[u8]) -> Option<&VolumeSlot> {
         let h = fnv1a64(volume_id);
         for s in &self.slots {

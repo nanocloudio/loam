@@ -4,11 +4,14 @@
 // The volume is a copy-on-write map of content-addressed extent bodies,
 // committed by a fenced, revisioned bind. This module is its one writer:
 // it takes the volume's writer lease, reads through the committed map,
-// stages written extents in memory, and makes them durable by the same
-// commit `loam-client`'s `VolumeWriter` runs — BEGIN, the extent bodies,
+// stages written extents in memory, and makes them durable by the
+// volume commit — BEGIN, the extent bodies,
 // the leaf pages on changed paths, the root page, COMMIT at the next
 // revision under the lease's fence. Every exchange is one admin-wire
-// request on `admin_req` and its ack on `admin_resp`, one at a time.
+// request and its ack through the admin client (`admin_client.rs`): over
+// an in-graph link to `admin_gate`, or over the network through a
+// client-mode `tls`, after presenting the capabilities in the module's
+// capability file — one covering the volume's key, one the body plane.
 //
 // Block requests:
 //
@@ -38,7 +41,7 @@
 // merged. A new instance reopens the volume at its committed revision.
 //
 // The includer's scope provides `SyscallTable`, `abi` (block contract
-// and fence), `admin` (loam_admin_wire), `map_wire`
+// and fence), `admin` (loam_admin_wire), `admin_client`, `map_wire`
 // (loam_volume_map_wire), `limits` and `sha256::Sha256`.
 //
 // PIC discipline: no division by a runtime value (the geometry is powers
@@ -72,8 +75,6 @@ pub const QUEUE_DEPTH: usize = 8;
 /// One admin frame in either direction: the largest is a PUT or GET of a
 /// full map page.
 pub const IO_CAP: usize = map::MAX_PAGE_LEN + 64;
-/// The longest PUT ack: opcode, cid, status, digest.
-pub const PUT_ACK_CAP: usize = 6 + DIGEST;
 
 /// An ack that has not arrived by then ends the device: a commit whose
 /// outcome is unknown cannot be retried as if it had not happened.
@@ -117,6 +118,8 @@ const J_ABORT: u8 = 12;
 /// A commit's extent bodies, sent back to back with their acks collected
 /// as they come (`bodies_pump`).
 const J_PUT_BODIES: u8 = 13;
+/// The lease's release, the last request of a drain.
+const J_RELEASE: u8 = 14;
 
 const C_IDLE: u8 = 0;
 const C_BEGIN: u8 = 1;
@@ -183,10 +186,17 @@ pub struct Pending {
 #[repr(C)]
 pub struct ModuleState {
     pub syscalls: *const super::SyscallTable,
-    /// Admin acks from the node (`admin_resp`).
-    pub resp_chan: i32,
-    /// Admin requests to the node (`admin_req`).
-    pub req_chan: i32,
+    /// The admin plane: requests out, answers in.
+    pub client: super::admin_client::Client,
+    /// Where the capability file is, and whether it has been loaded.
+    pub cap_path: [u8; CAP_PATH_MAX],
+    pub cap_path_len: u16,
+    pub cap_loaded: u8,
+    /// The gate's authority; empty, the module is a link session.
+    pub admin: [u8; super::admin_client::AUTHORITY_MAX],
+    pub admin_len: u8,
+    /// The link session id.
+    pub link_session: u32,
     /// The `storage.block` channel this source answers on.
     pub blocks_chan: i32,
     pub phase: u8,
@@ -196,6 +206,10 @@ pub struct ModuleState {
     pub commit: u8,
     /// Something waits for everything written so far to be durable.
     pub flush_wanted: u8,
+    /// Draining: no new request is admitted; what is staged commits, the
+    /// lease is released, and the module reports itself done.
+    pub draining: u8,
+    pub drained: u8,
     /// Negative errno once the device has failed; every request gets it.
     pub fail: i32,
     pub ready_reported: u8,
@@ -230,10 +244,9 @@ pub struct ModuleState {
     pub job_child: u64,
     pub retry_at: u64,
     pub begin_since: u64,
+    /// The request built in `io`, and whether the client has taken it.
     pub io_len: u32,
     pub io_sent: u32,
-    pub io_rx: u32,
-    pub _pad3: u32,
     pub io: [u8; IO_CAP],
     // ── Committed view ──
     pub revision: u64,
@@ -294,20 +307,18 @@ pub struct ModuleState {
     /// A PUT was refused: send no more, collect what is owed, then abort.
     pub pipe_refused: u8,
     pub _pad6: [u8; 2],
-    /// Acks of the pipelined PUTs as they arrive.
-    pub rx: [u8; PUT_ACK_CAP],
-    pub rx_len: u32,
 }
+
+/// Longest capability-file path: a string parameter's ceiling.
+pub const CAP_PATH_MAX: usize = 255;
 
 // ── Construction ────────────────────────────────────────────────────
 
-/// Zero the state and bind the three channels. Parameters are set after
-/// this — by the TLV parser, or `configure` — and checked on the first
-/// step.
+/// Zero the state and bind the block channel. The admin transport
+/// (`connect_link` / `connect_net`) and the parameters are set after
+/// this, and checked on the first step.
 pub unsafe fn module_new_impl(
-    resp_chan: i32,
     blocks_chan: i32,
-    req_chan: i32,
     state_ptr: *mut u8,
     state_size: usize,
     syscalls: *const super::SyscallTable,
@@ -321,8 +332,6 @@ pub unsafe fn module_new_impl(
     core::ptr::write_bytes(state_ptr, 0u8, core::mem::size_of::<ModuleState>());
     let s = &mut *(state_ptr as *mut ModuleState);
     s.syscalls = syscalls;
-    s.resp_chan = resp_chan;
-    s.req_chan = req_chan;
     s.blocks_chan = blocks_chan;
     s.block_size = 4096;
     s.ttl_ms = 30_000;
@@ -354,6 +363,54 @@ pub unsafe fn configure(
     set_path(s, path);
     s.ttl_ms = ttl_ms;
     s.block_size = block_size;
+}
+
+/// Bring up the admin transport the parameters chose: the network
+/// through a client-mode `tls` when an `admin` authority is set, else an
+/// in-graph link as `link_session`.
+pub unsafe fn connect(state_ptr: *mut u8, admin_in: i32, admin_out: i32, tag: u8) {
+    let s = &mut *(state_ptr as *mut ModuleState);
+    let t = now_ms(s);
+    if s.admin_len > 0 {
+        let authority: &[u8] = &*(&s.admin[..s.admin_len as usize] as *const [u8]);
+        super::admin_client::init_net(&mut s.client, admin_in, admin_out, tag, authority, t);
+    } else {
+        super::admin_client::init_link(&mut s.client, admin_in, admin_out, s.link_session, t);
+    }
+}
+
+/// The gate's authority. Longer than the client holds is refused at the
+/// first step.
+#[allow(
+    clippy::manual_memcpy,
+    reason = "a slice copy of a runtime length pulls panic paths the PIC link does not carry"
+)]
+pub fn set_admin(s: &mut ModuleState, v: &[u8]) {
+    if v.len() > s.admin.len() {
+        s.bad_param = 1;
+        return;
+    }
+    for i in 0..v.len() {
+        s.admin[i] = v[i];
+    }
+    s.admin_len = v.len() as u8;
+}
+
+/// The capability file's path. Longer than a parameter can carry is
+/// refused at the first step.
+#[allow(
+    clippy::manual_memcpy,
+    reason = "a slice copy of a runtime length pulls panic paths the PIC link does not carry"
+)]
+pub fn set_capability(s: &mut ModuleState, v: &[u8]) {
+    if v.len() > CAP_PATH_MAX {
+        s.bad_param = 1;
+        return;
+    }
+    for i in 0..v.len() {
+        s.cap_path[i] = v[i];
+    }
+    s.cap_path_len = v.len() as u16;
 }
 
 pub fn set_root(s: &mut ModuleState, v: &[u8]) {
@@ -436,48 +493,6 @@ fn with_fence(tag: u64, f: Fence) -> Cpl {
 
 // ── The admin exchange ─────────────────────────────────────────────
 
-/// The length of the ack at the front of `b`: `Ok(None)` until it has all
-/// arrived, `Err` for an opcode this module never sends. Covers exactly
-/// the acks of the requests the volume path issues.
-pub fn ack_len(b: &[u8]) -> Result<Option<usize>, ()> {
-    let op = match b.first() {
-        Some(op) => *op,
-        None => return Ok(None),
-    };
-    let status = b.get(5).copied();
-    let need = match op {
-        aw::OP_LEASE => 22,
-        aw::OP_VOLUME => 14,
-        aw::OP_PUT_BODY => match status {
-            None => return Ok(None),
-            Some(aw::STATUS_OK) => 6 + DIGEST,
-            Some(_) => 6,
-        },
-        aw::OP_GET_BODY => match status {
-            None => return Ok(None),
-            Some(aw::STATUS_OK) => {
-                if b.len() < 10 {
-                    return Ok(None);
-                }
-                10 + u32::from_le_bytes([b[6], b[7], b[8], b[9]]) as usize
-            }
-            Some(_) => 6,
-        },
-        aw::OP_LOOKUP => match status {
-            None => return Ok(None),
-            Some(aw::STATUS_OK) => {
-                if b.len() < 16 {
-                    return Ok(None);
-                }
-                16 + b[15] as usize
-            }
-            Some(_) => 6,
-        },
-        _ => return Err(()),
-    };
-    Ok(if b.len() >= need { Some(need) } else { None })
-}
-
 fn take_cid(s: &mut ModuleState) -> u32 {
     let c = s.next_cid;
     s.next_cid = c.wrapping_add(1).max(1);
@@ -490,24 +505,24 @@ unsafe fn issue(s: &mut ModuleState, job: u8, n: usize) {
     s.job = job;
     s.io_len = n as u32;
     s.io_sent = 0;
-    s.io_rx = 0;
     s.job_at = now_ms(s);
-    send_some(s);
+    hand(s);
 }
 
-unsafe fn send_some(s: &mut ModuleState) {
-    let at = s.io_sent as usize;
-    let len = s.io_len as usize;
-    if at >= len || len > IO_CAP {
+/// Hand the built request to the client once it can take one.
+unsafe fn hand(s: &mut ModuleState) {
+    if s.io_sent >= s.io_len {
         return;
     }
-    let rc = (sys(s).channel_write)(s.req_chan, s.io.as_ptr().add(at), len - at);
-    if rc > 0 {
-        s.io_sent = (s.io_sent + rc as u32).min(s.io_len);
+    let sys = &*s.syscalls;
+    let n = s.io_len as usize;
+    let frame: &[u8] = &*(&s.io[..n] as *const [u8]);
+    if super::admin_client::send(&mut s.client, sys, frame) {
+        s.io_sent = s.io_len;
     }
 }
 
-/// Send what is left of the request, then collect its ack.
+/// Hand over the request, then collect its ack.
 unsafe fn pump(s: &mut ModuleState, t: u64) {
     if s.job == J_NONE {
         return;
@@ -517,32 +532,21 @@ unsafe fn pump(s: &mut ModuleState, t: u64) {
         return;
     }
     if s.io_sent < s.io_len {
-        send_some(s);
+        hand(s);
         if s.io_sent < s.io_len {
             timeout_check(s, t);
             return;
         }
     }
-    let mut got = ack_len(&s.io[..s.io_rx as usize]);
-    while let Ok(None) = got {
-        let at = s.io_rx as usize;
-        if at >= IO_CAP {
-            got = Err(());
-            break;
+    match super::admin_client::recv(&mut s.client) {
+        Some(ack) => {
+            // The ack stays in the client until `take`; nothing below
+            // receives another before it has finished reading this one.
+            let frame: &[u8] = &*(ack as *const [u8]);
+            on_ack(s, t, frame);
+            super::admin_client::take(&mut s.client);
         }
-        let n = (sys(s).channel_read)(s.resp_chan, s.io.as_mut_ptr().add(at), IO_CAP - at);
-        if n <= 0 {
-            break;
-        }
-        s.io_rx = (s.io_rx + n as u32).min(IO_CAP as u32);
-        got = ack_len(&s.io[..s.io_rx as usize]);
-    }
-    match got {
-        Ok(Some(n)) if n == s.io_rx as usize => on_ack(s, t, n),
-        // Bytes past the one ack in flight: the stream is not the one
-        // this module is speaking.
-        Ok(Some(_)) | Err(()) => fail(s, EIO, b"[loam_volume] admin stream desynchronised"),
-        Ok(None) => timeout_check(s, t),
+        None => timeout_check(s, t),
     }
 }
 
@@ -574,7 +578,7 @@ unsafe fn bodies_pump(s: &mut ModuleState, t: u64) {
     // Send: finish the PUT in hand, then start the next.
     while s.pipe_refused == 0 {
         if s.io_sent < s.io_len {
-            send_some(s);
+            hand(s);
             if s.io_sent < s.io_len {
                 break;
             }
@@ -596,32 +600,20 @@ unsafe fn bodies_pump(s: &mut ModuleState, t: u64) {
         s.commit_cursor += 1;
         s.io_len = (h + len) as u32;
         s.io_sent = 0;
-        send_some(s);
+        hand(s);
     }
     // Receive: every whole ack in hand.
-    loop {
-        let at = s.rx_len as usize;
-        if at < PUT_ACK_CAP {
-            let n = (sys(s).channel_read)(s.resp_chan, s.rx.as_mut_ptr().add(at), PUT_ACK_CAP - at);
-            if n > 0 {
-                s.rx_len = (s.rx_len + n as u32).min(PUT_ACK_CAP as u32);
+    while let Some(ack) = super::admin_client::recv(&mut s.client) {
+        let frame: &[u8] = &*(ack as *const [u8]);
+        let cid = cid_of(frame);
+        let mut found = None;
+        for k in 0..s.pipe_len as usize {
+            if s.pipe_cids[k] == cid {
+                found = Some(k);
+                break;
             }
         }
-        let have = s.rx_len as usize;
-        let n = match ack_len(&s.rx[..have]) {
-            Ok(Some(n)) => n,
-            Ok(None) => break,
-            Err(()) => {
-                fail(s, EIO, b"[loam_volume] admin stream desynchronised");
-                return;
-            }
-        };
-        let frame: &[u8] = &*(&s.rx[..n] as *const [u8]);
-        let cid = cid_of(frame);
-        let Some(k) = s.pipe_cids[..s.pipe_len as usize]
-            .iter()
-            .position(|&c| c == cid)
-        else {
+        let Some(k) = found else {
             fail(s, EIO, b"[loam_volume] ack for another request");
             return;
         };
@@ -640,17 +632,18 @@ unsafe fn bodies_pump(s: &mut ModuleState, t: u64) {
             }
             Err(_) => s.pipe_refused = 1,
         }
-        // Drop the answered entry and its ack.
+        super::admin_client::take(&mut s.client);
+        // Drop the answered entry.
         let len = s.pipe_len as usize;
-        s.pipe_cids.copy_within(k + 1..len, k);
-        s.pipe_slots.copy_within(k + 1..len, k);
+        for j in k..len - 1 {
+            s.pipe_cids[j] = s.pipe_cids[j + 1];
+            s.pipe_slots[j] = s.pipe_slots[j + 1];
+        }
         s.pipe_len -= 1;
-        s.rx.copy_within(n..have, 0);
-        s.rx_len = (have - n) as u32;
         s.job_at = t;
     }
     let sent_all = s.pipe_refused != 0 || (s.io_sent >= s.io_len && next_body_ahead(s).is_none());
-    if sent_all && s.pipe_len == 0 && s.rx_len == 0 {
+    if sent_all && s.pipe_len == 0 {
         s.job = J_NONE;
         s.io_len = 0;
         s.io_sent = 0;
@@ -699,16 +692,12 @@ fn cid_of(frame: &[u8]) -> u32 {
     u32::from_le_bytes([frame[1], frame[2], frame[3], frame[4]])
 }
 
-/// Handle the complete ack in `io[..n]`.
-unsafe fn on_ack(s: &mut ModuleState, t: u64, n: usize) {
+/// Handle the complete ack `frame`.
+unsafe fn on_ack(s: &mut ModuleState, t: u64, frame: &[u8]) {
     let job = s.job;
     s.job = J_NONE;
     s.io_len = 0;
     s.io_sent = 0;
-    s.io_rx = 0;
-    // The ack stays in `io` until the next request is built; nothing
-    // below builds one before it has finished reading this.
-    let frame: &[u8] = &*(&s.io[..n] as *const [u8]);
     if cid_of(frame) != s.job_cid {
         fail(s, EIO, b"[loam_volume] ack for another request");
         return;
@@ -721,6 +710,9 @@ unsafe fn on_ack(s: &mut ModuleState, t: u64, n: usize) {
         J_EXTENT => on_extent(s, frame),
         J_BEGIN | J_COMMIT | J_ABORT => on_volume(s, t, job, frame),
         J_PUT_LEAF | J_PUT_ROOT => on_put(s, job, frame),
+        // Released or not, the writer is done with the volume: a lease it
+        // could not release lapses at its TTL.
+        J_RELEASE => s.drained = 1,
         _ => fail(s, EIO, b"[loam_volume] ack with nothing in flight"),
     }
 }
@@ -1452,7 +1444,6 @@ unsafe fn commit_next(s: &mut ModuleState, t: u64) {
             s.job_at = t;
             s.io_len = 0;
             s.io_sent = 0;
-            s.rx_len = 0;
             s.pipe_len = 0;
             s.pipe_refused = 0;
             bodies_pump(s, t);
@@ -1818,6 +1809,13 @@ unsafe fn schedule(s: &mut ModuleState, t: u64) {
                 commit_next(s, t);
                 return;
             }
+            if s.draining != 0 && s.flush_wanted == 0 && queued(s) == 0 {
+                // The drain's flush is decided — committed, or abandoned
+                // with its waiters answered — and nothing waits: the lease
+                // goes back, so the next writer need not wait it out.
+                issue_lease(s, J_RELEASE, aw::LEASE_RELEASE);
+                return;
+            }
             if s.flush_wanted != 0 {
                 if s.staged > 0 {
                     s.commit = C_BEGIN;
@@ -1848,6 +1846,51 @@ unsafe fn lease_guard(s: &mut ModuleState, t: u64) {
     }
 }
 
+/// Bring the admin client up: load the capability file, then drive the
+/// client. True once it is ready; a client that fails ends the device.
+unsafe fn admin_up(s: &mut ModuleState, t: u64) -> bool {
+    let sys = &*s.syscalls;
+    if s.cap_loaded == 0 {
+        if s.cap_path_len == 0 {
+            fail(
+                s,
+                EINVAL,
+                b"[loam_volume] the capability parameter is required",
+            );
+            return false;
+        }
+        let mut file = [0u8; super::admin_client::CAP_FILE_MAX];
+        let path: &[u8] = &*(&s.cap_path[..s.cap_path_len as usize] as *const [u8]);
+        if let Err(why) = super::admin_client::load_chain_file(&mut s.client, sys, path, &mut file)
+        {
+            fail(s, EINVAL, why);
+            return false;
+        }
+        s.cap_loaded = 1;
+    }
+    super::admin_client::poll(&mut s.client, sys, t);
+    if super::admin_client::has_failed(&s.client) {
+        // One call per arm: a match yielding the message would lower to
+        // a table of absolute pointers, which a PIC module cannot hold.
+        match s.client.why {
+            super::admin_client::WHY_REFUSED => {
+                fail(s, EACCES, b"[loam_volume] the gate refused a capability")
+            }
+            super::admin_client::WHY_UNAUTHENTICATED => fail(
+                s,
+                EACCES,
+                b"[loam_volume] the gate saw no authenticated peer",
+            ),
+            super::admin_client::WHY_TIMEOUT => {
+                fail(s, EIO, b"[loam_volume] the admin plane did not answer")
+            }
+            _ => fail(s, EIO, b"[loam_volume] the admin plane connection failed"),
+        }
+        return false;
+    }
+    super::admin_client::is_ready(&s.client)
+}
+
 pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     if state_ptr.is_null() {
         return -1;
@@ -1863,6 +1906,18 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         }
     }
     let t = now_ms(s);
+    if s.drained != 0 || (s.draining != 0 && s.phase != P_READY && s.job == J_NONE) {
+        // Drained, or draining with no lease to give back.
+        return 1;
+    }
+    if s.phase != P_FAILED && !admin_up(s, t) {
+        return if s.phase == P_FAILED && s.fail_reported == 0 {
+            s.fail_reported = 1;
+            s.fail
+        } else {
+            0
+        };
+    }
     if s.phase != P_FAILED {
         pump(s, t);
     }
@@ -1894,9 +1949,20 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     0
 }
 
+/// Begin a drain: admit nothing new, commit what is staged, release the
+/// writer lease, then report done. A stop that drains loses no
+/// acknowledged-but-unflushed write and leaves the volume free at once.
+pub fn drain(s: &mut ModuleState) {
+    s.draining = 1;
+    s.flush_wanted = 1;
+}
+
 // ── The block channel ──────────────────────────────────────────────
 
 unsafe fn admitted(s: &ModuleState, body: &[u8]) -> Result<Req, i32> {
+    if s.draining != 0 {
+        return Err(EBUSY);
+    }
     match s.phase {
         P_READY => {}
         P_FAILED => return Err(s.fail),

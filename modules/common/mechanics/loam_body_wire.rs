@@ -98,10 +98,18 @@ pub const MAX_SCAN_DIGESTS: usize = 4;
 pub const DIGEST_LEN: usize = 32;
 
 /// Max body length per single-shot put/get. Bounded so a put +
-/// header + digest still fits in the per-step scratch buffer.
-// Raised from 3072: consumers store region-journal-class blobs
-// (tens of KiB) in a single shot. Buffers derive from this const.
+/// header + digest still fits in the per-step scratch buffer;
+/// buffers derive from this const.
 pub const MAX_BODY: usize = 61440;
+
+/// The largest record this wire carries: a keyed put, whose header is
+/// the widest in front of a `MAX_BODY` payload. Every other record —
+/// including a full SCAN page — is no larger, which the assertions
+/// below hold.
+pub const RECORD_MAX: usize = 1 + DIGEST_LEN + 4 + MAX_BODY;
+const _: () = assert!(1 + 4 + MAX_BODY <= RECORD_MAX); // PUT, GET and RANGE answers
+const _: () = assert!(1 + 1 + 4 + MAX_BODY <= RECORD_MAX); // WAPPEND
+const _: () = assert!(1 + 4 + 1 + MAX_SCAN_DIGESTS * (1 + DIGEST_LEN) <= RECORD_MAX); // SCAN page
 
 pub const ERR_NOT_FOUND: u8 = 1;
 pub const ERR_TOO_LARGE: u8 = 2;

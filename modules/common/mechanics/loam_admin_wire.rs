@@ -1,7 +1,6 @@
-// Wire format for the `admin_router` PIC's request/response
-// protocol. Mediates between external admin clients (e.g.
-// `tools/loam-cli/` in a future phase) and the in-graph public-
-// surface PICs.
+// Wire format for loam's admin plane: the requests a client sends
+// `admin_gate` and the answers it gets back, which `admin_router`
+// composes over the in-graph public-surface PICs.
 //
 // Each request carries a `correlation_id` the router pairs with
 // the downstream PIC's response, so the caller can fire many
@@ -11,8 +10,12 @@
 //
 //   AdminBind          [op:u8=0x40][cid:u32]
 //                      [ns_len:u16][path_len:u16][oid_len:u16]
-//                      [kind:u8][revision:u64]
-//                      [ns:ns_len][path:path_len][oid:oid_len]
+//                      [kind:u8][revision:u64][size:u64][ctype_len:u8]
+//                      [ns:ns_len][path:path_len][oid:oid_len][ctype]
+//
+//                      `size` and the content type are what the binding
+//                      records of the object it names, as a write
+//                      records them; the router stamps the time.
 //
 //   AdminBindAck       [op:u8=0x40][cid:u32][status:u8]
 //                      // status: 0x01 = OK (downstream OP_BIND ack)
@@ -43,12 +46,6 @@ pub const OP_READ_FILE_RANGE: u8 = 0x4A;
 pub const OP_STAT_FILE: u8 = 0x4B;
 pub const OP_PUT_BODY_KEYED: u8 = 0x4C;
 pub const OP_DELETE_BODY: u8 = 0x4D;
-/// Authenticate a connection before any other op is accepted.
-/// Connection-scoped, not per-request: the admin
-/// surface can bind, read and delete anything in any namespace, so
-/// the boundary that matters is who is on the far end of the socket,
-/// established once.
-pub const OP_AUTH: u8 = 0x4E;
 /// Acquire, renew or release a volume's writer lease.
 pub const OP_LEASE: u8 = 0x4F;
 /// Begin, commit or abort a volume flush: the fenced, revisioned bind
@@ -57,11 +54,6 @@ pub const OP_VOLUME: u8 = 0x50;
 /// Resolve a path to its binding — object id, revision and kind —
 /// without reading the body.
 pub const OP_LOOKUP: u8 = 0x51;
-
-/// Longest accepted auth token. Long enough for a 512-bit secret in
-/// hex with room to spare, short enough that an unauthenticated peer
-/// cannot make the server hold much.
-pub const MAX_TOKEN: usize = 256;
 
 pub const STATUS_OK: u8 = 0x01;
 pub const STATUS_NAK: u8 = 0xFF;
@@ -109,14 +101,81 @@ pub const STATUS_LEASE_HELD: u8 = 0x06;
 /// newest.
 pub const STATUS_LEASE_LOST: u8 = 0x07;
 
-/// The caller's identity holds no grant for this operation: the op
-/// class on the namespace root it names, or a write stream it did not
-/// open.
+/// The caller's session holds no grant for this operation: no
+/// capability it presented covers the key the operation names with the
+/// permission it needs, or it names a write stream another session
+/// opened.
 ///
 /// Separate from `STATUS_NAK` because the remedy is an operator's, not
 /// the caller's: a grant has to change before the same request can
 /// succeed, so retrying it is pointless.
 pub const STATUS_FORBIDDEN: u8 = 0x08;
+
+/// A write made on condition that nothing was bound found a binding.
+/// Distinct from `STATUS_CONFLICT` because the remedy differs: the key
+/// exists, and only a write that means to replace it can proceed.
+pub const STATUS_EXISTS: u8 = 0x09;
+
+/// How a composed write or delete decides against the key's current
+/// binding. The router reads the binding just before it binds and binds
+/// at the next revision, on condition that nothing moved in between, so
+/// every mode is decided at the namespace's single point of order.
+pub const WRITE_ANY: u8 = 0;
+/// Only if nothing is bound (a create).
+pub const WRITE_ABSENT: u8 = 1;
+/// Only if the key is bound to the expected object id (an etag match).
+pub const WRITE_IF: u8 = 2;
+
+/// A write's condition: its mode and, for `WRITE_IF`, the object id the
+/// key must be bound to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteCond<'a> {
+    pub mode: u8,
+    pub expect: &'a [u8],
+}
+
+impl WriteCond<'_> {
+    pub const ANY: WriteCond<'static> = WriteCond {
+        mode: WRITE_ANY,
+        expect: &[],
+    };
+}
+
+/// Longest content type a write carries.
+pub use super::limits::CONTENT_TYPE_MAX;
+
+fn check_cond(c: &WriteCond<'_>) -> Result<(), WireError> {
+    if c.mode > WRITE_IF
+        || c.expect.len() > MAX_OBJECT_ID
+        || (c.mode == WRITE_IF) == c.expect.is_empty()
+    {
+        return Err(WireError::BadOpcode { observed: c.mode });
+    }
+    Ok(())
+}
+
+/// The largest request: a single-frame PUT_FILE of a whole body under
+/// the longest key, expected object id and content type. What a
+/// receiver assembling requests from a stream must hold, and past which
+/// a request is refused.
+pub const REQUEST_MAX: usize = 17
+    + MAX_ROOT
+    + MAX_PATH
+    + MAX_OBJECT_ID
+    + super::limits::CONTENT_TYPE_MAX
+    + super::body_wire::MAX_BODY;
+
+/// The largest answer: a whole body read back. A listing page is
+/// bounded below it, which the assertion holds.
+pub const RESPONSE_MAX: usize = 10 + super::body_wire::MAX_BODY;
+
+/// Entries one listing page carries: the namespace's own page.
+pub const LIST_PAGE_MAX: usize = 16;
+const _: () = assert!(
+    8 + LIST_PAGE_MAX
+        * (2 + MAX_PATH + 8 + 1 + 1 + MAX_OBJECT_ID + 8 + 8 + 1 + super::limits::CONTENT_TYPE_MAX)
+        <= RESPONSE_MAX
+);
 
 /// Per-field key ceilings, from the single register in
 /// `loam_limits.rs` — the same numbers the namespace wire, the
@@ -152,98 +211,6 @@ pub fn check_key(namespace_root: &[u8], path: &[u8], object_id: &[u8]) -> Result
 }
 pub const DIGEST_LEN: usize = 32;
 
-/// `AdminAuth  [op:u8=0x4E][cid:u32][token_len:u16][token]`
-///
-/// Answered with the ordinary ack shape: `[op][cid][status]`, where
-/// `STATUS_OK` means the connection may proceed and `STATUS_NAK`
-/// means it may not — and the server closes it rather than leaving a
-/// rejected peer holding an open socket to retry on.
-pub fn encode_admin_auth(dst: &mut [u8], cid: u32, token: &[u8]) -> Result<usize, WireError> {
-    if token.len() > MAX_TOKEN {
-        return Err(WireError::StringTooLong {
-            len: token.len(),
-            max: MAX_TOKEN,
-        });
-    }
-    let need = 1 + 4 + 2 + token.len();
-    if dst.len() < need {
-        return Err(WireError::BufferTooSmall {
-            needed: need,
-            actual: dst.len(),
-        });
-    }
-    dst[0] = OP_AUTH;
-    dst[1..5].copy_from_slice(&cid.to_le_bytes());
-    dst[5..7].copy_from_slice(&(token.len() as u16).to_le_bytes());
-    dst[7..need].copy_from_slice(token);
-    Ok(need)
-}
-
-/// Decode an auth request. Returns `(cid, token)`.
-pub fn decode_admin_auth(src: &[u8]) -> Result<(u32, &[u8]), WireError> {
-    if src.len() < 7 {
-        return Err(WireError::Truncated);
-    }
-    if src[0] != OP_AUTH {
-        return Err(WireError::BadOpcode { observed: src[0] });
-    }
-    let cid = u32::from_le_bytes([src[1], src[2], src[3], src[4]]);
-    let len = u16::from_le_bytes([src[5], src[6]]) as usize;
-    if len > MAX_TOKEN {
-        return Err(WireError::StringTooLong {
-            len,
-            max: MAX_TOKEN,
-        });
-    }
-    if src.len() < 7 + len {
-        return Err(WireError::Truncated);
-    }
-    Ok((cid, &src[7..7 + len]))
-}
-
-/// The ack for any connection-scoped op: `[op][cid][status]`.
-pub fn encode_admin_auth_ack(dst: &mut [u8], cid: u32, status: u8) -> Result<usize, WireError> {
-    if dst.len() < 6 {
-        return Err(WireError::BufferTooSmall {
-            needed: 6,
-            actual: dst.len(),
-        });
-    }
-    dst[0] = OP_AUTH;
-    dst[1..5].copy_from_slice(&cid.to_le_bytes());
-    dst[5] = status;
-    Ok(6)
-}
-
-pub fn decode_admin_auth_ack(src: &[u8]) -> Result<(u32, u8), WireError> {
-    if src.len() < 6 {
-        return Err(WireError::Truncated);
-    }
-    if src[0] != OP_AUTH {
-        return Err(WireError::BadOpcode { observed: src[0] });
-    }
-    Ok((u32::from_le_bytes([src[1], src[2], src[3], src[4]]), src[5]))
-}
-
-/// Constant-time byte equality.
-///
-/// A token check with `==` leaks its answer through timing: an
-/// attacker who can measure the reply learns how many leading bytes
-/// they guessed right, which turns a 256-bit secret into 32
-/// independent one-byte searches. The comparison must therefore look
-/// at every byte regardless, and combine the results without
-/// branching.
-pub fn tokens_match(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() || a.is_empty() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for i in 0..a.len() {
-        diff |= a[i] ^ b[i];
-    }
-    diff == 0
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireError {
     Truncated,
@@ -254,6 +221,12 @@ pub enum WireError {
 
 // ── AdminBind ──────────────────────────────────────────────────────
 
+const BIND_HDR: usize = 1 + 4 + 2 + 2 + 2 + 1 + 8 + 8 + 1;
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "bounded no_std step functions pass explicit scalar params"
+)]
 pub fn encode_admin_bind(
     dst: &mut [u8],
     correlation_id: u32,
@@ -262,10 +235,18 @@ pub fn encode_admin_bind(
     object_id: &[u8],
     kind: u8,
     revision: u64,
+    size: u64,
+    content_type: &[u8],
 ) -> Result<usize, WireError> {
     check_key(namespace_root, path, object_id)?;
-    let header = 1 + 4 + 2 + 2 + 2 + 1 + 8;
-    let needed = header + namespace_root.len() + path.len() + object_id.len();
+    if content_type.len() > CONTENT_TYPE_MAX {
+        return Err(WireError::StringTooLong {
+            len: content_type.len(),
+            max: CONTENT_TYPE_MAX,
+        });
+    }
+    let needed =
+        BIND_HDR + namespace_root.len() + path.len() + object_id.len() + content_type.len();
     if dst.len() < needed {
         return Err(WireError::BufferTooSmall {
             needed,
@@ -279,12 +260,13 @@ pub fn encode_admin_bind(
     dst[9..11].copy_from_slice(&(object_id.len() as u16).to_le_bytes());
     dst[11] = kind;
     dst[12..20].copy_from_slice(&revision.to_le_bytes());
-    let mut cursor = header;
-    dst[cursor..cursor + namespace_root.len()].copy_from_slice(namespace_root);
-    cursor += namespace_root.len();
-    dst[cursor..cursor + path.len()].copy_from_slice(path);
-    cursor += path.len();
-    dst[cursor..cursor + object_id.len()].copy_from_slice(object_id);
+    dst[20..28].copy_from_slice(&size.to_le_bytes());
+    dst[28] = content_type.len() as u8;
+    let mut cursor = BIND_HDR;
+    for part in [namespace_root, path, object_id, content_type] {
+        dst[cursor..cursor + part.len()].copy_from_slice(part);
+        cursor += part.len();
+    }
     Ok(needed)
 }
 
@@ -296,10 +278,12 @@ pub struct DecodedAdminBind<'a> {
     pub object_id: &'a [u8],
     pub kind: u8,
     pub revision: u64,
+    pub size: u64,
+    pub content_type: &'a [u8],
 }
 
 pub fn decode_admin_bind(src: &[u8]) -> Result<DecodedAdminBind<'_>, WireError> {
-    if src.len() < 20 {
+    if src.len() < BIND_HDR {
         return Err(WireError::Truncated);
     }
     if src[0] != OP_BIND {
@@ -311,14 +295,27 @@ pub fn decode_admin_bind(src: &[u8]) -> Result<DecodedAdminBind<'_>, WireError> 
     let oid_len = u16::from_le_bytes([src[9], src[10]]) as usize;
     let kind = src[11];
     let revision = u64::from_le_bytes(src[12..20].try_into().unwrap());
-    let header = 20;
-    let total = header + ns_len + path_len + oid_len;
+    let size = u64::from_le_bytes(src[20..28].try_into().unwrap());
+    let ct_len = src[28] as usize;
+    if ct_len > CONTENT_TYPE_MAX {
+        return Err(WireError::StringTooLong {
+            len: ct_len,
+            max: CONTENT_TYPE_MAX,
+        });
+    }
+    let total = BIND_HDR + ns_len + path_len + oid_len + ct_len;
     if src.len() < total {
         return Err(WireError::Truncated);
     }
-    let ns = &src[header..header + ns_len];
-    let path = &src[header + ns_len..header + ns_len + path_len];
-    let oid = &src[header + ns_len + path_len..header + ns_len + path_len + oid_len];
+    let mut at = BIND_HDR;
+    let ns = &src[at..at + ns_len];
+    at += ns_len;
+    let path = &src[at..at + path_len];
+    at += path_len;
+    let oid = &src[at..at + oid_len];
+    at += oid_len;
+    let content_type = &src[at..at + ct_len];
+    check_key(ns, path, oid)?;
     Ok(DecodedAdminBind {
         correlation_id,
         namespace_root: ns,
@@ -326,6 +323,8 @@ pub fn decode_admin_bind(src: &[u8]) -> Result<DecodedAdminBind<'_>, WireError> 
         object_id: oid,
         kind,
         revision,
+        size,
+        content_type,
     })
 }
 
@@ -595,29 +594,50 @@ pub fn decode_admin_get_body_ack(src: &[u8]) -> Result<(u32, u8, Option<&[u8]>),
 // stage fails the whole op nak's.
 //
 //   Request:  [op=0x43][cid:u32][ns_len:u16][path_len:u16]
-//             [kind:u8][revision:u64][body_len:u32]
-//             [ns:ns_len][path:path_len][body:body_len]
+//             [kind:u8][mode:u8][expect_len:u8][ctype_len:u8]
+//             [body_len:u32]
+//             [ns][path][expect][ctype][body]
 //
 //   Response: [op=0x43][cid:u32][status:u8][digest:32]   (status OK)
-//          or [op=0x43][cid:u32][status:u8]              (NAK)
+//          or [op=0x43][cid:u32][status:u8]              (otherwise)
 //
-// `revision` gates the final BIND stage: binds are revision-gated
-// upserts, so overwriting a path (S3 PUT semantics) requires a
-// strictly higher revision than the one currently bound. Callers
-// that overwrite pass a monotone value (e.g. wall-clock millis).
+// The router chooses the revision: it reads the key's binding just
+// before binding and binds at the next revision on condition that the
+// key has not moved, so a write is ordered by the namespace, not by a
+// writer's clock. `mode` / `expect` are the write's own condition
+// (`WriteCond`); a failed one is `STATUS_EXISTS` (ABSENT) or
+// `STATUS_CONFLICT` (IF).
 
+const PUT_FILE_HDR: usize = 1 + 4 + 2 + 2 + 1 + 1 + 1 + 1 + 4;
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "bounded no_std step functions pass explicit scalar params"
+)]
 pub fn encode_admin_put_file(
     dst: &mut [u8],
     correlation_id: u32,
     namespace_root: &[u8],
     path: &[u8],
     kind: u8,
-    revision: u64,
+    cond: &WriteCond<'_>,
+    content_type: &[u8],
     body: &[u8],
 ) -> Result<usize, WireError> {
     check_key(namespace_root, path, &[])?;
-    let header = 1 + 4 + 2 + 2 + 1 + 8 + 4;
-    let needed = header + namespace_root.len() + path.len() + body.len();
+    check_cond(cond)?;
+    if content_type.len() > CONTENT_TYPE_MAX {
+        return Err(WireError::StringTooLong {
+            len: content_type.len(),
+            max: CONTENT_TYPE_MAX,
+        });
+    }
+    let needed = PUT_FILE_HDR
+        + namespace_root.len()
+        + path.len()
+        + cond.expect.len()
+        + content_type.len()
+        + body.len();
     if dst.len() < needed {
         return Err(WireError::BufferTooSmall {
             needed,
@@ -629,14 +649,15 @@ pub fn encode_admin_put_file(
     dst[5..7].copy_from_slice(&(namespace_root.len() as u16).to_le_bytes());
     dst[7..9].copy_from_slice(&(path.len() as u16).to_le_bytes());
     dst[9] = kind;
-    dst[10..18].copy_from_slice(&revision.to_le_bytes());
-    dst[18..22].copy_from_slice(&(body.len() as u32).to_le_bytes());
-    let mut cursor = header;
-    dst[cursor..cursor + namespace_root.len()].copy_from_slice(namespace_root);
-    cursor += namespace_root.len();
-    dst[cursor..cursor + path.len()].copy_from_slice(path);
-    cursor += path.len();
-    dst[cursor..cursor + body.len()].copy_from_slice(body);
+    dst[10] = cond.mode;
+    dst[11] = cond.expect.len() as u8;
+    dst[12] = content_type.len() as u8;
+    dst[13..17].copy_from_slice(&(body.len() as u32).to_le_bytes());
+    let mut at = PUT_FILE_HDR;
+    for part in [namespace_root, path, cond.expect, content_type, body] {
+        dst[at..at + part.len()].copy_from_slice(part);
+        at += part.len();
+    }
     Ok(needed)
 }
 
@@ -646,13 +667,13 @@ pub struct DecodedAdminPutFile<'a> {
     pub namespace_root: &'a [u8],
     pub path: &'a [u8],
     pub kind: u8,
-    pub revision: u64,
+    pub cond: WriteCond<'a>,
+    pub content_type: &'a [u8],
     pub body: &'a [u8],
 }
 
 pub fn decode_admin_put_file(src: &[u8]) -> Result<DecodedAdminPutFile<'_>, WireError> {
-    let header = 22;
-    if src.len() < header {
+    if src.len() < PUT_FILE_HDR {
         return Err(WireError::Truncated);
     }
     if src[0] != OP_PUT_FILE {
@@ -662,21 +683,41 @@ pub fn decode_admin_put_file(src: &[u8]) -> Result<DecodedAdminPutFile<'_>, Wire
     let ns_len = u16::from_le_bytes([src[5], src[6]]) as usize;
     let path_len = u16::from_le_bytes([src[7], src[8]]) as usize;
     let kind = src[9];
-    let revision = u64::from_le_bytes(src[10..18].try_into().unwrap());
-    let body_len = u32::from_le_bytes(src[18..22].try_into().unwrap()) as usize;
-    let total = header + ns_len + path_len + body_len;
+    let mode = src[10];
+    let expect_len = src[11] as usize;
+    let ct_len = src[12] as usize;
+    let body_len = u32::from_le_bytes(src[13..17].try_into().unwrap()) as usize;
+    let total = PUT_FILE_HDR + ns_len + path_len + expect_len + ct_len + body_len;
     if src.len() < total {
         return Err(WireError::Truncated);
     }
-    let ns = &src[header..header + ns_len];
-    let path = &src[header + ns_len..header + ns_len + path_len];
-    let body = &src[header + ns_len + path_len..header + ns_len + path_len + body_len];
+    let mut at = PUT_FILE_HDR;
+    let mut take = |n: usize| {
+        let p = &src[at..at + n];
+        at += n;
+        p
+    };
+    let ns = take(ns_len);
+    let path = take(path_len);
+    let expect = take(expect_len);
+    let content_type = take(ct_len);
+    let body = take(body_len);
+    check_key(ns, path, &[])?;
+    let cond = WriteCond { mode, expect };
+    check_cond(&cond)?;
+    if content_type.len() > CONTENT_TYPE_MAX {
+        return Err(WireError::StringTooLong {
+            len: content_type.len(),
+            max: CONTENT_TYPE_MAX,
+        });
+    }
     Ok(DecodedAdminPutFile {
         correlation_id: cid,
         namespace_root: ns,
         path,
         kind,
-        revision,
+        cond,
+        content_type,
         body,
     })
 }
@@ -743,19 +784,23 @@ pub fn decode_admin_put_file_ack(src: &[u8]) -> Result<(u32, u8, Option<&[u8]>),
 //
 // GetFile: 2-stage — namespace LOOKUP resolves the path to its
 // bound object id (the content digest), then a body_store GET
-// fetches the bytes.
+// fetches the bytes. A non-empty `expect` pins the read to that
+// object id: a key bound to anything else answers STATUS_CONFLICT,
+// so a reader that learned the binding first never gets bytes of a
+// version it did not ask for.
 //
-//   Request:  [op=0x44][cid:u32][ns_len:u16][path_len:u16]
-//             [ns:ns_len][path:path_len]
+//   Request:  [op=0x44][cid:u32][ns_len:u16][path_len:u16][expect_len:u8]
+//             [ns][path][expect]
 //   Response: [op=0x44][cid:u32][status=OK][len:u32][bytes:len]
-//          or [op=0x44][cid:u32][status:u8]        (NOT_FOUND/NAK)
+//          or [op=0x44][cid:u32][status:u8]
 //
-// DeleteFile: 1-stage — namespace UNBIND of the path. The body
-// blob stays (content-addressed, possibly shared by other paths);
-// orphan collection is a scrub concern.
+// DeleteFile: namespace LOOKUP, then UNBIND at the next revision on
+// condition the key has not moved. The body blob stays
+// (content-addressed, possibly shared by other paths); orphan
+// collection is a sweep concern. `mode` is WRITE_ANY or WRITE_IF.
 //
-//   Request:  [op=0x45][cid:u32][ns_len:u16][path_len:u16]
-//             [ns:ns_len][path:path_len]
+//   Request:  [op=0x45][cid:u32][ns_len:u16][path_len:u16][mode:u8]
+//             [expect_len:u8][ns][path][expect]
 //   Response: [op=0x45][cid:u32][status:u8]
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -818,12 +863,87 @@ pub fn encode_admin_get_file(
     correlation_id: u32,
     namespace_root: &[u8],
     path: &[u8],
+    expect: &[u8],
 ) -> Result<usize, WireError> {
-    encode_path_req(dst, OP_GET_FILE, correlation_id, namespace_root, path)
+    encode_pinned_req(
+        dst,
+        OP_GET_FILE,
+        correlation_id,
+        namespace_root,
+        path,
+        expect,
+    )
 }
 
-pub fn decode_admin_get_file(src: &[u8]) -> Result<DecodedAdminPathReq<'_>, WireError> {
-    decode_path_req(src, OP_GET_FILE)
+pub fn decode_admin_get_file(src: &[u8]) -> Result<DecodedPinnedReq<'_>, WireError> {
+    decode_pinned_req(src, OP_GET_FILE)
+}
+
+/// A path request that may be pinned to an expected object id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedPinnedReq<'a> {
+    pub correlation_id: u32,
+    pub namespace_root: &'a [u8],
+    pub path: &'a [u8],
+    /// Empty: unpinned.
+    pub expect: &'a [u8],
+}
+
+fn encode_pinned_req(
+    dst: &mut [u8],
+    op: u8,
+    correlation_id: u32,
+    namespace_root: &[u8],
+    path: &[u8],
+    expect: &[u8],
+) -> Result<usize, WireError> {
+    check_key(namespace_root, path, expect)?;
+    let header = 1 + 4 + 2 + 2 + 1;
+    let needed = header + namespace_root.len() + path.len() + expect.len();
+    if dst.len() < needed {
+        return Err(WireError::BufferTooSmall {
+            needed,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = op;
+    dst[1..5].copy_from_slice(&correlation_id.to_le_bytes());
+    dst[5..7].copy_from_slice(&(namespace_root.len() as u16).to_le_bytes());
+    dst[7..9].copy_from_slice(&(path.len() as u16).to_le_bytes());
+    dst[9] = expect.len() as u8;
+    let mut at = header;
+    for part in [namespace_root, path, expect] {
+        dst[at..at + part.len()].copy_from_slice(part);
+        at += part.len();
+    }
+    Ok(needed)
+}
+
+fn decode_pinned_req(src: &[u8], op: u8) -> Result<DecodedPinnedReq<'_>, WireError> {
+    let header = 10;
+    if src.len() < header {
+        return Err(WireError::Truncated);
+    }
+    if src[0] != op {
+        return Err(WireError::BadOpcode { observed: src[0] });
+    }
+    let cid = u32::from_le_bytes(src[1..5].try_into().unwrap());
+    let ns_len = u16::from_le_bytes([src[5], src[6]]) as usize;
+    let path_len = u16::from_le_bytes([src[7], src[8]]) as usize;
+    let expect_len = src[9] as usize;
+    if src.len() < header + ns_len + path_len + expect_len {
+        return Err(WireError::Truncated);
+    }
+    let ns = &src[header..header + ns_len];
+    let path = &src[header + ns_len..header + ns_len + path_len];
+    let expect = &src[header + ns_len + path_len..header + ns_len + path_len + expect_len];
+    check_key(ns, path, expect)?;
+    Ok(DecodedPinnedReq {
+        correlation_id: cid,
+        namespace_root: ns,
+        path,
+        expect,
+    })
 }
 
 pub fn encode_admin_get_file_ack(
@@ -891,12 +1011,76 @@ pub fn encode_admin_delete_file(
     correlation_id: u32,
     namespace_root: &[u8],
     path: &[u8],
+    cond: &WriteCond<'_>,
 ) -> Result<usize, WireError> {
-    encode_path_req(dst, OP_DELETE_FILE, correlation_id, namespace_root, path)
+    check_key(namespace_root, path, &[])?;
+    check_cond(cond)?;
+    if cond.mode == WRITE_ABSENT {
+        return Err(WireError::BadOpcode {
+            observed: cond.mode,
+        });
+    }
+    let header = 1 + 4 + 2 + 2 + 1 + 1;
+    let needed = header + namespace_root.len() + path.len() + cond.expect.len();
+    if dst.len() < needed {
+        return Err(WireError::BufferTooSmall {
+            needed,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = OP_DELETE_FILE;
+    dst[1..5].copy_from_slice(&correlation_id.to_le_bytes());
+    dst[5..7].copy_from_slice(&(namespace_root.len() as u16).to_le_bytes());
+    dst[7..9].copy_from_slice(&(path.len() as u16).to_le_bytes());
+    dst[9] = cond.mode;
+    dst[10] = cond.expect.len() as u8;
+    let mut at = header;
+    for part in [namespace_root, path, cond.expect] {
+        dst[at..at + part.len()].copy_from_slice(part);
+        at += part.len();
+    }
+    Ok(needed)
 }
 
-pub fn decode_admin_delete_file(src: &[u8]) -> Result<DecodedAdminPathReq<'_>, WireError> {
-    decode_path_req(src, OP_DELETE_FILE)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedAdminDeleteFile<'a> {
+    pub correlation_id: u32,
+    pub namespace_root: &'a [u8],
+    pub path: &'a [u8],
+    pub cond: WriteCond<'a>,
+}
+
+pub fn decode_admin_delete_file(src: &[u8]) -> Result<DecodedAdminDeleteFile<'_>, WireError> {
+    let header = 11;
+    if src.len() < header {
+        return Err(WireError::Truncated);
+    }
+    if src[0] != OP_DELETE_FILE {
+        return Err(WireError::BadOpcode { observed: src[0] });
+    }
+    let cid = u32::from_le_bytes(src[1..5].try_into().unwrap());
+    let ns_len = u16::from_le_bytes([src[5], src[6]]) as usize;
+    let path_len = u16::from_le_bytes([src[7], src[8]]) as usize;
+    let mode = src[9];
+    let expect_len = src[10] as usize;
+    if src.len() < header + ns_len + path_len + expect_len {
+        return Err(WireError::Truncated);
+    }
+    let ns = &src[header..header + ns_len];
+    let path = &src[header + ns_len..header + ns_len + path_len];
+    let expect = &src[header + ns_len + path_len..header + ns_len + path_len + expect_len];
+    check_key(ns, path, &[])?;
+    let cond = WriteCond { mode, expect };
+    check_cond(&cond)?;
+    if mode == WRITE_ABSENT {
+        return Err(WireError::BadOpcode { observed: mode });
+    }
+    Ok(DecodedAdminDeleteFile {
+        correlation_id: cid,
+        namespace_root: ns,
+        path,
+        cond,
+    })
 }
 
 pub fn encode_admin_delete_file_ack(
@@ -929,25 +1113,30 @@ pub fn decode_admin_delete_file_ack(src: &[u8]) -> Result<(u32, u8), WireError> 
 
 // ── AdminListFiles ────────────────────────────────────────────────
 //
-// Cursor-paged enumeration of a namespace root's bound paths
-// (forwarded to the namespace_router's OP_LIST).
+// One page of a root's bindings under a prefix, in name order after a
+// cursor, with what each binding records.
 //
-//   Request:  [op=0x46][cid:u32][root_len:u16][cursor:u32][max:u8]
-//             [root:root_len]
-//   Response: [op=0x46][cid:u32][status:u8][next_cursor:u32]
-//             [count:u8][(path_len:u16,path)*]      (status OK)
-//          or [op=0x46][cid:u32][status:u8]          (NAK)
+//   Request: [op=0x46][cid:u32][root_len:u16][prefix_len:u16][after_len:u16]
+//            [max:u8][root][prefix][after]
+//   Ack:     [op=0x46][cid:u32][status:u8], then on STATUS_OK
+//            [count:u8][more:u8] and per entry [path_len:u16][path][binding]
+//
+// `binding` is the shape the lookup ack carries (`AdminBinding`). The
+// next page asks with `after` = the last path; `more` 0 ends the
+// listing.
 
 pub fn encode_admin_list_files(
     dst: &mut [u8],
     correlation_id: u32,
     namespace_root: &[u8],
-    cursor: u32,
+    prefix: &[u8],
+    after: &[u8],
     max: u8,
 ) -> Result<usize, WireError> {
-    check_key(namespace_root, &[], &[])?;
-    let header = 1 + 4 + 2 + 4 + 1;
-    let needed = header + namespace_root.len();
+    check_key(namespace_root, prefix, &[])?;
+    check_key(namespace_root, after, &[])?;
+    let header = 12;
+    let needed = header + namespace_root.len() + prefix.len() + after.len();
     if dst.len() < needed {
         return Err(WireError::BufferTooSmall {
             needed,
@@ -957,9 +1146,14 @@ pub fn encode_admin_list_files(
     dst[0] = OP_LIST_FILES;
     dst[1..5].copy_from_slice(&correlation_id.to_le_bytes());
     dst[5..7].copy_from_slice(&(namespace_root.len() as u16).to_le_bytes());
-    dst[7..11].copy_from_slice(&cursor.to_le_bytes());
+    dst[7..9].copy_from_slice(&(prefix.len() as u16).to_le_bytes());
+    dst[9..11].copy_from_slice(&(after.len() as u16).to_le_bytes());
     dst[11] = max;
-    dst[header..needed].copy_from_slice(namespace_root);
+    let mut at = header;
+    for part in [namespace_root, prefix, after] {
+        dst[at..at + part.len()].copy_from_slice(part);
+        at += part.len();
+    }
     Ok(needed)
 }
 
@@ -967,7 +1161,8 @@ pub fn encode_admin_list_files(
 pub struct DecodedAdminListFiles<'a> {
     pub correlation_id: u32,
     pub namespace_root: &'a [u8],
-    pub cursor: u32,
+    pub prefix: &'a [u8],
+    pub after: &'a [u8],
     pub max: u8,
 }
 
@@ -980,63 +1175,96 @@ pub fn decode_admin_list_files(src: &[u8]) -> Result<DecodedAdminListFiles<'_>, 
         return Err(WireError::BadOpcode { observed: src[0] });
     }
     let root_len = u16::from_le_bytes([src[5], src[6]]) as usize;
-    if src.len() < header + root_len {
+    let prefix_len = u16::from_le_bytes([src[7], src[8]]) as usize;
+    let after_len = u16::from_le_bytes([src[9], src[10]]) as usize;
+    if src.len() < header + root_len + prefix_len + after_len {
         return Err(WireError::Truncated);
     }
+    let root = &src[header..header + root_len];
+    let prefix = &src[header + root_len..header + root_len + prefix_len];
+    let after = &src[header + root_len + prefix_len..header + root_len + prefix_len + after_len];
+    check_key(root, prefix, &[])?;
+    check_key(root, after, &[])?;
     Ok(DecodedAdminListFiles {
         correlation_id: u32::from_le_bytes(src[1..5].try_into().unwrap()),
-        namespace_root: &src[header..header + root_len],
-        cursor: u32::from_le_bytes(src[7..11].try_into().unwrap()),
+        namespace_root: root,
+        prefix,
+        after,
         max: src[11],
     })
 }
 
-/// Encode an OK list ack by embedding the namespace ListResp's
-/// entry section verbatim (`entries` = the bytes after the ns
-/// resp header, `count` entries, next cursor as given).
-pub fn encode_admin_list_files_ack(
+/// Writes one listing ack, entry by entry.
+pub struct ListFilesWriter<'a> {
+    out: &'a mut [u8],
+    at: usize,
+    count: u8,
+}
+
+impl<'a> ListFilesWriter<'a> {
+    /// A writer for a STATUS_OK page; `None` when `out` is too small for
+    /// its header.
+    pub fn new(out: &'a mut [u8], correlation_id: u32) -> Option<Self> {
+        if out.len() < 8 {
+            return None;
+        }
+        out[0] = OP_LIST_FILES;
+        out[1..5].copy_from_slice(&correlation_id.to_le_bytes());
+        out[5] = STATUS_OK;
+        Some(ListFilesWriter {
+            out,
+            at: 8,
+            count: 0,
+        })
+    }
+
+    /// Append one entry; false when it does not fit.
+    pub fn push(&mut self, path: &[u8], b: &AdminBinding<'_>) -> bool {
+        let need = 2 + path.len() + binding_tail_len(b);
+        if self.at + need > self.out.len() || self.count == u8::MAX {
+            return false;
+        }
+        let at = self.at;
+        self.out[at..at + 2].copy_from_slice(&(path.len() as u16).to_le_bytes());
+        self.out[at + 2..at + 2 + path.len()].copy_from_slice(path);
+        put_binding_tail(&mut self.out[at + 2 + path.len()..], b);
+        self.at += need;
+        self.count += 1;
+        true
+    }
+
+    /// Close the page; its length.
+    pub fn finish(self, more: bool) -> usize {
+        self.out[6] = self.count;
+        self.out[7] = u8::from(more);
+        self.at
+    }
+}
+
+/// A refused listing's ack.
+pub fn encode_admin_list_files_status(
     dst: &mut [u8],
     correlation_id: u32,
     status: u8,
-    next_cursor: u32,
-    count: u8,
-    entries: &[u8],
 ) -> Result<usize, WireError> {
-    if status != STATUS_OK {
-        let needed = 1 + 4 + 1;
-        if dst.len() < needed {
-            return Err(WireError::BufferTooSmall {
-                needed,
-                actual: dst.len(),
-            });
-        }
-        dst[0] = OP_LIST_FILES;
-        dst[1..5].copy_from_slice(&correlation_id.to_le_bytes());
-        dst[5] = status;
-        return Ok(needed);
-    }
-    let needed = 1 + 4 + 1 + 4 + 1 + entries.len();
-    if dst.len() < needed {
+    if dst.len() < 6 {
         return Err(WireError::BufferTooSmall {
-            needed,
+            needed: 6,
             actual: dst.len(),
         });
     }
     dst[0] = OP_LIST_FILES;
     dst[1..5].copy_from_slice(&correlation_id.to_le_bytes());
-    dst[5] = STATUS_OK;
-    dst[6..10].copy_from_slice(&next_cursor.to_le_bytes());
-    dst[10] = count;
-    dst[11..needed].copy_from_slice(entries);
-    Ok(needed)
+    dst[5] = status;
+    Ok(6)
 }
 
-/// Decode a list ack, calling `emit` per path. Returns
-/// (cid, status, next_cursor, count).
+/// Decode a listing ack, calling `emit` per entry in order. Returns
+/// `(cid, status, more)`.
 pub fn decode_admin_list_files_ack(
     src: &[u8],
-    mut emit: impl FnMut(&[u8]),
-) -> Result<(u32, u8, u32, usize), WireError> {
+    mut emit: impl FnMut(&[u8], &AdminBinding<'_>),
+) -> Result<(u32, u8, bool), WireError> {
     if src.len() < 6 {
         return Err(WireError::Truncated);
     }
@@ -1046,27 +1274,29 @@ pub fn decode_admin_list_files_ack(
     let cid = u32::from_le_bytes(src[1..5].try_into().unwrap());
     let status = src[5];
     if status != STATUS_OK {
-        return Ok((cid, status, 0, 0));
+        return Ok((cid, status, false));
     }
-    if src.len() < 11 {
+    if src.len() < 8 {
         return Err(WireError::Truncated);
     }
-    let next_cursor = u32::from_le_bytes(src[6..10].try_into().unwrap());
-    let count = src[10] as usize;
-    let mut pos = 11usize;
+    let count = src[6] as usize;
+    let mut at = 8usize;
     for _ in 0..count {
-        if pos + 2 > src.len() {
-            return Err(WireError::Truncated);
-        }
-        let plen = u16::from_le_bytes([src[pos], src[pos + 1]]) as usize;
-        pos += 2;
-        if pos + plen > src.len() {
-            return Err(WireError::Truncated);
-        }
-        emit(&src[pos..pos + plen]);
-        pos += plen;
+        let plen = u16::from_le_bytes(
+            src.get(at..at + 2)
+                .ok_or(WireError::Truncated)?
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        at += 2;
+        let path = src.get(at..at + plen).ok_or(WireError::Truncated)?;
+        at += plen;
+        let (b, n) = take_binding_tail(src.get(at..).ok_or(WireError::Truncated)?)
+            .ok_or(WireError::Truncated)?;
+        at += n;
+        emit(path, &b);
     }
-    Ok((cid, status, next_cursor, count))
+    Ok((cid, status, src[7] != 0))
 }
 
 // ── Streamed AdminPutFile (large bodies) ──────────────────────────
@@ -1075,7 +1305,8 @@ pub fn decode_admin_list_files_ack(
 // body-wire chunk cap the writer streams:
 //
 //   PutFileOpen    [op=0x47][cid][ns_len:u16][path_len:u16][kind:u8]
-//                  [revision:u64][digest:32][total_len:u64][ns][path]
+//                  [mode:u8][expect_len:u8][ctype_len:u8]
+//                  [digest:32][total_len:u64][ns][path][expect][ctype]
 //   PutFileOpenAck [op=0x47][cid][status][pfid:u8]
 //   PutFileChunk   [op=0x48][cid][pfid:u8][len:u32][bytes]
 //   PutFileChunkAck[op=0x48][cid][status]
@@ -1089,7 +1320,8 @@ pub fn decode_admin_list_files_ack(
 // corrupted stream publishes nothing and never reaches the bind.
 //
 //   ReadFileRange  [op=0x4A][cid][off:u64][len:u32]
-//                  [ns_len:u16][path_len:u16][ns][path]
+//                  [ns_len:u16][path_len:u16][expect_len:u8]
+//                  [ns][path][expect]       (expect pins, as GetFile)
 //   ReadFileRangeAck [op=0x4A][cid][status][len:u32][bytes]
 //   StatFile       [op=0x4B][cid][ns_len:u16][path_len:u16][ns][path]
 //   StatFileAck    [op=0x4B][cid][status][size:u64]
@@ -1100,7 +1332,8 @@ pub struct DecodedPutFileOpen<'a> {
     pub namespace_root: &'a [u8],
     pub path: &'a [u8],
     pub kind: u8,
-    pub revision: u64,
+    pub cond: WriteCond<'a>,
+    pub content_type: &'a [u8],
     pub digest: &'a [u8],
     pub total_len: u64,
 }
@@ -1115,13 +1348,24 @@ pub fn encode_put_file_open(
     namespace_root: &[u8],
     path: &[u8],
     kind: u8,
-    revision: u64,
+    cond: &WriteCond<'_>,
+    content_type: &[u8],
     digest: &[u8; DIGEST_LEN],
     total_len: u64,
 ) -> Result<usize, WireError> {
     check_key(namespace_root, path, &[])?;
-    let header = 1 + 4 + 2 + 2 + 1 + 8 + DIGEST_LEN + 8;
-    let needed = header + namespace_root.len() + path.len();
+    check_cond(cond)?;
+    if content_type.len() > CONTENT_TYPE_MAX {
+        return Err(WireError::StringTooLong {
+            len: content_type.len(),
+            max: CONTENT_TYPE_MAX,
+        });
+    }
+    let needed = PUT_FILE_OPEN_HDR
+        + namespace_root.len()
+        + path.len()
+        + cond.expect.len()
+        + content_type.len();
     if dst.len() < needed {
         return Err(WireError::BufferTooSmall {
             needed,
@@ -1133,19 +1377,23 @@ pub fn encode_put_file_open(
     dst[5..7].copy_from_slice(&(namespace_root.len() as u16).to_le_bytes());
     dst[7..9].copy_from_slice(&(path.len() as u16).to_le_bytes());
     dst[9] = kind;
-    dst[10..18].copy_from_slice(&revision.to_le_bytes());
-    dst[18..18 + DIGEST_LEN].copy_from_slice(digest);
-    dst[18 + DIGEST_LEN..header].copy_from_slice(&total_len.to_le_bytes());
-    let mut cursor = header;
-    dst[cursor..cursor + namespace_root.len()].copy_from_slice(namespace_root);
-    cursor += namespace_root.len();
-    dst[cursor..cursor + path.len()].copy_from_slice(path);
+    dst[10] = cond.mode;
+    dst[11] = cond.expect.len() as u8;
+    dst[12] = content_type.len() as u8;
+    dst[13..13 + DIGEST_LEN].copy_from_slice(digest);
+    dst[13 + DIGEST_LEN..PUT_FILE_OPEN_HDR].copy_from_slice(&total_len.to_le_bytes());
+    let mut at = PUT_FILE_OPEN_HDR;
+    for part in [namespace_root, path, cond.expect, content_type] {
+        dst[at..at + part.len()].copy_from_slice(part);
+        at += part.len();
+    }
     Ok(needed)
 }
 
+const PUT_FILE_OPEN_HDR: usize = 1 + 4 + 2 + 2 + 1 + 1 + 1 + 1 + DIGEST_LEN + 8;
+
 pub fn decode_put_file_open(src: &[u8]) -> Result<DecodedPutFileOpen<'_>, WireError> {
-    let header = 1 + 4 + 2 + 2 + 1 + 8 + DIGEST_LEN + 8;
-    if src.len() < header {
+    if src.len() < PUT_FILE_OPEN_HDR {
         return Err(WireError::Truncated);
     }
     if src[0] != OP_PUT_FILE_OPEN {
@@ -1153,17 +1401,42 @@ pub fn decode_put_file_open(src: &[u8]) -> Result<DecodedPutFileOpen<'_>, WireEr
     }
     let ns_len = u16::from_le_bytes([src[5], src[6]]) as usize;
     let path_len = u16::from_le_bytes([src[7], src[8]]) as usize;
-    if src.len() < header + ns_len + path_len {
+    let expect_len = src[11] as usize;
+    let ct_len = src[12] as usize;
+    if src.len() < PUT_FILE_OPEN_HDR + ns_len + path_len + expect_len + ct_len {
         return Err(WireError::Truncated);
+    }
+    let mut at = PUT_FILE_OPEN_HDR;
+    let mut take = |n: usize| {
+        let p = &src[at..at + n];
+        at += n;
+        p
+    };
+    let ns = take(ns_len);
+    let path = take(path_len);
+    let expect = take(expect_len);
+    let content_type = take(ct_len);
+    check_key(ns, path, &[])?;
+    let cond = WriteCond {
+        mode: src[10],
+        expect,
+    };
+    check_cond(&cond)?;
+    if content_type.len() > CONTENT_TYPE_MAX {
+        return Err(WireError::StringTooLong {
+            len: content_type.len(),
+            max: CONTENT_TYPE_MAX,
+        });
     }
     Ok(DecodedPutFileOpen {
         correlation_id: u32::from_le_bytes(src[1..5].try_into().unwrap()),
-        namespace_root: &src[header..header + ns_len],
-        path: &src[header + ns_len..header + ns_len + path_len],
+        namespace_root: ns,
+        path,
         kind: src[9],
-        revision: u64::from_le_bytes(src[10..18].try_into().unwrap()),
-        digest: &src[18..18 + DIGEST_LEN],
-        total_len: u64::from_le_bytes(src[18 + DIGEST_LEN..header].try_into().unwrap()),
+        cond,
+        content_type,
+        digest: &src[13..13 + DIGEST_LEN],
+        total_len: u64::from_le_bytes(src[13 + DIGEST_LEN..PUT_FILE_OPEN_HDR].try_into().unwrap()),
     })
 }
 
@@ -1298,6 +1571,10 @@ pub fn decode_put_file_commit(src: &[u8]) -> Result<(u32, u8), WireError> {
     Ok((u32::from_le_bytes(src[1..5].try_into().unwrap()), src[5]))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "bounded no_std step functions pass explicit scalar params"
+)]
 pub fn encode_read_file_range(
     dst: &mut [u8],
     correlation_id: u32,
@@ -1305,10 +1582,11 @@ pub fn encode_read_file_range(
     len: u32,
     namespace_root: &[u8],
     path: &[u8],
+    expect: &[u8],
 ) -> Result<usize, WireError> {
-    check_key(namespace_root, path, &[])?;
-    let header = 1 + 4 + 8 + 4 + 2 + 2;
-    let needed = header + namespace_root.len() + path.len();
+    check_key(namespace_root, path, expect)?;
+    let header = 1 + 4 + 8 + 4 + 2 + 2 + 1;
+    let needed = header + namespace_root.len() + path.len() + expect.len();
     if dst.len() < needed {
         return Err(WireError::BufferTooSmall {
             needed,
@@ -1321,10 +1599,12 @@ pub fn encode_read_file_range(
     dst[13..17].copy_from_slice(&len.to_le_bytes());
     dst[17..19].copy_from_slice(&(namespace_root.len() as u16).to_le_bytes());
     dst[19..21].copy_from_slice(&(path.len() as u16).to_le_bytes());
-    let mut cursor = header;
-    dst[cursor..cursor + namespace_root.len()].copy_from_slice(namespace_root);
-    cursor += namespace_root.len();
-    dst[cursor..cursor + path.len()].copy_from_slice(path);
+    dst[21] = expect.len() as u8;
+    let mut at = header;
+    for part in [namespace_root, path, expect] {
+        dst[at..at + part.len()].copy_from_slice(part);
+        at += part.len();
+    }
     Ok(needed)
 }
 
@@ -1335,10 +1615,12 @@ pub struct DecodedReadFileRange<'a> {
     pub len: u32,
     pub namespace_root: &'a [u8],
     pub path: &'a [u8],
+    /// Empty: unpinned.
+    pub expect: &'a [u8],
 }
 
 pub fn decode_read_file_range(src: &[u8]) -> Result<DecodedReadFileRange<'_>, WireError> {
-    let header = 21;
+    let header = 22;
     if src.len() < header {
         return Err(WireError::Truncated);
     }
@@ -1347,15 +1629,21 @@ pub fn decode_read_file_range(src: &[u8]) -> Result<DecodedReadFileRange<'_>, Wi
     }
     let ns_len = u16::from_le_bytes([src[17], src[18]]) as usize;
     let path_len = u16::from_le_bytes([src[19], src[20]]) as usize;
-    if src.len() < header + ns_len + path_len {
+    let expect_len = src[21] as usize;
+    if src.len() < header + ns_len + path_len + expect_len {
         return Err(WireError::Truncated);
     }
+    let ns = &src[header..header + ns_len];
+    let path = &src[header + ns_len..header + ns_len + path_len];
+    let expect = &src[header + ns_len + path_len..header + ns_len + path_len + expect_len];
+    check_key(ns, path, expect)?;
     Ok(DecodedReadFileRange {
         correlation_id: u32::from_le_bytes(src[1..5].try_into().unwrap()),
         off: u64::from_le_bytes(src[5..13].try_into().unwrap()),
         len: u32::from_le_bytes(src[13..17].try_into().unwrap()),
-        namespace_root: &src[header..header + ns_len],
-        path: &src[header + ns_len..header + ns_len + path_len],
+        namespace_root: ns,
+        path,
+        expect,
     })
 }
 
@@ -1495,24 +1783,300 @@ pub fn request_len(src: &[u8]) -> Result<usize, WireError> {
         }
         Ok(u32::from_le_bytes([src[at], src[at + 1], src[at + 2], src[at + 3]]) as usize)
     };
+    let u8_at = |at: usize| -> Result<usize, WireError> {
+        src.get(at).map(|b| *b as usize).ok_or(WireError::Truncated)
+    };
     match op {
-        OP_AUTH => Ok(7 + u16_at(5)?),
-        OP_BIND => Ok(20 + u16_at(5)? + u16_at(7)? + u16_at(9)?),
+        OP_BIND => Ok(BIND_HDR + u16_at(5)? + u16_at(7)? + u16_at(9)? + u8_at(28)?),
         OP_PUT_BODY => Ok(9 + u32_at(5)?),
         OP_GET_BODY => Ok(5 + DIGEST_LEN),
-        OP_PUT_FILE => Ok(22 + u16_at(5)? + u16_at(7)? + u32_at(18)?),
-        OP_GET_FILE | OP_DELETE_FILE | OP_STAT_FILE | OP_LOOKUP => Ok(9 + u16_at(5)? + u16_at(7)?),
-        OP_LIST_FILES => Ok(12 + u16_at(5)?),
-        OP_PUT_FILE_OPEN => Ok(1 + 4 + 2 + 2 + 1 + 8 + DIGEST_LEN + 8 + u16_at(5)? + u16_at(7)?),
+        OP_PUT_FILE => {
+            Ok(PUT_FILE_HDR + u16_at(5)? + u16_at(7)? + u8_at(11)? + u8_at(12)? + u32_at(13)?)
+        }
+        OP_GET_FILE => Ok(10 + u16_at(5)? + u16_at(7)? + u8_at(9)?),
+        OP_DELETE_FILE => Ok(11 + u16_at(5)? + u16_at(7)? + u8_at(10)?),
+        OP_STAT_FILE | OP_LOOKUP => Ok(9 + u16_at(5)? + u16_at(7)?),
+        OP_LIST_FILES => Ok(12 + u16_at(5)? + u16_at(7)? + u16_at(9)?),
+        OP_PUT_FILE_OPEN => {
+            Ok(PUT_FILE_OPEN_HDR + u16_at(5)? + u16_at(7)? + u8_at(11)? + u8_at(12)?)
+        }
         OP_PUT_FILE_CHUNK => Ok(10 + u32_at(6)?),
         OP_PUT_FILE_COMMIT => Ok(6),
-        OP_READ_FILE_RANGE => Ok(21 + u16_at(17)? + u16_at(19)?),
+        OP_READ_FILE_RANGE => Ok(22 + u16_at(17)? + u16_at(19)? + u8_at(21)?),
         OP_PUT_BODY_KEYED => Ok(1 + 4 + DIGEST_LEN + 4 + u32_at(37)?),
         OP_DELETE_BODY => Ok(1 + 4 + DIGEST_LEN),
         OP_LEASE => Ok(LEASE_REQ_HDR + u16_at(6)? + u16_at(8)?),
         OP_VOLUME => Ok(VOLUME_REQ_HDR + u16_at(6)? + u16_at(8)? + u16_at(10)?),
         observed => Err(WireError::BadOpcode { observed }),
     }
+}
+
+/// The length of the answer frame at the front of `src`, read from its
+/// header alone — the client's counterpart of [`request_len`].
+/// `Truncated` until enough of it has arrived to say; `BadOpcode` for a
+/// byte that names no answer.
+pub fn response_len(src: &[u8]) -> Result<usize, WireError> {
+    let op = *src.first().ok_or(WireError::Truncated)?;
+    let status = || src.get(5).copied().ok_or(WireError::Truncated);
+    let u32_at = |at: usize| -> Result<usize, WireError> {
+        let b = src.get(at..at + 4).ok_or(WireError::Truncated)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    };
+    match op {
+        OP_BIND | OP_DELETE_FILE | OP_PUT_FILE_CHUNK | OP_PUT_BODY_KEYED => Ok(6),
+        OP_DELETE_BODY => Ok(7),
+        OP_PUT_FILE_OPEN => Ok(7),
+        OP_STAT_FILE => Ok(14),
+        OP_LEASE => Ok(LEASE_ACK_LEN),
+        OP_VOLUME => Ok(14),
+        OP_PUT_BODY | OP_PUT_FILE => Ok(if status()? == STATUS_OK {
+            6 + DIGEST_LEN
+        } else {
+            6
+        }),
+        OP_GET_BODY | OP_GET_FILE | OP_READ_FILE_RANGE => Ok(if status()? == STATUS_OK {
+            10 + u32_at(6)?
+        } else {
+            6
+        }),
+        OP_LOOKUP => Ok(if status()? == STATUS_OK {
+            6 + binding_tail_record_len(&src[6..])?
+        } else {
+            6
+        }),
+        OP_LIST_FILES => {
+            if status()? != STATUS_OK {
+                return Ok(6);
+            }
+            let count = *src.get(6).ok_or(WireError::Truncated)? as usize;
+            let mut at = 8;
+            for _ in 0..count {
+                let b = src.get(at..at + 2).ok_or(WireError::Truncated)?;
+                at += 2 + u16::from_le_bytes([b[0], b[1]]) as usize;
+                at += binding_tail_record_len(src.get(at..).ok_or(WireError::Truncated)?)?;
+            }
+            Ok(at)
+        }
+        observed => Err(WireError::BadOpcode { observed }),
+    }
+}
+
+/// Answer request `frame` with `status` in that op's own ack shape, so a
+/// client decodes a refusal with the decoder it was already waiting on.
+/// Returns the length written to `out` (at least 32 bytes).
+pub fn refusal(frame: &[u8], status: u8, out: &mut [u8]) -> usize {
+    let op = frame.first().copied().unwrap_or(0);
+    let cid = if frame.len() >= 5 {
+        u32::from_le_bytes([frame[1], frame[2], frame[3], frame[4]])
+    } else {
+        0
+    };
+    let n = match op {
+        OP_BIND => encode_admin_bind_ack(out, cid, status),
+        OP_PUT_BODY => encode_admin_put_body_ack(out, cid, status, None),
+        OP_GET_BODY => encode_admin_get_body_ack(out, cid, status, None),
+        // A streamed write's commit is answered as a whole-file put.
+        OP_PUT_FILE | OP_PUT_FILE_COMMIT => encode_admin_put_file_ack(out, cid, status, None),
+        OP_GET_FILE => encode_admin_get_file_ack(out, cid, status, None),
+        OP_DELETE_FILE => encode_admin_delete_file_ack(out, cid, status),
+        OP_LIST_FILES => encode_admin_list_files_status(out, cid, status),
+        OP_PUT_FILE_OPEN => encode_put_file_open_ack(out, cid, status, 0),
+        OP_PUT_FILE_CHUNK => encode_put_file_chunk_ack(out, cid, status),
+        OP_READ_FILE_RANGE => encode_read_file_range_ack(out, cid, status, None),
+        OP_STAT_FILE => encode_stat_file_ack(out, cid, status, 0),
+        OP_PUT_BODY_KEYED => encode_admin_put_body_keyed_ack(out, cid, status),
+        OP_DELETE_BODY => encode_admin_delete_body_ack(out, cid, status, false),
+        OP_LEASE => encode_admin_lease_ack(out, cid, status, 0, 0),
+        OP_VOLUME => encode_admin_volume_ack(out, cid, status, 0),
+        OP_LOOKUP => encode_admin_lookup_ack(out, cid, status, None),
+        _ => {
+            // No ack shape to borrow: the common envelope.
+            if out.len() < 6 {
+                return 0;
+            }
+            out[0] = op;
+            out[1..5].copy_from_slice(&cid.to_le_bytes());
+            out[5] = status;
+            Ok(6)
+        }
+    };
+    n.unwrap_or(0)
+}
+
+/// What a request touches, for deciding whether a grant covers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope<'a> {
+    /// A key under a namespace root: the grant's scope must be a prefix
+    /// of `root/path`. A listing names its prefix as the path, so it is
+    /// admitted only by a scope that covers every key the prefix can
+    /// reach.
+    Key { root: &'a [u8], path: &'a [u8] },
+    /// The content-addressed body plane, which names no key: a body is
+    /// reachable only by a digest a caller learned from a key it could
+    /// read, and an unbound body is collected. Granted on
+    /// [`BODY_PLANE_OBJECT`].
+    Bodies,
+    /// A write stream: decided by which session opened it.
+    Stream(u8),
+}
+
+/// Which permission an operation needs on its scope, in mesh terms:
+/// reads need `ReadState`, writes and leases `SendCommand`, and the raw
+/// keyed body plane — which overwrites and deletes by key across every
+/// root — `Admin`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Need {
+    Read,
+    Write,
+    Admin,
+}
+
+/// The object a capability over the content-addressed body plane names:
+/// the first 16 bytes of SHA-256 of `"loam.body-plane\0"`. An operator
+/// mints one with `fluxor modules cap mint --object <this, in hex>`.
+pub const BODY_PLANE_DOMAIN: &[u8] = b"loam.body-plane\0";
+
+/// What request `frame` touches and needs, or `None` for a frame that is
+/// not a well-formed request.
+pub fn request_scope(frame: &[u8]) -> Option<(Scope<'_>, Need)> {
+    let op = *frame.first()?;
+    Some(match op {
+        OP_GET_FILE => {
+            let r = decode_admin_get_file(frame).ok()?;
+            (
+                Scope::Key {
+                    root: r.namespace_root,
+                    path: r.path,
+                },
+                Need::Read,
+            )
+        }
+        OP_STAT_FILE => {
+            let r = decode_stat_file(frame).ok()?;
+            (
+                Scope::Key {
+                    root: r.namespace_root,
+                    path: r.path,
+                },
+                Need::Read,
+            )
+        }
+        OP_LOOKUP => {
+            let r = decode_admin_lookup(frame).ok()?;
+            (
+                Scope::Key {
+                    root: r.namespace_root,
+                    path: r.path,
+                },
+                Need::Read,
+            )
+        }
+        OP_READ_FILE_RANGE => {
+            let r = decode_read_file_range(frame).ok()?;
+            (
+                Scope::Key {
+                    root: r.namespace_root,
+                    path: r.path,
+                },
+                Need::Read,
+            )
+        }
+        OP_LIST_FILES => {
+            let r = decode_admin_list_files(frame).ok()?;
+            (
+                Scope::Key {
+                    root: r.namespace_root,
+                    path: r.prefix,
+                },
+                Need::Read,
+            )
+        }
+        OP_BIND => {
+            let r = decode_admin_bind(frame).ok()?;
+            (
+                Scope::Key {
+                    root: r.namespace_root,
+                    path: r.path,
+                },
+                Need::Write,
+            )
+        }
+        OP_PUT_FILE => {
+            let r = decode_admin_put_file(frame).ok()?;
+            (
+                Scope::Key {
+                    root: r.namespace_root,
+                    path: r.path,
+                },
+                Need::Write,
+            )
+        }
+        OP_DELETE_FILE => {
+            let r = decode_admin_delete_file(frame).ok()?;
+            (
+                Scope::Key {
+                    root: r.namespace_root,
+                    path: r.path,
+                },
+                Need::Write,
+            )
+        }
+        OP_PUT_FILE_OPEN => {
+            let r = decode_put_file_open(frame).ok()?;
+            (
+                Scope::Key {
+                    root: r.namespace_root,
+                    path: r.path,
+                },
+                Need::Write,
+            )
+        }
+        OP_VOLUME => {
+            let r = decode_admin_volume(frame).ok()?;
+            (
+                Scope::Key {
+                    root: r.namespace_root,
+                    path: r.path,
+                },
+                Need::Write,
+            )
+        }
+        OP_LEASE => {
+            let r = decode_admin_lease(frame).ok()?;
+            (
+                Scope::Key {
+                    root: r.namespace_root,
+                    path: r.path,
+                },
+                Need::Write,
+            )
+        }
+        OP_PUT_FILE_CHUNK => (
+            Scope::Stream(decode_put_file_chunk(frame).ok()?.1),
+            Need::Write,
+        ),
+        OP_PUT_FILE_COMMIT => (
+            Scope::Stream(decode_put_file_commit(frame).ok()?.1),
+            Need::Write,
+        ),
+        OP_PUT_BODY => {
+            decode_admin_put_body(frame).ok()?;
+            (Scope::Bodies, Need::Write)
+        }
+        OP_GET_BODY => {
+            decode_admin_get_body(frame).ok()?;
+            (Scope::Bodies, Need::Read)
+        }
+        OP_PUT_BODY_KEYED => {
+            decode_admin_put_body_keyed(frame).ok()?;
+            (Scope::Bodies, Need::Admin)
+        }
+        OP_DELETE_BODY => {
+            decode_admin_delete_body(frame).ok()?;
+            (Scope::Bodies, Need::Admin)
+        }
+        _ => return None,
+    })
 }
 
 // ── AdminLease (volume writer lease) ──────────────────────────────
@@ -1951,7 +2515,7 @@ pub fn decode_admin_volume_ack(src: &[u8]) -> Result<(u32, u8, u64), WireError> 
 //
 //   LookupReq  [op=0x51][cid:u32][root_len:u16][path_len:u16][root][path]
 //   LookupAck  [op=0x51][cid:u32][status:u8]
-//              then, on STATUS_OK: [revision:u64][kind:u8][oid_len:u8][oid]
+//              then, on STATUS_OK, the binding (`AdminBinding`)
 //
 // What a volume opener needs — the root digest and the revision a
 // commit must name — and what a snapshot needs to bind an entry under
@@ -1970,12 +2534,71 @@ pub fn decode_admin_lookup(src: &[u8]) -> Result<DecodedAdminPathReq<'_>, WireEr
     decode_path_req(src, OP_LOOKUP)
 }
 
-/// A binding as the lookup ack carries it.
+/// A binding as the lookup and listing acks carry it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdminBinding<'a> {
     pub revision: u64,
     pub kind: u8,
     pub object_id: &'a [u8],
+    /// Wall-clock milliseconds the write was admitted at.
+    pub stamp_ms: u64,
+    pub size: u64,
+    pub content_type: &'a [u8],
+}
+
+/// `[revision:u64][kind][oid_len:u8][oid][stamp:u64][size:u64]
+/// [ctype_len:u8][ctype]`
+fn binding_tail_len(b: &AdminBinding<'_>) -> usize {
+    8 + 1 + 1 + b.object_id.len() + 8 + 8 + 1 + b.content_type.len()
+}
+
+fn put_binding_tail(dst: &mut [u8], b: &AdminBinding<'_>) -> usize {
+    dst[0..8].copy_from_slice(&b.revision.to_le_bytes());
+    dst[8] = b.kind;
+    dst[9] = b.object_id.len() as u8;
+    let mut at = 10;
+    dst[at..at + b.object_id.len()].copy_from_slice(b.object_id);
+    at += b.object_id.len();
+    dst[at..at + 8].copy_from_slice(&b.stamp_ms.to_le_bytes());
+    dst[at + 8..at + 16].copy_from_slice(&b.size.to_le_bytes());
+    at += 16;
+    dst[at] = b.content_type.len() as u8;
+    dst[at + 1..at + 1 + b.content_type.len()].copy_from_slice(b.content_type);
+    at + 1 + b.content_type.len()
+}
+
+fn take_binding_tail(src: &[u8]) -> Option<(AdminBinding<'_>, usize)> {
+    let revision = u64::from_le_bytes(src.get(0..8)?.try_into().ok()?);
+    let kind = *src.get(8)?;
+    let oid_len = *src.get(9)? as usize;
+    let mut at = 10;
+    let object_id = src.get(at..at + oid_len)?;
+    at += oid_len;
+    let stamp_ms = u64::from_le_bytes(src.get(at..at + 8)?.try_into().ok()?);
+    let size = u64::from_le_bytes(src.get(at + 8..at + 16)?.try_into().ok()?);
+    at += 16;
+    let ct_len = *src.get(at)? as usize;
+    let content_type = src.get(at + 1..at + 1 + ct_len)?;
+    Some((
+        AdminBinding {
+            revision,
+            kind,
+            object_id,
+            stamp_ms,
+            size,
+            content_type,
+        },
+        at + 1 + ct_len,
+    ))
+}
+
+/// The length of a binding tail at the front of `src`, from its length
+/// fields alone.
+fn binding_tail_record_len(src: &[u8]) -> Result<usize, WireError> {
+    let oid_len = *src.get(9).ok_or(WireError::Truncated)? as usize;
+    let ct_at = 10 + oid_len + 16;
+    let ct_len = *src.get(ct_at).ok_or(WireError::Truncated)? as usize;
+    Ok(ct_at + 1 + ct_len)
 }
 
 pub fn encode_admin_lookup_ack(
@@ -1986,13 +2609,13 @@ pub fn encode_admin_lookup_ack(
 ) -> Result<usize, WireError> {
     let tail = match binding {
         Some(b) if status == STATUS_OK => {
-            if b.object_id.len() > MAX_OBJECT_ID {
+            if b.object_id.len() > MAX_OBJECT_ID || b.content_type.len() > CONTENT_TYPE_MAX {
                 return Err(WireError::StringTooLong {
-                    len: b.object_id.len(),
+                    len: b.object_id.len().max(b.content_type.len()),
                     max: MAX_OBJECT_ID,
                 });
             }
-            8 + 1 + 1 + b.object_id.len()
+            binding_tail_len(b)
         }
         _ => 0,
     };
@@ -2008,10 +2631,7 @@ pub fn encode_admin_lookup_ack(
     dst[5] = status;
     if let Some(b) = binding {
         if tail != 0 {
-            dst[6..14].copy_from_slice(&b.revision.to_le_bytes());
-            dst[14] = b.kind;
-            dst[15] = b.object_id.len() as u8;
-            dst[16..16 + b.object_id.len()].copy_from_slice(b.object_id);
+            put_binding_tail(&mut dst[6..], b);
         }
     }
     Ok(needed)
@@ -2033,20 +2653,6 @@ pub fn decode_admin_lookup_ack(
     if status != STATUS_OK {
         return Ok((cid, status, None));
     }
-    if src.len() < 16 {
-        return Err(WireError::Truncated);
-    }
-    let oid_len = src[15] as usize;
-    if src.len() < 16 + oid_len {
-        return Err(WireError::Truncated);
-    }
-    Ok((
-        cid,
-        status,
-        Some(AdminBinding {
-            revision: u64::from_le_bytes(src[6..14].try_into().unwrap()),
-            kind: src[14],
-            object_id: &src[16..16 + oid_len],
-        }),
-    ))
+    let (b, _) = take_binding_tail(&src[6..]).ok_or(WireError::Truncated)?;
+    Ok((cid, status, Some(b)))
 }

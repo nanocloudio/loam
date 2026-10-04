@@ -239,17 +239,22 @@ unsafe fn init_state(
     0
 }
 
-/// See `namespace_pic_body::decode_wal_path_params`. The proposer
-/// reuses the same dual-format (TLV with tag=1, or raw bytes).
-pub unsafe fn decode_wal_path_params(state_ptr: *mut u8, params: *const u8, params_len: usize) {
+/// See `namespace_pic_body::decode_wal_path_params`.
+pub unsafe fn decode_wal_path_params(
+    state_ptr: *mut u8,
+    params: *const u8,
+    params_len: usize,
+) -> i32 {
     if state_ptr.is_null() {
-        return;
+        return -22;
     }
     let s = &mut *(state_ptr as *mut ModuleState);
-    // The TLV/raw ambiguity lives in one place — `wal_io` — so the
-    // four modules that take a WAL path cannot drift apart on it.
-    if let Some(n) = super::wal::decode_wal_path(params, params_len, &mut s.wal_path) {
-        s.wal_path_len = n as u16;
+    match super::wal::decode_wal_path(params, params_len, &mut s.wal_path) {
+        Ok(n) => {
+            s.wal_path_len = n as u16;
+            0
+        }
+        Err(()) => -22,
     }
 }
 
@@ -414,6 +419,10 @@ pub unsafe fn in_flight(state_ptr: *const u8) -> u32 {
     n
 }
 
+#[allow(
+    clippy::manual_find,
+    reason = "an explicit scan keeps the PIC build panic-free: iterator adapters pull core::panicking paths the bare-metal SDK does not carry"
+)]
 unsafe fn find_pending(s: &mut ModuleState, correlation_id: u32) -> Option<&mut PendingEntry> {
     for slot in s.pending.iter_mut() {
         if slot.in_use != 0 && slot.correlation_id == correlation_id {

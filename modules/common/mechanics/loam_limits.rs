@@ -12,14 +12,11 @@
 //
 // PROFILE SELECTION. A deployment's capacity is a property of the
 // DEPLOYMENT, not of where the code happens to compile, so the profile
-// is an explicit input to each build that can carry one:
-//
-//     rustc --cfg 'loam_profile="server"' …          (cargo builds)
-//     --cfg fluxor_silicon="bcm2712"                  (fluxor module builds)
-//
-// A cargo build given no profile is a single host node. Selecting on
-// the compile target alone is what made a laptop dev graph and a
-// 64-core fleet member carry identical arenas.
+// is chosen by the graph that runs the module: every module that sizes
+// itself from this file builds one `[[variant]]` per profile, the
+// variant's feature names the profile, and a graph picks one with
+// `variant: <profile>`. The test harness builds the same file under the
+// same feature, so a suite runs exactly the arenas that ship.
 //
 // Four profiles, in increasing order of what the machine affords:
 //
@@ -42,68 +39,51 @@
 
 // ── The selector ──────────────────────────────────────────────────
 //
-// Two builds compile this file, and each selects from the input it
-// can actually be given.
-//
-// FLUXOR'S MODULE BUILD compiles a PIC module for one die and says
-// which: `--cfg fluxor_silicon="…"`, declared and value-checked in
-// every module compile. That is fluxor's per-die capacity input, so a
-// bare-metal image takes its profile from the die it was built for.
-// Loam's modules target bcm2712 alone (each manifest's
-// `hardware_targets`), and a Pi 5 / CM5 is the `embedded` budget.
-//
-// CARGO compiles the host binaries, the tests and the profile matrix,
-// and reads `loam_profile`, which the workspace declares. An explicit
-// ladder rather than a match, so an unrecognised value falls through
-// to `node` instead of selecting whichever arm happened to be last.
-//
-// The arms are modules gated on the build, and a cfg-stripped module's
-// contents are never configured: a module build never evaluates
-// `loam_profile`, and a cargo build never needs a die. Each checks
-// exactly the names it declares, with nothing excused.
+// Exactly one profile feature. None, or more than one, is refused by
+// name: a capacity guessed for a build nobody sized is the drift this
+// file exists to prevent.
 
-#[cfg(fluxor_silicon = "bcm2712")]
+#[cfg(feature = "minimal")]
 mod selector {
     /// Human-readable profile name. Diagnostics and the health surface
     /// read it; nothing parses it.
+    pub const PROFILE: &str = "minimal";
+}
+#[cfg(feature = "embedded")]
+mod selector {
     pub const PROFILE: &str = "embedded";
 }
+#[cfg(feature = "node")]
+mod selector {
+    pub const PROFILE: &str = "node";
+}
+#[cfg(feature = "server")]
+mod selector {
+    pub const PROFILE: &str = "server";
+}
 
-// A bare-metal build for a die the selector does not map. Refused by
-// name rather than defaulted: a capacity profile guessed for a die
-// nobody sized it for is the drift this file exists to prevent. The
-// module still names `PROFILE` so the refusal is the only error the
-// build reports, not the first of a cascade.
-#[cfg(all(target_os = "none", not(fluxor_silicon = "bcm2712")))]
+#[cfg(not(any(
+    feature = "minimal",
+    feature = "embedded",
+    feature = "node",
+    feature = "server"
+)))]
 mod selector {
     compile_error!(
-        "no loam capacity profile for this die: map its fluxor_silicon in \
-         the selector in modules/common/mechanics/loam_limits.rs"
+        "no loam capacity profile: build one of the module's variants \
+         (minimal, embedded, node, server)"
     );
-    pub const PROFILE: &str = "unmapped";
+    pub const PROFILE: &str = "unselected";
 }
 
-#[cfg(not(any(fluxor_silicon = "bcm2712", target_os = "none")))]
-mod selector {
-    /// Human-readable profile name. Diagnostics and the health surface
-    /// read it; nothing parses it.
-    #[cfg(loam_profile = "minimal")]
-    pub const PROFILE: &str = "minimal";
-    #[cfg(loam_profile = "embedded")]
-    pub const PROFILE: &str = "embedded";
-    #[cfg(loam_profile = "node")]
-    pub const PROFILE: &str = "node";
-    #[cfg(loam_profile = "server")]
-    pub const PROFILE: &str = "server";
-    /// Nothing was declared: a host build is a single node.
-    #[cfg(not(any(
-        loam_profile = "minimal",
-        loam_profile = "embedded",
-        loam_profile = "node",
-        loam_profile = "server"
-    )))]
-    pub const PROFILE: &str = "node";
-}
+const _: () = assert!(
+    (cfg!(feature = "minimal") as u8)
+        + (cfg!(feature = "embedded") as u8)
+        + (cfg!(feature = "node") as u8)
+        + (cfg!(feature = "server") as u8)
+        <= 1,
+    "more than one loam capacity profile is selected"
+);
 
 pub use selector::PROFILE;
 
@@ -364,15 +344,42 @@ pub const WRITE_SESSIONS: usize = if MINIMAL {
 /// capacity, key width, and which feature tiers it carries.
 pub const PROPOSER_PENDING: usize = if SERVER { 1024 } else { 256 };
 
-/// Outstanding upstream requests per body router, and per-request
-/// fan-out join records. `ROUTER_PENDING` is per fleet member, so
-/// the table is `MAX_FLEET × ROUTER_PENDING` entries — the largest
-/// of these, and still only a few kilobytes. Server-vs-rest, for
-/// the reason above.
-pub const ROUTER_PENDING: usize = if SERVER { 256 } else { 64 };
-
 /// Per-request fan-out join records held by a body router.
+/// Server-vs-rest, for the reason above.
 pub const ROUTER_JOINS: usize = if SERVER { 128 } else { 32 };
+
+/// Body stores one router fronts: the member port pairs it wires.
+///
+/// Each wired member costs the router a staged outbound frame
+/// (`body_frame::FRAME_MAX`, about 60 KiB), because a frame a member's
+/// channel has taken only in part must be finished before anything
+/// else is sent to it. So this is profiled where the saving is real:
+/// two members on `minimal`, four on `embedded`, eight on a host. A
+/// graph wiring a member past it is refused at construction.
+pub const ROUTER_MEMBERS: usize = if MINIMAL {
+    2
+} else if CONSTRAINED {
+    4
+} else {
+    8
+};
+
+/// Answers a body router awaits from its members at once. Derived,
+/// not chosen: every join fans to at most every member, so the table
+/// can never bind before the join table does.
+pub const ROUTER_PENDING: usize = ROUTER_JOINS * ROUTER_MEMBERS;
+
+/// How long a body member has to take a frame and to answer it, in
+/// milliseconds.
+///
+/// A member across a network can lose the requests in flight when its
+/// session ends, and nothing tells the router; an answer that has not
+/// come by this deadline is taken as the member's failure, and a frame
+/// its channel has not taken by then marks the member stalled, so
+/// requests stop waiting on it until it drains. Ten seconds is past
+/// any healthy round trip and inside what a client waits. A protocol
+/// commitment rather than an arena size, so not profiled.
+pub const MEMBER_DEADLINE_MS: u64 = 10_000;
 
 /// Admin ops in flight, composed writes in flight, and streamed
 /// composed writes in flight — the three `admin_router` tables.
@@ -390,6 +397,125 @@ pub const ROUTER_JOINS: usize = if SERVER { 128 } else { 32 };
 pub const ADMIN_PENDING: usize = if SERVER { 256 } else { 64 };
 pub const ADMIN_PUTFILE: usize = if SERVER { 64 } else { 16 };
 pub const ADMIN_STREAMED_PUTFILE: usize = if SERVER { 32 } else { 4 };
+
+/// Times a composed write or delete re-reads a key whose binding moved
+/// between its read and its conditional bind.
+///
+/// The router binds at the revision after the one it read, on condition
+/// that the key still holds it; a writer that lands in between fails the
+/// condition, and the router reads again. Each retry means another
+/// writer committed to the same key inside one round trip, so eight in a
+/// row is contention no client is served by waiting out: the write is
+/// refused `STATUS_BUSY` and the caller backs off. A protocol bound, not
+/// an arena size, so not profiled.
+pub const ADMIN_WRITE_RETRIES: u8 = 8;
+
+// ── Binding metadata ──────────────────────────────────────────────
+
+/// Longest content type a binding records. A storage writer's media
+/// type travels with the key it is bound at, so it is stored inline in
+/// the arena slot, the WAL record and the snapshot record. 128 bytes is
+/// what an S3 server stores for `Content-Type`; a longer one is refused
+/// at the wire, never cut short. Not profiled: a few hundred bytes per
+/// slot is not where a constrained profile is won or lost.
+pub const CONTENT_TYPE_MAX: usize = 128;
+
+// ── The admin gate ────────────────────────────────────────────────
+
+/// Network admin sessions one `admin_gate` serves at once: mutual-TLS
+/// connections, each holding its own grants and a whole request's worth
+/// of reassembly (about 62 KiB on a host). A connection past it is
+/// closed at accept, never queued.
+pub const ADMIN_SESSIONS: usize = if MINIMAL {
+    1
+} else if CONSTRAINED {
+    4
+} else if SERVER {
+    64
+} else {
+    16
+};
+
+/// Sessions one `admin_gate` serves over its in-graph links at once:
+/// a storage provider opens one per grant it presents (an S3 server's
+/// credentials, at most sixteen), a volume one. Small records, so not
+/// profiled past `minimal`. A session past it is refused at its first
+/// record.
+pub const ADMIN_LINK_SESSIONS: usize = if MINIMAL { 4 } else { 32 };
+
+/// Deepest scope a grant can name on the admin plane, counted in `/`
+/// separators of `root/path`. An operation is admitted by a grant whose
+/// scope is a `/`-terminated prefix of its key, and each prefix tried
+/// costs one SHA-256; past this depth no deeper prefix is tried, so a
+/// grant scoped below it admits nothing — refused, never widened to a
+/// shallower one.
+pub const ADMIN_SCOPE_DEPTH: usize = 32;
+
+// ── The object provider ───────────────────────────────────────────
+
+/// Grants one `object_provider` holds: each is a capability a consumer
+/// presented for a scope, and a session of its own on the gate's link,
+/// so scopes never share authority. An S3 server presents one per
+/// credential, at most sixteen. Past it `PRESENT` answers `ENOMEM`.
+pub const OBJECT_GRANTS: usize = if MINIMAL { 4 } else { 16 };
+const _: () = assert!(OBJECT_GRANTS <= ADMIN_LINK_SESSIONS);
+
+/// Requests the provider holds at once: writes and reads in flight to
+/// the gate, and answers decided but not yet collected by the module
+/// that asked. Past it a new request answers `EBUSY`, which a consumer
+/// backs off from.
+pub const OBJECT_PENDING: usize = if MINIMAL {
+    8
+} else if CONSTRAINED {
+    16
+} else if SERVER {
+    256
+} else {
+    64
+};
+
+/// Open read handles (`GET`), each holding one read-ahead window of up
+/// to `MAX_BODY` bytes — the largest allocation per handle, so profiled.
+/// Past it `GET` answers `EBUSY`.
+pub const OBJECT_READS: usize = if MINIMAL {
+    1
+} else if CONSTRAINED {
+    2
+} else if SERVER {
+    64
+} else {
+    16
+};
+
+/// Open streamed writes (`PUT_STREAMED_OPEN`), each spooled to a file
+/// until it commits. Past it `PUT_STREAMED_OPEN` answers `ENOMEM`.
+pub const OBJECT_STREAMS: usize = if MINIMAL {
+    1
+} else if CONSTRAINED {
+    2
+} else if SERVER {
+    64
+} else {
+    16
+};
+
+/// Listing pages held for their askers: a page is up to sixteen entries
+/// of the longest listable key, about 5 KiB.
+pub const OBJECT_LISTS: usize = if MINIMAL {
+    1
+} else if CONSTRAINED {
+    2
+} else {
+    8
+};
+
+/// How long a decided answer, or a grant, waits for the module that
+/// asked to collect it, in milliseconds. A module that stops asking does
+/// not undo what was decided; only the answer is dropped, so the table
+/// is not held by callers that went away. Also how long a request may
+/// wait for the gate's answer before it is answered `EIO`. A protocol
+/// bound, not an arena size.
+pub const OBJECT_HOLD_MS: u64 = 60_000;
 
 /// Cooperative step budget: operations one `module_step` handles
 /// before yielding.

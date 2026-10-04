@@ -11,7 +11,8 @@
 #      the arena can store.
 #
 #   2. NO code outside loam_limits.rs selects on the profile's
-#      inputs — `loam_profile`, `fluxor_silicon`, or
+#      inputs — the `minimal` / `embedded` / `node` / `server`
+#      features a manifest `[[variant]]` sets, `fluxor_silicon`, or
 #      `target_os = "none"`. Profile selection lives in exactly one
 #      file; a second one is drift that makes the register's
 #      per-profile columns a lie.
@@ -58,7 +59,7 @@ if ((${#missing[@]})); then
 fi
 
 # ── (2) profile selection lives in exactly one file ───────────────
-strays=$(grep -rlE 'cfg\(.*(loam_profile|fluxor_silicon|target_os = "none")' \
+strays=$(grep -rlE 'cfg\(.*(feature = "(minimal|embedded|node|server)"|fluxor_silicon|target_os = "none")' \
          --include='*.rs' modules/ | grep -v "^${LIMITS}$" || true)
 if [[ -n $strays ]]; then
   echo "limit_guard: profile selection outside $LIMITS:"

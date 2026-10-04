@@ -19,3 +19,23 @@ content_type = "OctetStream"
 
 [observability]
 exempt = "self-contained e2e fixture; success is its PASS log"
+
+# Capacity profiles (modules/common/mechanics/loam_limits.rs). A graph
+# picks one with `variant: <profile>`; the default is the bare-metal
+# budget a Pi 5 / CM5 affords.
+[[variant]]
+name = "embedded"
+features = ["embedded"]
+default = true
+
+[[variant]]
+name = "minimal"
+features = ["minimal"]
+
+[[variant]]
+name = "node"
+features = ["node"]
+
+[[variant]]
+name = "server"
+features = ["server"]

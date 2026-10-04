@@ -15,13 +15,25 @@
 // Layout (all multi-byte ints are LE):
 //
 //   Bind        [op:u8=1][ns_len:u16][path_len:u16][oid_len:u16]
-//               [kind:u8][revision:u64]
-//               [ns:ns_len][path:path_len][oid:oid_len]
+//               [kind:u8][revision:u64][stamp_ms:u64][size:u64]
+//               [cond:u8][expect:u64][ctype_len:u8]
+//               [ns:ns_len][path:path_len][oid:oid_len][ctype:ctype_len]
 //   Rename      [op:u8=2][ns_len:u16][from_len:u16][to_len:u16]
 //               [new_revision:u64]
 //               [ns:ns_len][from:from_len][to:to_len]
-//   Unbind      [op:u8=3][ns_len:u16][path_len:u16]
+//   Unbind      [op:u8=3][ns_len:u16][path_len:u16][revision:u64]
+//               [cond:u8][expect:u64]
 //               [ns:ns_len][path:path_len]
+//
+// Every record that changes a binding names the revision it leaves the
+// binding at, and applies only when that revision is strictly higher
+// than the one the key holds — live or tombstoned, in the arena or the
+// snapshot. That is what makes a record safe to apply twice: delivery
+// is at least once, and a replayed record finds its own effect, or a
+// later one, already in place. A condition (`cond`) narrows when a
+// record applies — the key absent, or at an expected revision — and is
+// decided where the record is applied, in log order, so every replica
+// and every replay decides it alike. It never chooses a revision.
 //
 // Opcode 0 is reserved (so a zeroed buffer is not a valid record).
 
@@ -62,8 +74,54 @@ pub const NAK_RESERVED_BYTE: u8 = 0xFD;
 /// remove a volume binding, which only a fenced VOLUME record may do.
 pub const NAK_FENCED: u8 = 0xFC;
 
-/// Max paths per OP_LIST response page.
+/// A record refused because its condition did not hold: the key was
+/// present for an ABSENT write, or not at the expected revision.
+pub const NAK_CONDITION: u8 = 0xFB;
+/// A record refused because the revision it names is not above the
+/// key's current one: a write that lost a race, or one already applied.
+pub const NAK_STALE: u8 = 0xFA;
+
+/// When a binding change applies, beyond its revision.
+pub const COND_ANY: u8 = 0;
+/// Only if the key holds no live binding.
+pub const COND_ABSENT: u8 = 1;
+/// Only if the key's current revision (live or tombstoned) equals
+/// `expect`.
+pub const COND_REVISION: u8 = 2;
+
+/// Longest content type a binding carries.
+pub use super::limits::CONTENT_TYPE_MAX;
+
+/// What a binding records besides its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindMeta<'a> {
+    /// Wall-clock milliseconds the writer was admitted at; the router
+    /// decides it once, so every replica records the same value.
+    pub stamp_ms: u64,
+    /// Size of the bound content, as the writer stated it.
+    pub size: u64,
+    pub content_type: &'a [u8],
+}
+
+impl BindMeta<'_> {
+    pub const NONE: BindMeta<'static> = BindMeta {
+        stamp_ms: 0,
+        size: 0,
+        content_type: &[],
+    };
+}
+
+/// Max entries per OP_LIST response page.
 pub const MAX_LIST_PAGE: usize = 16;
+
+/// The largest request record: a bind of the longest key, object id and
+/// content type. What a reader assembling requests from a stream must
+/// hold.
+pub const REQUEST_RECORD_MAX: usize = BIND_HDR
+    + super::limits::MAX_ROOT
+    + super::limits::MAX_PATH
+    + super::limits::MAX_OBJECT_ID
+    + CONTENT_TYPE_MAX;
 
 /// Lookup response status bytes.
 pub const LOOKUP_FOUND: u8 = 1;
@@ -120,6 +178,12 @@ pub fn check_key(namespace_root: &[u8], path: &[u8], object_id: &[u8]) -> Result
 
 // ── Bind ───────────────────────────────────────────────────────────
 
+const BIND_HDR: usize = 1 + 2 + 2 + 2 + 1 + 8 + 8 + 8 + 1 + 8 + 1;
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "bounded no_std step functions pass explicit scalar params"
+)]
 pub fn encode_bind(
     dst: &mut [u8],
     namespace_root: &[u8],
@@ -127,10 +191,22 @@ pub fn encode_bind(
     object_id: &[u8],
     kind: u8,
     revision: u64,
+    meta: &BindMeta<'_>,
+    cond: u8,
+    expect: u64,
 ) -> Result<usize, WireError> {
     check_key(namespace_root, path, object_id)?;
-    let header = 1 + 2 + 2 + 2 + 1 + 8;
-    let needed = header + namespace_root.len() + path.len() + object_id.len();
+    if meta.content_type.len() > CONTENT_TYPE_MAX {
+        return Err(WireError::StringTooLong {
+            len: meta.content_type.len(),
+            max: CONTENT_TYPE_MAX,
+        });
+    }
+    if cond > COND_REVISION {
+        return Err(WireError::BadKind { observed: cond });
+    }
+    let needed =
+        BIND_HDR + namespace_root.len() + path.len() + object_id.len() + meta.content_type.len();
     if dst.len() < needed {
         return Err(WireError::BufferTooSmall {
             needed,
@@ -143,12 +219,16 @@ pub fn encode_bind(
     dst[5..7].copy_from_slice(&(object_id.len() as u16).to_le_bytes());
     dst[7] = kind;
     dst[8..16].copy_from_slice(&revision.to_le_bytes());
-    let mut cursor = header;
-    dst[cursor..cursor + namespace_root.len()].copy_from_slice(namespace_root);
-    cursor += namespace_root.len();
-    dst[cursor..cursor + path.len()].copy_from_slice(path);
-    cursor += path.len();
-    dst[cursor..cursor + object_id.len()].copy_from_slice(object_id);
+    dst[16..24].copy_from_slice(&meta.stamp_ms.to_le_bytes());
+    dst[24..32].copy_from_slice(&meta.size.to_le_bytes());
+    dst[32] = cond;
+    dst[33..41].copy_from_slice(&expect.to_le_bytes());
+    dst[41] = meta.content_type.len() as u8;
+    let mut cursor = BIND_HDR;
+    for part in [namespace_root, path, object_id, meta.content_type] {
+        dst[cursor..cursor + part.len()].copy_from_slice(part);
+        cursor += part.len();
+    }
     Ok(needed)
 }
 
@@ -159,14 +239,19 @@ pub struct DecodedBind<'a> {
     pub object_id: &'a [u8],
     pub kind: u8,
     pub revision: u64,
+    pub meta: BindMeta<'a>,
+    pub cond: u8,
+    pub expect: u64,
 }
 
 pub fn decode_bind(src: &[u8]) -> Result<DecodedBind<'_>, WireError> {
-    if src.len() < 16 {
-        return Err(WireError::Truncated);
+    match src.first() {
+        None => return Err(WireError::Truncated),
+        Some(&op) if op != OP_BIND => return Err(WireError::BadOpcode { observed: op }),
+        _ => {}
     }
-    if src[0] != OP_BIND {
-        return Err(WireError::BadOpcode { observed: src[0] });
+    if src.len() < BIND_HDR {
+        return Err(WireError::Truncated);
     }
     let ns_len = u16::from_le_bytes([src[1], src[2]]) as usize;
     let path_len = u16::from_le_bytes([src[3], src[4]]) as usize;
@@ -176,14 +261,32 @@ pub fn decode_bind(src: &[u8]) -> Result<DecodedBind<'_>, WireError> {
         return Err(WireError::BadKind { observed: kind });
     }
     let revision = u64::from_le_bytes(src[8..16].try_into().unwrap());
-    let header = 16;
-    let total = header + ns_len + path_len + oid_len;
+    let stamp_ms = u64::from_le_bytes(src[16..24].try_into().unwrap());
+    let size = u64::from_le_bytes(src[24..32].try_into().unwrap());
+    let cond = src[32];
+    if cond > COND_REVISION {
+        return Err(WireError::BadKind { observed: cond });
+    }
+    let expect = u64::from_le_bytes(src[33..41].try_into().unwrap());
+    let ct_len = src[41] as usize;
+    if ct_len > CONTENT_TYPE_MAX {
+        return Err(WireError::StringTooLong {
+            len: ct_len,
+            max: CONTENT_TYPE_MAX,
+        });
+    }
+    let total = BIND_HDR + ns_len + path_len + oid_len + ct_len;
     if src.len() < total {
         return Err(WireError::Truncated);
     }
-    let ns = &src[header..header + ns_len];
-    let path = &src[header + ns_len..header + ns_len + path_len];
-    let oid = &src[header + ns_len + path_len..header + ns_len + path_len + oid_len];
+    let mut at = BIND_HDR;
+    let ns = &src[at..at + ns_len];
+    at += ns_len;
+    let path = &src[at..at + path_len];
+    at += path_len;
+    let oid = &src[at..at + oid_len];
+    at += oid_len;
+    let content_type = &src[at..at + ct_len];
     check_key(ns, path, oid)?;
     Ok(DecodedBind {
         namespace_root: ns,
@@ -191,6 +294,13 @@ pub fn decode_bind(src: &[u8]) -> Result<DecodedBind<'_>, WireError> {
         object_id: oid,
         kind,
         revision,
+        meta: BindMeta {
+            stamp_ms,
+            size,
+            content_type,
+        },
+        cond,
+        expect,
     })
 }
 
@@ -264,14 +374,22 @@ pub fn decode_rename(src: &[u8]) -> Result<DecodedRename<'_>, WireError> {
 
 // ── Unbind ─────────────────────────────────────────────────────────
 
+const UNBIND_HDR: usize = 1 + 2 + 2 + 8 + 1 + 8;
+
+/// Delete a binding, leaving the key tombstoned at `revision`.
 pub fn encode_unbind(
     dst: &mut [u8],
     namespace_root: &[u8],
     path: &[u8],
+    revision: u64,
+    cond: u8,
+    expect: u64,
 ) -> Result<usize, WireError> {
     check_key(namespace_root, path, &[])?;
-    let header = 1 + 2 + 2;
-    let needed = header + namespace_root.len() + path.len();
+    if cond > COND_REVISION {
+        return Err(WireError::BadKind { observed: cond });
+    }
+    let needed = UNBIND_HDR + namespace_root.len() + path.len();
     if dst.len() < needed {
         return Err(WireError::BufferTooSmall {
             needed,
@@ -281,7 +399,10 @@ pub fn encode_unbind(
     dst[0] = OP_UNBIND;
     dst[1..3].copy_from_slice(&(namespace_root.len() as u16).to_le_bytes());
     dst[3..5].copy_from_slice(&(path.len() as u16).to_le_bytes());
-    let mut cursor = header;
+    dst[5..13].copy_from_slice(&revision.to_le_bytes());
+    dst[13] = cond;
+    dst[14..22].copy_from_slice(&expect.to_le_bytes());
+    let mut cursor = UNBIND_HDR;
     dst[cursor..cursor + namespace_root.len()].copy_from_slice(namespace_root);
     cursor += namespace_root.len();
     dst[cursor..cursor + path.len()].copy_from_slice(path);
@@ -292,10 +413,13 @@ pub fn encode_unbind(
 pub struct DecodedUnbind<'a> {
     pub namespace_root: &'a [u8],
     pub path: &'a [u8],
+    pub revision: u64,
+    pub cond: u8,
+    pub expect: u64,
 }
 
 pub fn decode_unbind(src: &[u8]) -> Result<DecodedUnbind<'_>, WireError> {
-    if src.len() < 5 {
+    if src.len() < UNBIND_HDR {
         return Err(WireError::Truncated);
     }
     if src[0] != OP_UNBIND {
@@ -303,15 +427,23 @@ pub fn decode_unbind(src: &[u8]) -> Result<DecodedUnbind<'_>, WireError> {
     }
     let ns_len = u16::from_le_bytes([src[1], src[2]]) as usize;
     let path_len = u16::from_le_bytes([src[3], src[4]]) as usize;
-    let header = 5;
-    if src.len() < header + ns_len + path_len {
+    let revision = u64::from_le_bytes(src[5..13].try_into().unwrap());
+    let cond = src[13];
+    if cond > COND_REVISION {
+        return Err(WireError::BadKind { observed: cond });
+    }
+    let expect = u64::from_le_bytes(src[14..22].try_into().unwrap());
+    if src.len() < UNBIND_HDR + ns_len + path_len {
         return Err(WireError::Truncated);
     }
-    let ns = &src[header..header + ns_len];
-    let path = &src[header + ns_len..header + ns_len + path_len];
+    let ns = &src[UNBIND_HDR..UNBIND_HDR + ns_len];
+    let path = &src[UNBIND_HDR + ns_len..UNBIND_HDR + ns_len + path_len];
     Ok(DecodedUnbind {
         namespace_root: ns,
         path,
+        revision,
+        cond,
+        expect,
     })
 }
 
@@ -319,8 +451,12 @@ pub fn decode_unbind(src: &[u8]) -> Result<DecodedUnbind<'_>, WireError> {
 //
 //   Request:           [op:u8=4][ns_len:u16][path_len:u16][ns][path]
 //   Response (found):  [op:u8=4][status:u8=1][object_id_len:u8][object_id]
-//                      [revision:u64][kind:u8]
-//   Response (absent): [op:u8=4][status:u8=0]
+//                      [revision:u64][kind:u8][stamp_ms:u64][size:u64]
+//                      [ctype_len:u8][ctype]
+//   Response (absent): [op:u8=4][status:u8=0][revision:u64]
+//
+// An absent key answers the revision its tombstone holds (0 when none
+// is known), which is what a writer must exceed to bind it again.
 
 pub fn encode_lookup_req(
     dst: &mut [u8],
@@ -373,19 +509,92 @@ pub fn decode_lookup_req(src: &[u8]) -> Result<DecodedLookupReq<'_>, WireError> 
     })
 }
 
-pub fn encode_lookup_found(
-    dst: &mut [u8],
-    object_id: &[u8],
-    revision: u64,
-    kind: u8,
-) -> Result<usize, WireError> {
-    if object_id.len() > 255 {
+/// A binding as the namespace reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Binding<'a> {
+    pub object_id: &'a [u8],
+    pub revision: u64,
+    pub kind: u8,
+    pub meta: BindMeta<'a>,
+}
+
+/// Bytes a binding takes after its leading fields: oid, revision, kind,
+/// stamp, size, content type.
+fn binding_len(b: &Binding<'_>) -> usize {
+    1 + b.object_id.len() + 8 + 1 + 8 + 8 + 1 + b.meta.content_type.len()
+}
+
+fn put_binding(dst: &mut [u8], b: &Binding<'_>) -> usize {
+    let mut at = 0;
+    dst[at] = b.object_id.len() as u8;
+    at += 1;
+    dst[at..at + b.object_id.len()].copy_from_slice(b.object_id);
+    at += b.object_id.len();
+    dst[at..at + 8].copy_from_slice(&b.revision.to_le_bytes());
+    at += 8;
+    dst[at] = b.kind;
+    at += 1;
+    dst[at..at + 8].copy_from_slice(&b.meta.stamp_ms.to_le_bytes());
+    at += 8;
+    dst[at..at + 8].copy_from_slice(&b.meta.size.to_le_bytes());
+    at += 8;
+    dst[at] = b.meta.content_type.len() as u8;
+    at += 1;
+    dst[at..at + b.meta.content_type.len()].copy_from_slice(b.meta.content_type);
+    at + b.meta.content_type.len()
+}
+
+/// Decode a binding at the front of `src`: it and its length, `None`
+/// when `src` is short.
+fn take_binding(src: &[u8]) -> Option<(Binding<'_>, usize)> {
+    let oid_len = *src.first()? as usize;
+    let mut at = 1;
+    let object_id = src.get(at..at + oid_len)?;
+    at += oid_len;
+    let revision = u64::from_le_bytes(src.get(at..at + 8)?.try_into().ok()?);
+    at += 8;
+    let kind = *src.get(at)?;
+    at += 1;
+    let stamp_ms = u64::from_le_bytes(src.get(at..at + 8)?.try_into().ok()?);
+    at += 8;
+    let size = u64::from_le_bytes(src.get(at..at + 8)?.try_into().ok()?);
+    at += 8;
+    let ct_len = *src.get(at)? as usize;
+    at += 1;
+    let content_type = src.get(at..at + ct_len)?;
+    at += ct_len;
+    Some((
+        Binding {
+            object_id,
+            revision,
+            kind,
+            meta: BindMeta {
+                stamp_ms,
+                size,
+                content_type,
+            },
+        },
+        at,
+    ))
+}
+
+/// The length of a binding at the front of `src`, read from its length
+/// fields alone; `None` until they have all arrived.
+fn binding_record_len(src: &[u8]) -> Option<usize> {
+    let oid_len = *src.first()? as usize;
+    let ct_at = 1 + oid_len + 8 + 1 + 8 + 8;
+    let ct_len = *src.get(ct_at)? as usize;
+    Some(ct_at + 1 + ct_len)
+}
+
+pub fn encode_lookup_found(dst: &mut [u8], b: &Binding<'_>) -> Result<usize, WireError> {
+    if b.object_id.len() > u8::MAX as usize || b.meta.content_type.len() > CONTENT_TYPE_MAX {
         return Err(WireError::StringTooLong {
-            len: object_id.len(),
-            max: 255,
+            len: b.object_id.len().max(b.meta.content_type.len()),
+            max: CONTENT_TYPE_MAX,
         });
     }
-    let needed = 1 + 1 + 1 + object_id.len() + 8 + 1;
+    let needed = 2 + binding_len(b);
     if dst.len() < needed {
         return Err(WireError::BufferTooSmall {
             needed,
@@ -394,36 +603,30 @@ pub fn encode_lookup_found(
     }
     dst[0] = OP_LOOKUP;
     dst[1] = LOOKUP_FOUND;
-    dst[2] = object_id.len() as u8;
-    let mut cursor = 3;
-    dst[cursor..cursor + object_id.len()].copy_from_slice(object_id);
-    cursor += object_id.len();
-    dst[cursor..cursor + 8].copy_from_slice(&revision.to_le_bytes());
-    cursor += 8;
-    dst[cursor] = kind;
-    Ok(needed)
+    Ok(2 + put_binding(&mut dst[2..], b))
 }
 
-pub fn encode_lookup_not_found(dst: &mut [u8]) -> Result<usize, WireError> {
-    if dst.len() < 2 {
+/// An absent key, and the revision a write must exceed to bind it.
+pub fn encode_lookup_not_found(dst: &mut [u8], floor: u64) -> Result<usize, WireError> {
+    if dst.len() < 10 {
         return Err(WireError::BufferTooSmall {
-            needed: 2,
+            needed: 10,
             actual: dst.len(),
         });
     }
     dst[0] = OP_LOOKUP;
     dst[1] = LOOKUP_NOT_FOUND;
-    Ok(2)
+    dst[2..10].copy_from_slice(&floor.to_le_bytes());
+    Ok(10)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodedLookupResp<'a> {
-    Found {
-        object_id: &'a [u8],
-        revision: u64,
-        kind: u8,
+    Found(Binding<'a>),
+    /// Absent; the revision a write must exceed to bind it.
+    NotFound {
+        floor: u64,
     },
-    NotFound,
 }
 
 pub fn decode_lookup_resp(src: &[u8]) -> Result<DecodedLookupResp<'_>, WireError> {
@@ -434,44 +637,47 @@ pub fn decode_lookup_resp(src: &[u8]) -> Result<DecodedLookupResp<'_>, WireError
         return Err(WireError::BadOpcode { observed: src[0] });
     }
     match src[1] {
-        LOOKUP_NOT_FOUND => Ok(DecodedLookupResp::NotFound),
-        LOOKUP_FOUND => {
-            if src.len() < 3 {
-                return Err(WireError::Truncated);
-            }
-            let id_len = src[2] as usize;
-            let needed = 3 + id_len + 8 + 1;
-            if src.len() < needed {
-                return Err(WireError::Truncated);
-            }
-            let object_id = &src[3..3 + id_len];
-            let revision = u64::from_le_bytes(src[3 + id_len..3 + id_len + 8].try_into().unwrap());
-            let kind = src[3 + id_len + 8];
-            Ok(DecodedLookupResp::Found {
-                object_id,
-                revision,
-                kind,
-            })
+        LOOKUP_NOT_FOUND => {
+            let floor = u64::from_le_bytes(
+                src.get(2..10)
+                    .ok_or(WireError::Truncated)?
+                    .try_into()
+                    .unwrap(),
+            );
+            Ok(DecodedLookupResp::NotFound { floor })
         }
+        LOOKUP_FOUND => take_binding(&src[2..])
+            .map(|(b, _)| DecodedLookupResp::Found(b))
+            .ok_or(WireError::Truncated),
         other => Err(WireError::BadKind { observed: other }),
     }
 }
 
-// ── List (read op: enumerate a namespace's paths) ─────────────────
+// ── List (read op: one page of a root's keys, in name order) ──────
 //
-//   ListReq   [op=5][root_len:u16][cursor:u32][max:u8][root]
-//   ListResp  [op=5][next_cursor:u32][count:u8][(path_len:u16,path)*]
-//             // next_cursor 0 = enumeration wrapped; resume from 0
+//   ListReq   [op=5][root_len:u16][prefix_len:u16][after_len:u16][max:u8]
+//             [root][prefix][after]
+//   ListResp  [op=5][count:u8][more:u8]
+//             ([path_len:u16][path][binding]) × count
+//
+// Entries are the root's live bindings whose path starts with `prefix`
+// and sorts strictly after `after`, in ascending bytewise order. The
+// next page asks again with `after` = the last path returned; `more` 0
+// means the listing is complete. A binding written or deleted between
+// pages is seen or not by where it sorts against the cursor; one present
+// throughout is seen exactly once.
 
 pub fn encode_list_req(
     dst: &mut [u8],
     namespace_root: &[u8],
-    cursor: u32,
+    prefix: &[u8],
+    after: &[u8],
     max: u8,
 ) -> Result<usize, WireError> {
-    check_key(namespace_root, &[], &[])?;
-    let header = 1 + 2 + 4 + 1;
-    let needed = header + namespace_root.len();
+    check_key(namespace_root, prefix, &[])?;
+    check_key(namespace_root, after, &[])?;
+    let header = 1 + 2 + 2 + 2 + 1;
+    let needed = header + namespace_root.len() + prefix.len() + after.len();
     if dst.len() < needed {
         return Err(WireError::BufferTooSmall {
             needed,
@@ -480,16 +686,22 @@ pub fn encode_list_req(
     }
     dst[0] = OP_LIST;
     dst[1..3].copy_from_slice(&(namespace_root.len() as u16).to_le_bytes());
-    dst[3..7].copy_from_slice(&cursor.to_le_bytes());
+    dst[3..5].copy_from_slice(&(prefix.len() as u16).to_le_bytes());
+    dst[5..7].copy_from_slice(&(after.len() as u16).to_le_bytes());
     dst[7] = max;
-    dst[header..needed].copy_from_slice(namespace_root);
+    let mut at = header;
+    for part in [namespace_root, prefix, after] {
+        dst[at..at + part.len()].copy_from_slice(part);
+        at += part.len();
+    }
     Ok(needed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedListReq<'a> {
     pub namespace_root: &'a [u8],
-    pub cursor: u32,
+    pub prefix: &'a [u8],
+    pub after: &'a [u8],
     pub max: u8,
 }
 
@@ -502,81 +714,116 @@ pub fn decode_list_req(src: &[u8]) -> Result<DecodedListReq<'_>, WireError> {
         return Err(WireError::BadOpcode { observed: src[0] });
     }
     let root_len = u16::from_le_bytes([src[1], src[2]]) as usize;
-    if src.len() < header + root_len {
+    let prefix_len = u16::from_le_bytes([src[3], src[4]]) as usize;
+    let after_len = u16::from_le_bytes([src[5], src[6]]) as usize;
+    if src.len() < header + root_len + prefix_len + after_len {
         return Err(WireError::Truncated);
     }
+    let root = &src[header..header + root_len];
+    let prefix = &src[header + root_len..header + root_len + prefix_len];
+    let after = &src[header + root_len + prefix_len..header + root_len + prefix_len + after_len];
+    check_key(root, prefix, &[])?;
+    check_key(root, after, &[])?;
     Ok(DecodedListReq {
-        namespace_root: &src[header..header + root_len],
-        cursor: u32::from_le_bytes(src[3..7].try_into().unwrap()),
+        namespace_root: root,
+        prefix,
+        after,
         max: src[7],
     })
 }
 
-pub fn encode_list_resp(
-    dst: &mut [u8],
-    next_cursor: u32,
-    paths: &[&[u8]],
-) -> Result<usize, WireError> {
-    if paths.len() > MAX_LIST_PAGE {
-        return Err(WireError::StringTooLong {
-            len: paths.len(),
-            max: MAX_LIST_PAGE,
-        });
-    }
-    let mut needed = 1 + 4 + 1;
-    for p in paths {
-        needed += 2 + p.len();
-    }
-    if dst.len() < needed {
-        return Err(WireError::BufferTooSmall {
-            needed,
-            actual: dst.len(),
-        });
-    }
-    dst[0] = OP_LIST;
-    dst[1..5].copy_from_slice(&next_cursor.to_le_bytes());
-    dst[5] = paths.len() as u8;
-    let mut cursor = 6;
-    for p in paths {
-        dst[cursor..cursor + 2].copy_from_slice(&(p.len() as u16).to_le_bytes());
-        cursor += 2;
-        dst[cursor..cursor + p.len()].copy_from_slice(p);
-        cursor += p.len();
-    }
-    Ok(needed)
+/// The largest listing page: `MAX_LIST_PAGE` entries of the longest
+/// path, object id and content type.
+pub const LIST_RESP_MAX: usize = 3 + MAX_LIST_PAGE
+    * (2 + super::limits::MAX_PATH
+        + 1
+        + super::limits::MAX_OBJECT_ID
+        + 8
+        + 1
+        + 8
+        + 8
+        + 1
+        + CONTENT_TYPE_MAX);
+
+/// Writes one listing page, entry by entry.
+pub struct ListWriter<'a> {
+    out: &'a mut [u8],
+    at: usize,
+    count: u8,
 }
 
-/// Decode a ListResp, calling `emit` per path in order. Returns
-/// (next_cursor, count).
+impl<'a> ListWriter<'a> {
+    pub fn new(out: &'a mut [u8]) -> Option<Self> {
+        if out.len() < 3 {
+            return None;
+        }
+        out[0] = OP_LIST;
+        Some(ListWriter {
+            out,
+            at: 3,
+            count: 0,
+        })
+    }
+
+    pub fn count(&self) -> usize {
+        self.count as usize
+    }
+
+    /// Append one entry; false when it does not fit.
+    pub fn push(&mut self, path: &[u8], b: &Binding<'_>) -> bool {
+        let need = 2 + path.len() + binding_len(b);
+        if self.at + need > self.out.len() || self.count as usize >= MAX_LIST_PAGE {
+            return false;
+        }
+        let at = self.at;
+        self.out[at..at + 2].copy_from_slice(&(path.len() as u16).to_le_bytes());
+        self.out[at + 2..at + 2 + path.len()].copy_from_slice(path);
+        put_binding(&mut self.out[at + 2 + path.len()..], b);
+        self.at += need;
+        self.count += 1;
+        true
+    }
+
+    /// Close the page; `more` says whether entries remain. Its length.
+    pub fn finish(self, more: bool) -> usize {
+        self.out[1] = self.count;
+        self.out[2] = u8::from(more);
+        self.at
+    }
+}
+
+/// Decode a ListResp, calling `emit` per entry in order. Returns
+/// `(count, more)`.
 pub fn decode_list_resp(
     src: &[u8],
-    mut emit: impl FnMut(&[u8]),
-) -> Result<(u32, usize), WireError> {
-    if src.len() < 6 {
+    mut emit: impl FnMut(&[u8], &Binding<'_>),
+) -> Result<(usize, bool), WireError> {
+    if src.len() < 3 {
         return Err(WireError::Truncated);
     }
     if src[0] != OP_LIST {
         return Err(WireError::BadOpcode { observed: src[0] });
     }
-    let next_cursor = u32::from_le_bytes(src[1..5].try_into().unwrap());
-    let count = src[5] as usize;
+    let count = src[1] as usize;
     if count > MAX_LIST_PAGE {
         return Err(WireError::Truncated);
     }
-    let mut pos = 6usize;
+    let mut pos = 3usize;
     for _ in 0..count {
-        if pos + 2 > src.len() {
-            return Err(WireError::Truncated);
-        }
-        let plen = u16::from_le_bytes([src[pos], src[pos + 1]]) as usize;
+        let plen = u16::from_le_bytes(
+            src.get(pos..pos + 2)
+                .ok_or(WireError::Truncated)?
+                .try_into()
+                .unwrap(),
+        ) as usize;
         pos += 2;
-        if pos + plen > src.len() {
-            return Err(WireError::Truncated);
-        }
-        emit(&src[pos..pos + plen]);
+        let path = src.get(pos..pos + plen).ok_or(WireError::Truncated)?;
         pos += plen;
+        let (b, n) = take_binding(&src[pos..]).ok_or(WireError::Truncated)?;
+        pos += n;
+        emit(path, &b);
     }
-    Ok((next_cursor, count))
+    Ok((count, src[2] != 0))
 }
 
 // ── Referenced (read op: is this object id bound anywhere?) ───────
@@ -1341,7 +1588,7 @@ pub fn response_record_len(src: &[u8]) -> Result<Option<usize>, WireError> {
     match opcode {
         // Bare acks: the applied opcode echoed back, or a refusal.
         OP_BIND | OP_RENAME | OP_UNBIND | OP_GC_RELEASE | NAK_GENERIC | NAK_RESERVED_BYTE
-        | NAK_FENCED => complete(1),
+        | NAK_FENCED | NAK_CONDITION | NAK_STALE => complete(1),
         // [op][flag]
         OP_GC_RESERVE => complete(2),
         // [op][status][fence:u64][expires_at:u64]
@@ -1353,30 +1600,34 @@ pub fn response_record_len(src: &[u8]) -> Result<Option<usize>, WireError> {
             None => Ok(None),
             Some(&count) => complete(VOLUME_ROOTS_HDR + count as usize * VOLUME_ROOT_DIGEST),
         },
-        // [op][status], and when FOUND: [oid_len][oid][rev:u64][kind]
+        // [op][status], then the binding, or the floor revision.
         OP_LOOKUP => match src.get(1) {
             None => Ok(None),
-            Some(&LOOKUP_NOT_FOUND) => complete(2),
-            Some(_) => match src.get(2) {
+            Some(&LOOKUP_NOT_FOUND) => complete(10),
+            Some(_) => match binding_record_len(&src[2..]) {
                 None => Ok(None),
-                Some(&oid_len) => complete(3 + oid_len as usize + 9),
+                Some(n) => complete(2 + n),
             },
         },
         // [op][referenced][cursor:u32]
         OP_REFERENCED => complete(6),
-        // [op][next_cursor:u32][count][ (len:u16)(path) × count ]
+        // [op][count][more] then (path_len:u16)(path)(binding) × count
         OP_LIST => {
-            let count = match src.get(5) {
+            let count = match src.get(1) {
                 Some(c) => *c as usize,
                 None => return Ok(None),
             };
-            let mut at = 6usize;
+            let mut at = 3usize;
             for _ in 0..count {
                 if src.len() < at + 2 {
                     return Ok(None);
                 }
                 let plen = u16::from_le_bytes([src[at], src[at + 1]]) as usize;
                 at += 2 + plen;
+                match src.get(at..).and_then(binding_record_len) {
+                    Some(n) => at += n,
+                    None => return Ok(None),
+                }
             }
             complete(at)
         }
@@ -1399,17 +1650,31 @@ pub fn request_record_len(src: &[u8]) -> Result<Option<usize>, WireError> {
     // the same code is linked normally, and faults on the first record
     // in a real graph. `0` is the opcode's own byte, so it reads as
     // "no field here".
+    // A bind's content type is the one length held in a byte.
+    if opcode == OP_BIND {
+        if src.len() < BIND_HDR {
+            return Ok(None);
+        }
+        let total = BIND_HDR
+            + u16::from_le_bytes([src[1], src[2]]) as usize
+            + u16::from_le_bytes([src[3], src[4]]) as usize
+            + u16::from_le_bytes([src[5], src[6]]) as usize
+            + src[41] as usize;
+        return Ok(if src.len() >= total {
+            Some(total)
+        } else {
+            None
+        });
+    }
     let (header, lens_at): (usize, [usize; 3]) = match opcode {
-        // [op][root_len:u16][path_len:u16][oid_len:u16][kind][rev:u64]
-        OP_BIND => (16, [1, 3, 5]),
         // [op][root_len:u16][from_len:u16][to_len:u16][rev:u64]
         OP_RENAME => (15, [1, 3, 5]),
-        // [op][root_len:u16][path_len:u16]
-        OP_UNBIND => (5, [1, 3, 0]),
+        // [op][root_len:u16][path_len:u16][rev:u64][cond][expect:u64]
+        OP_UNBIND => (UNBIND_HDR, [1, 3, 0]),
         // [op][root_len:u16][path_len:u16]
         OP_LOOKUP => (5, [1, 3, 0]),
-        // [op][root_len:u16][cursor:u32][max]
-        OP_LIST => (8, [1, 0, 0]),
+        // [op][root_len:u16][prefix_len:u16][after_len:u16][max]
+        OP_LIST => (8, [1, 3, 5]),
         // [op][cursor:u32][oid_len:u16]
         OP_REFERENCED => (7, [5, 0, 0]),
         // [op][oid_len:u16][now:u64]

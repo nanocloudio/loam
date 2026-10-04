@@ -8,7 +8,9 @@
 // object body store; bodies live at `<root_dir>/<hex(sha256)>`.
 // Step body in `modules/common/mechanics/body_store_body.rs`. `root_dir`
 // is configured via the `root_dir` TLV param (tag = 1); without
-// it PUT/GET respond ERR_NO_ROOT.
+// it PUT/GET respond ERR_NO_ROOT. Requests and responses are body
+// frames (`body_frame.rs`), so the same module serves a local router
+// or, behind `remote_channel`, one on another node.
 
 use core::ffi::c_void;
 
@@ -25,10 +27,6 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
 
-#[allow(
-    dead_code,
-    reason = "shared PIC body; each module shim drives a subset"
-)]
 #[path = "../../common/mechanics/loam_hash.rs"]
 mod hash;
 
@@ -40,15 +38,15 @@ mod fs_names;
 
 #[path = "../../common/mechanics/loam_body_wire.rs"]
 mod wire;
+use wire as body_wire;
+
+#[path = "../../common/mechanics/body_frame.rs"]
+mod body_frame;
 
 mod sha256 {
     pub use super::Sha256;
 }
 
-#[allow(
-    dead_code,
-    reason = "shared PIC body; each module shim drives a subset"
-)]
 #[path = "../../common/mechanics/loam_ec_wire.rs"]
 mod ec_wire;
 
@@ -88,9 +86,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// The module ABI's constructor: `state_ptr` points to `state_size`
+/// zeroed bytes this module owns, `params` to `params_len` bytes, and
+/// `syscalls` to the runtime's table, all valid for the call.
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -131,9 +133,12 @@ unsafe fn decode_root_dir_params(state_ptr: *mut u8, params: *const u8, params_l
     body::set_root_dir(state_ptr, raw);
 }
 
+/// # Safety
+/// The module ABI's step: the state pointer is the state `module_new`
+/// initialised, and the runtime steps it from one caller at a time.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
     unsafe {
         let rc = body::module_step_impl(state_ptr);
         if let Some(line) = body::take_tier_report(state_ptr) {

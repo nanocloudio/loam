@@ -1,0 +1,22 @@
+# The `loam` operator applet. `fluxor install packaging/cli/workload.toml`
+# registers it; `fluxor exec loam -- <command>` runs it.
+#
+# The graph (linux.yaml, beside this file): cli_in → loam_cli → cli_out,
+# and loam_cli → tls (client) → linux_net for the admin plane. The client
+# certificate and its key are read from `$HOME/.config/loam/` when the
+# applet is installed. The node's certificate is verified against the
+# host's trusted CAs; `FLUXOR_CA_BUNDLE` names another bundle for a run.
+[workload]
+name = "loam"
+version = "0.1.0"
+role = "cli"
+
+[[implementation]]
+target = "linux"
+graph = "linux.yaml"
+
+[resources]
+# loam_cli's state is 674 KiB: two admin sessions, each holding a whole
+# request and answer, and a body, a listing page and two map pages.
+state_bytes = 786432
+buffer_bytes = 262144

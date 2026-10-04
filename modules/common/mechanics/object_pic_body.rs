@@ -12,7 +12,9 @@
 // ModuleState size: ObjectSlot(~48B) × 256 + 4 KiB scratch ≈ 16 KiB.
 // Capacity profile — see namespace_pic_body.rs.
 const ARENA_CAPACITY: usize = super::limits::OBJECT_SLOTS;
-const READ_BUF: usize = 1024;
+/// One read holds the largest request record, so a request arriving
+/// one per buffer is never cut.
+const READ_BUF: usize = super::wire::PUT_RECORD_MAX;
 /// Reassembly capacity for `requests`. Sized to hold a full step's
 /// budget plus one more read, so refilling never starves the step.
 const REQ_ASM: usize = READ_BUF * (super::limits::OPS_PER_STEP as usize + 1);
@@ -126,15 +128,21 @@ pub unsafe fn open_and_replay_wal(state_ptr: *mut u8, wal_path: &[u8]) -> i32 {
 }
 
 /// See `namespace_pic_body::decode_wal_path_params`.
-pub unsafe fn decode_wal_path_params(state_ptr: *mut u8, params: *const u8, params_len: usize) {
+pub unsafe fn decode_wal_path_params(
+    state_ptr: *mut u8,
+    params: *const u8,
+    params_len: usize,
+) -> i32 {
     if state_ptr.is_null() {
-        return;
+        return -22;
     }
     let s = &mut *(state_ptr as *mut ModuleState);
-    // The TLV/raw ambiguity lives in one place — `wal_io` — so the
-    // four modules that take a WAL path cannot drift apart on it.
-    if let Some(n) = super::wal::decode_wal_path(params, params_len, &mut s.wal_path) {
-        s.wal_path_len = n as u16;
+    match super::wal::decode_wal_path(params, params_len, &mut s.wal_path) {
+        Ok(n) => {
+            s.wal_path_len = n as u16;
+            0
+        }
+        Err(()) => -22,
     }
 }
 

@@ -1,0 +1,57 @@
+# The loam-nbd template: an NBD export of one loam volume.
+#
+#   nbd client ⇄ linux_net ⇄ nbd_serve ⇄ loam_volume ⇄ tls (client) ⇄ linux_net
+#                                                          ⇅ mutual TLS
+#                                                  the volume's admin plane
+#
+# `loam_volume` is the block source: one writer per volume by its lease,
+# writes staged until a flush commits them as one revision, and a writer
+# that loses its lease closed rather than merged.
+target: linux
+tick_us: 100
+
+# Every pair below is a bidirectional feedback pair.
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+
+modules:
+  - name: admin_tls
+    type: tls
+    mode: 0                       # client
+    peer_auth: ca_dns
+    trust: system
+    cert_file: "${param:cert}"
+    key_file: "${param:key}"
+    ecdh_bits_per_step: 32
+
+  - name: loam_volume
+    variant: node
+    admin: "${param:admin}"
+    capability: "${param:capability}"
+    root: "${param:root}"
+    path: "${param:path}"
+    block_size: ${param:block_size}
+    lease_ttl_ms: ${param:lease_ttl_ms}
+
+  - name: nbd_serve
+    port: ${param:port}
+
+wiring:
+  - from: linux_net.net_out
+    to: admin_tls.cipher_in
+  - from: admin_tls.cipher_out
+    to: linux_net.net_in
+  - from: admin_tls.clear_out
+    to: loam_volume.admin_in
+  - from: loam_volume.admin_out
+    to: admin_tls.clear_in
+
+  - from: loam_volume.blocks
+    to: nbd_serve.blocks
+  - from: linux_net.net_out
+    to: nbd_serve.net_in
+  - from: nbd_serve.net_out
+    to: linux_net.net_in

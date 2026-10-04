@@ -20,17 +20,9 @@ use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 
-#[allow(
-    dead_code,
-    reason = "shared PIC body; each module shim drives a subset"
-)]
 #[path = "../../common/mechanics/loam_decision_wire.rs"]
 mod wire;
 
-#[allow(
-    dead_code,
-    reason = "shared PIC body; each module shim drives a subset"
-)]
 #[path = "../../common/mechanics/loam_limits.rs"]
 mod limits;
 
@@ -53,7 +45,18 @@ const PROBE_REVISION: u64 = 1;
 
 /// Encode the probe's bind into `dst`, returning its length.
 fn encode_probe_bind(dst: &mut [u8]) -> Option<usize> {
-    ns_wire::encode_bind(dst, PROBE_ROOT, PROBE_PATH, PROBE_OBJECT, 0, PROBE_REVISION).ok()
+    ns_wire::encode_bind(
+        dst,
+        PROBE_ROOT,
+        PROBE_PATH,
+        PROBE_OBJECT,
+        0,
+        PROBE_REVISION,
+        &ns_wire::BindMeta::NONE,
+        ns_wire::COND_ANY,
+        0,
+    )
+    .ok()
 }
 
 /// Does `inner` decode back to the bind this probe proposed?
@@ -99,9 +102,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[no_mangle]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// The module ABI's constructor: `state_ptr` points to `state_size`
+/// zeroed bytes this module owns, `params` to `params_len` bytes, and
+/// `syscalls` to the runtime's table, all valid for the call.
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -130,9 +137,12 @@ pub extern "C" fn module_new(
     }
 }
 
+/// # Safety
+/// The module ABI's step: the state pointer is the state `module_new`
+/// initialised, and the runtime steps it from one caller at a time.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
@@ -168,7 +178,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 (sys.channel_write)(s.ops_out, s.buf.as_ptr(), n);
                 s.phase = 1;
             }
-            1 if s.ticks % 500 == 0 && s.ticks < 29_500 => {
+            1 if s.ticks.is_multiple_of(500) && s.ticks < 29_500 => {
                 // Re-propose until committed: an early Propose can be
                 // dropped while the group is still electing. Same
                 // correlation semantics (proposer assigns fresh ids;
