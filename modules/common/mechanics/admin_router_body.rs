@@ -29,6 +29,14 @@ const SCRATCH: usize = super::admin::RESPONSE_MAX + 128;
 /// Body frames queued for the body plane while its channel drains: two
 /// whole frames, so one is always ready behind the one in flight.
 const BODY_QUEUE: usize = 2 * super::body_frame::FRAME_MAX;
+/// Namespace requests queued while its channel drains: one of the
+/// largest for every composed write in flight, so a burst of them waits
+/// a step rather than being refused for a channel that was momentarily
+/// full. A request finding the queue full is refused `BUSY`.
+const NS_QUEUE: usize = super::limits::ADMIN_PUTFILE * super::ns_wire::REQUEST_RECORD_MAX;
+/// Object-index requests queued while its channel drains, on the same
+/// terms.
+const OBJ_QUEUE: usize = super::limits::ADMIN_PUTFILE * super::obj_wire::PUT_RECORD_MAX;
 /// Reassembly capacity for `ns_responses`. Sized to hold a full step's
 /// budget of the largest response plus one more read, so refilling
 /// never starves the step.
@@ -254,6 +262,10 @@ pub struct ModuleState {
     pub body_cid_next: u32,
     /// Body frames owed on `body_req`.
     pub body_tx: super::body_frame::Ring<BODY_QUEUE>,
+    /// Requests owed to the namespace and to the object index, in the
+    /// order their pending entries were queued.
+    pub ns_tx: super::body_frame::Ring<NS_QUEUE>,
+    pub obj_tx: super::body_frame::Ring<OBJ_QUEUE>,
     /// The body answer being assembled from `body_resp`.
     pub body_rx: super::body_frame::Inbox<{ super::body_frame::RECORD_MAX }>,
     pub obj_head: u32,
@@ -545,14 +557,42 @@ unsafe fn forward_ns(
     if s.ns_req_chan < 0 || !enqueue_entry(s, Stream::Namespace, entry) {
         return false;
     }
-    let wrote = (syscalls.channel_write)(s.ns_req_chan, s.scratch.as_ptr(), n);
-    if wrote < 0 || (wrote as usize) != n {
+    if !send_downstream(s, syscalls, Stream::Namespace, n) {
         // No answer will come; the entry just pushed is the tail.
         gc_unenqueue_tail(s, Stream::Namespace);
         return false;
     }
+    true
+}
+
+/// Queue the `n`-byte request in `scratch` for `stream`'s channel and
+/// offer what is queued. False, with nothing queued, when the queue is
+/// full. Every request to the namespace and the object index goes this
+/// way, so they leave in the order their pending entries were queued.
+unsafe fn send_downstream(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    stream: Stream,
+    n: usize,
+) -> bool {
+    let bytes: &[u8] = &*(&s.scratch[..n] as *const [u8]);
+    let queued = match stream {
+        Stream::Namespace => s.ns_tx.push_bytes(bytes),
+        Stream::Object => s.obj_tx.push_bytes(bytes),
+        Stream::Body => false,
+    };
+    if !queued {
+        return false;
+    }
+    flush_downstream(s, syscalls);
     s.forwarded = s.forwarded.wrapping_add(1);
     true
+}
+
+/// Offer what is queued for the namespace and the object index.
+unsafe fn flush_downstream(s: &mut ModuleState, syscalls: &super::SyscallTable) {
+    s.ns_tx.flush(syscalls, s.ns_req_chan);
+    s.obj_tx.flush(syscalls, s.obj_req_chan);
 }
 
 unsafe fn dequeue_pending(s: &mut ModuleState, stream: Stream) -> Option<PendingDownstream> {
@@ -720,8 +760,10 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     }
     // Body frames owed to the body plane go out as its channel takes
     // them; work that could forward another is admitted only while a
-    // whole frame fits behind them.
+    // whole frame fits behind them. Requests owed to the namespace and
+    // the object index go out the same way.
     s.body_tx.flush(syscalls, s.body_req_chan);
+    flush_downstream(s, syscalls);
 
     // ── 0. Orphan GC: kick one inventory SCAN when due, idle,
     //      and no composed write is mid-flight. ──
@@ -877,7 +919,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                 }
                 super::admin::OP_BIND => {
                     let status = ns_write_status(ns_resp, super::ns_wire::OP_BIND);
-                    emit_bind_status(s, syscalls, entry.correlation_id, status);
+                    emit_bind_status(s, syscalls, entry.correlation_id, status, ns_fence(ns_resp));
                 }
                 _ => {
                     s.apply_errors = s.apply_errors.wrapping_add(1);
@@ -1070,14 +1112,34 @@ unsafe fn handle_admin_bind(s: &mut ModuleState, syscalls: &super::SyscallTable,
     ) {
         Ok(n) => n,
         Err(_) => {
-            emit_bind_status(s, syscalls, req.correlation_id, super::admin::STATUS_NAK);
+            emit_bind_status(
+                s,
+                syscalls,
+                req.correlation_id,
+                super::admin::STATUS_NAK,
+                &[],
+            );
             return;
         }
     };
     let entry = PendingDownstream::new(req.correlation_id, super::admin::OP_BIND, u16::MAX);
     if !forward_ns(s, syscalls, entry, n) {
-        emit_bind_status(s, syscalls, req.correlation_id, super::admin::STATUS_BUSY);
+        emit_bind_status(
+            s,
+            syscalls,
+            req.correlation_id,
+            super::admin::STATUS_BUSY,
+            &[],
+        );
         s.apply_errors = s.apply_errors.wrapping_add(1);
+    }
+}
+
+/// The fence a namespace write ack carries; empty for a refusal.
+fn ns_fence(ns_resp: &[u8]) -> &[u8] {
+    match super::ns_wire::decode_write_ack(ns_resp) {
+        Ok((_, fence)) => fence,
+        Err(_) => &[],
     }
 }
 
@@ -1163,13 +1225,10 @@ unsafe fn handle_admin_lease(s: &mut ModuleState, syscalls: &super::SyscallTable
         s.apply_errors = s.apply_errors.wrapping_add(1);
         return;
     }
-    let wrote = (syscalls.channel_write)(s.ns_req_chan, s.scratch.as_ptr(), n);
-    if wrote < 0 || (wrote as usize) != n {
-        let _ = dequeue_pending(s, Stream::Namespace);
-        s.apply_errors = s.apply_errors.wrapping_add(1);
-        return;
+    if !send_downstream(s, syscalls, Stream::Namespace, n) {
+        gc_unenqueue_tail(s, Stream::Namespace);
+        emit_lease_status(s, syscalls, req.correlation_id, super::admin::STATUS_BUSY);
     }
-    s.forwarded = s.forwarded.wrapping_add(1);
 }
 
 /// Translate the namespace's lease verdict into the admin ack. A
@@ -1258,13 +1317,16 @@ unsafe fn handle_admin_volume(s: &mut ModuleState, syscalls: &super::SyscallTabl
         s.apply_errors = s.apply_errors.wrapping_add(1);
         return;
     }
-    let wrote = (syscalls.channel_write)(s.ns_req_chan, s.scratch.as_ptr(), n);
-    if wrote < 0 || (wrote as usize) != n {
-        let _ = dequeue_pending(s, Stream::Namespace);
-        s.apply_errors = s.apply_errors.wrapping_add(1);
-        return;
+    if !send_downstream(s, syscalls, Stream::Namespace, n) {
+        gc_unenqueue_tail(s, Stream::Namespace);
+        emit_volume_status(
+            s,
+            syscalls,
+            req.correlation_id,
+            super::admin::STATUS_BUSY,
+            0,
+        );
     }
-    s.forwarded = s.forwarded.wrapping_add(1);
 }
 
 /// Translate the namespace's verdict on a volume record.
@@ -1674,12 +1736,17 @@ unsafe fn emit_body_admin_response(
                     }
                 }
             } else {
-                // body_store NAK — likely ERR_NOT_FOUND.
-                let status = if body_resp.len() >= 2
-                    && body_resp[0] == super::body_wire::OP_NAK
-                    && body_resp[1] == super::body_wire::ERR_NOT_FOUND
-                {
+                // body_store NAK: not held, held but larger than one
+                // answer, or a failure.
+                let nak = |e: u8| {
+                    body_resp.len() >= 2
+                        && body_resp[0] == super::body_wire::OP_NAK
+                        && body_resp[1] == e
+                };
+                let status = if nak(super::body_wire::ERR_NOT_FOUND) {
                     super::admin::STATUS_NOT_FOUND
+                } else if nak(super::body_wire::ERR_TOO_LARGE) {
+                    super::admin::STATUS_EXISTS
                 } else {
                     super::admin::STATUS_NAK
                 };
@@ -1999,17 +2066,15 @@ unsafe fn gc_forward(
         s.forwarded = s.forwarded.wrapping_add(1);
         return true;
     }
-    if !enqueue_pending(s, stream, 0, gc_op, 0) {
+    if chan < 0 || !enqueue_pending(s, stream, 0, gc_op, 0) {
         return false;
     }
-    let wrote = (syscalls.channel_write)(chan, s.scratch.as_ptr(), req_n);
-    if wrote < 0 || (wrote as usize) != req_n {
+    if !send_downstream(s, syscalls, stream, req_n) {
         // No response will ever come — unwind the just-pushed TAIL
         // entry (popping the head would desync the FIFO).
         gc_unenqueue_tail(s, stream);
         return false;
     }
-    s.forwarded = s.forwarded.wrapping_add(1);
     true
 }
 
@@ -3157,7 +3222,7 @@ unsafe fn emit_delete_file_status(
     status: u8,
 ) {
     if let Ok(n) =
-        super::admin::encode_admin_delete_file_ack(&mut s.scratch, correlation_id, status)
+        super::admin::encode_admin_delete_file_ack(&mut s.scratch, correlation_id, status, &[])
     {
         reply_staged(s, syscalls, n);
     }
@@ -3180,7 +3245,7 @@ unsafe fn handle_putfile_body_response(
         None
     };
     let Some(digest) = digest else {
-        composed_finish(s, syscalls, slot_idx, super::admin::STATUS_NAK);
+        composed_finish(s, syscalls, slot_idx, super::admin::STATUS_NAK, &[]);
         return;
     };
     let mut d = [0u8; 32];
@@ -3213,12 +3278,12 @@ unsafe fn composed_lookup(s: &mut ModuleState, syscalls: &super::SyscallTable, s
     let n = match super::ns_wire::encode_lookup_req(&mut s.scratch, target.root(), target.path()) {
         Ok(n) => n,
         Err(_) => {
-            composed_finish(s, syscalls, slot_idx, super::admin::STATUS_NAK);
+            composed_finish(s, syscalls, slot_idx, super::admin::STATUS_NAK, &[]);
             return;
         }
     };
     if !forward_ns(s, syscalls, PendingDownstream::new(cid, op, slot_idx), n) {
-        composed_finish(s, syscalls, slot_idx, super::admin::STATUS_BUSY);
+        composed_finish(s, syscalls, slot_idx, super::admin::STATUS_BUSY, &[]);
         s.apply_errors = s.apply_errors.wrapping_add(1);
     }
 }
@@ -3250,14 +3315,14 @@ unsafe fn handle_composed_ns_response(
                     let slot = &mut s.putfiles[i];
                     slot.attempts = slot.attempts.saturating_add(1);
                     if slot.attempts > super::limits::ADMIN_WRITE_RETRIES {
-                        composed_finish(s, syscalls, slot_idx, super::admin::STATUS_BUSY);
+                        composed_finish(s, syscalls, slot_idx, super::admin::STATUS_BUSY, &[]);
                     } else {
                         composed_lookup(s, syscalls, slot_idx);
                     }
                 }
                 _ => {
                     let status = ns_write_status(ns_resp, ok_op);
-                    composed_finish(s, syscalls, slot_idx, status);
+                    composed_finish(s, syscalls, slot_idx, status, ns_fence(ns_resp));
                 }
             }
         }
@@ -3306,11 +3371,11 @@ unsafe fn composed_decide(
         }
     };
     if let Some(status) = refusal {
-        composed_finish(s, syscalls, slot_idx, status);
+        composed_finish(s, syscalls, slot_idx, status, &[]);
         return;
     }
     if cur == u64::MAX {
-        composed_finish(s, syscalls, slot_idx, super::admin::STATUS_NAK);
+        composed_finish(s, syscalls, slot_idx, super::admin::STATUS_NAK, &[]);
         return;
     }
     s.putfiles[i].cur_rev = cur;
@@ -3349,7 +3414,7 @@ unsafe fn emit_putfile_object_stage(
     let n = match super::obj_wire::encode_put(&mut s.scratch, &fields) {
         Ok(n) => n,
         Err(_) => {
-            composed_finish(s, syscalls, slot_idx, super::admin::STATUS_NAK);
+            composed_finish(s, syscalls, slot_idx, super::admin::STATUS_NAK, &[]);
             return;
         }
     };
@@ -3360,18 +3425,14 @@ unsafe fn emit_putfile_object_stage(
         super::admin::OP_PUT_FILE,
         slot_idx,
     ) {
-        composed_finish(s, syscalls, slot_idx, super::admin::STATUS_BUSY);
+        composed_finish(s, syscalls, slot_idx, super::admin::STATUS_BUSY, &[]);
         s.apply_errors = s.apply_errors.wrapping_add(1);
         return;
     }
-    let wrote = (syscalls.channel_write)(s.obj_req_chan, s.scratch.as_ptr(), n);
-    if wrote < 0 || (wrote as usize) != n {
+    if !send_downstream(s, syscalls, Stream::Object, n) {
         gc_unenqueue_tail(s, Stream::Object);
-        composed_finish(s, syscalls, slot_idx, super::admin::STATUS_BUSY);
-        s.apply_errors = s.apply_errors.wrapping_add(1);
-        return;
+        composed_finish(s, syscalls, slot_idx, super::admin::STATUS_BUSY, &[]);
     }
-    s.forwarded = s.forwarded.wrapping_add(1);
 }
 
 unsafe fn handle_putfile_object_response(
@@ -3395,7 +3456,7 @@ unsafe fn handle_putfile_object_response(
         } else {
             super::admin::STATUS_NAK
         };
-        composed_finish(s, syscalls, slot_idx, status);
+        composed_finish(s, syscalls, slot_idx, status, &[]);
         return;
     }
     s.putfiles[i].described = 1;
@@ -3428,13 +3489,13 @@ unsafe fn composed_bind(s: &mut ModuleState, syscalls: &super::SyscallTable, slo
     ) {
         Ok(n) => n,
         Err(_) => {
-            composed_finish(s, syscalls, slot_idx, super::admin::STATUS_NAK);
+            composed_finish(s, syscalls, slot_idx, super::admin::STATUS_NAK, &[]);
             return;
         }
     };
     let entry = PendingDownstream::new(slot.correlation_id, super::admin::OP_PUT_FILE, slot_idx);
     if !forward_ns(s, syscalls, entry, n) {
-        composed_finish(s, syscalls, slot_idx, super::admin::STATUS_BUSY);
+        composed_finish(s, syscalls, slot_idx, super::admin::STATUS_BUSY, &[]);
         s.apply_errors = s.apply_errors.wrapping_add(1);
     }
 }
@@ -3455,31 +3516,44 @@ unsafe fn composed_unbind(s: &mut ModuleState, syscalls: &super::SyscallTable, s
     ) {
         Ok(n) => n,
         Err(_) => {
-            composed_finish(s, syscalls, slot_idx, super::admin::STATUS_NAK);
+            composed_finish(s, syscalls, slot_idx, super::admin::STATUS_NAK, &[]);
             return;
         }
     };
     let entry = PendingDownstream::new(slot.correlation_id, super::admin::OP_DELETE_FILE, slot_idx);
     if !forward_ns(s, syscalls, entry, n) {
-        composed_finish(s, syscalls, slot_idx, super::admin::STATUS_BUSY);
+        composed_finish(s, syscalls, slot_idx, super::admin::STATUS_BUSY, &[]);
         s.apply_errors = s.apply_errors.wrapping_add(1);
     }
 }
 
-/// End a composed op: answer it with `status` and free its slot.
+/// End a composed op: answer it with `status` and the fence its write
+/// achieved (empty unless it applied), and free its slot.
 unsafe fn composed_finish(
     s: &mut ModuleState,
     syscalls: &super::SyscallTable,
     slot_idx: u16,
     status: u8,
+    fence: &[u8],
 ) {
     let slot = s.putfiles[slot_idx as usize];
     free_putfile_slot(s, slot_idx);
     let n = if slot.op == super::admin::OP_DELETE_FILE {
-        super::admin::encode_admin_delete_file_ack(&mut s.scratch, slot.correlation_id, status)
+        super::admin::encode_admin_delete_file_ack(
+            &mut s.scratch,
+            slot.correlation_id,
+            status,
+            fence,
+        )
     } else {
         let digest = (status == super::admin::STATUS_OK).then_some(&slot.digest);
-        super::admin::encode_admin_put_file_ack(&mut s.scratch, slot.correlation_id, status, digest)
+        super::admin::encode_admin_put_file_ack(
+            &mut s.scratch,
+            slot.correlation_id,
+            status,
+            digest,
+            fence,
+        )
     };
     match n {
         Ok(n) => reply_staged(s, syscalls, n),
@@ -3510,7 +3584,7 @@ unsafe fn emit_putfile_status(
     status: u8,
 ) {
     if let Ok(n) =
-        super::admin::encode_admin_put_file_ack(&mut s.scratch, correlation_id, status, None)
+        super::admin::encode_admin_put_file_ack(&mut s.scratch, correlation_id, status, None, &[])
     {
         reply_staged(s, syscalls, n);
     }
@@ -3529,8 +3603,11 @@ unsafe fn emit_bind_status(
     syscalls: &super::SyscallTable,
     correlation_id: u32,
     status: u8,
+    fence: &[u8],
 ) {
-    if let Ok(n) = super::admin::encode_admin_bind_ack(&mut s.scratch, correlation_id, status) {
+    if let Ok(n) =
+        super::admin::encode_admin_bind_ack(&mut s.scratch, correlation_id, status, fence)
+    {
         reply_staged(s, syscalls, n);
     }
 }

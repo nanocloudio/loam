@@ -623,6 +623,13 @@ unsafe fn net_event(c: &mut Client, sys: &super::SyscallTable, ty: u8, p: &[u8])
             if c.connected != 0 && net_proto::conn_id(p) == c.conn {
                 net_cmd(c, sys, net_proto::CMD_CLOSE, &c.conn.to_le_bytes());
                 fail(c, WHY_TRANSPORT);
+            } else if c.connected == 0 && c.dialed != 0 && c.shared == 0 {
+                // A session `tls` ended before its handshake completed —
+                // the node refused this client's certificate — is
+                // reported by its connection id alone, which the client
+                // has not been told. Alone on its transport, the close
+                // can only be its own dial's.
+                fail(c, WHY_TRANSPORT);
             }
         }
         net_proto::MSG_ERROR if p.len() > net_proto::CONN_ID_LEN => {
@@ -663,6 +670,40 @@ pub fn has_room(c: &Client) -> bool {
 pub unsafe fn feed(c: &mut Client, sys: &super::SyscallTable, ty: u8, payload: &[u8]) {
     if c.status != ST_FAILED {
         net_event(c, sys, ty, payload);
+    }
+}
+
+/// Hand one transport event to every client sharing the transport.
+///
+/// A session `tls` ended before its handshake completed is reported by
+/// its connection id alone, which its client has not yet been told.
+/// `tls` makes one outbound connection at a time, so a close naming no
+/// client's connection belongs to the one client whose dial is still
+/// out, and that client fails as a refused connection.
+pub unsafe fn feed_all(clients: &mut [Client], sys: &super::SyscallTable, ty: u8, payload: &[u8]) {
+    let mut k = 0;
+    while k < clients.len() {
+        feed(&mut clients[k], sys, ty, payload);
+        k += 1;
+    }
+    if ty != net_proto::MSG_CLOSED || payload.len() < net_proto::CONN_ID_LEN {
+        return;
+    }
+    let conn = net_proto::conn_id(payload);
+    let mut dialing = usize::MAX;
+    let mut k = 0;
+    while k < clients.len() {
+        let c = &clients[k];
+        if c.status != ST_FAILED && c.connected != 0 && c.conn == conn {
+            return;
+        }
+        if c.status != ST_FAILED && c.connected == 0 && c.dialed != 0 {
+            dialing = k;
+        }
+        k += 1;
+    }
+    if dialing != usize::MAX {
+        fail(&mut clients[dialing], WHY_TRANSPORT);
     }
 }
 

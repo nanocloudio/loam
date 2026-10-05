@@ -327,7 +327,7 @@ pub const WRITE_SESSIONS: usize = if MINIMAL {
 } else if SERVER {
     64
 } else {
-    8
+    16
 };
 
 /// Proposals in flight in `raft_metadata_client`. One past the table
@@ -396,7 +396,13 @@ pub const MEMBER_DEADLINE_MS: u64 = 10_000;
 /// where the saving is decisive, not everywhere it is possible.
 pub const ADMIN_PENDING: usize = if SERVER { 256 } else { 64 };
 pub const ADMIN_PUTFILE: usize = if SERVER { 64 } else { 16 };
-pub const ADMIN_STREAMED_PUTFILE: usize = if SERVER { 32 } else { 4 };
+pub const ADMIN_STREAMED_PUTFILE: usize = if SERVER {
+    64
+} else if CONSTRAINED {
+    4
+} else {
+    16
+};
 
 /// Times a composed write or delete re-reads a key whose binding moved
 /// between its read and its conditional bind.
@@ -459,6 +465,12 @@ pub const ADMIN_SCOPE_DEPTH: usize = 32;
 /// credential, at most sixteen. Past it `PRESENT` answers `ENOMEM`.
 pub const OBJECT_GRANTS: usize = if MINIMAL { 4 } else { 16 };
 const _: () = assert!(OBJECT_GRANTS <= ADMIN_LINK_SESSIONS);
+// Every streamed upload the provider holds open can commit at once: each
+// commit is one streamed composed write at the router, and one write
+// session at a body store. A provider that accepted more than the plane
+// behind it can carry would refuse an upload it had already taken.
+const _: () = assert!(OBJECT_STREAMS <= ADMIN_STREAMED_PUTFILE);
+const _: () = assert!(OBJECT_STREAMS <= WRITE_SESSIONS);
 
 /// Requests the provider holds at once: writes and reads in flight to
 /// the gate, and answers decided but not yet collected by the module

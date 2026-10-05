@@ -362,6 +362,16 @@ impl<const N: usize> Ring<N> {
         self.len += bytes.len() as u32;
     }
 
+    /// Queue `bytes` as they are, for a channel whose records delimit
+    /// themselves. False, with nothing queued, when they do not fit.
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> bool {
+        if bytes.len() > self.free() {
+            return false;
+        }
+        self.put(bytes);
+        true
+    }
+
     /// Queue one frame. False, with nothing queued, when it does not fit.
     pub fn push(&mut self, cid: u32, record: &[u8]) -> bool {
         if HDR + record.len() > self.free() {

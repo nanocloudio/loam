@@ -59,8 +59,10 @@ pub const REC_SIZE: usize =
 
 pub use super::hash::key_cmp;
 
-/// `kind` value marking a tombstone in ARENA slots (never written
-/// to a snapshot — compaction drops the record entirely).
+/// `kind` value marking a tombstone: a deleted key, kept in the arena
+/// and in the snapshot at the revision it was deleted at, which is what
+/// a later bind of the key must exceed. Snapshot readers treat it as
+/// absent.
 pub const KIND_TOMBSTONE: u8 = 0xFE;
 
 #[derive(Clone, Copy)]

@@ -17,18 +17,18 @@ a public module. The declaration is the module's own
 it internal. `loam surfaces --modules modules` reads those manifests
 and prints the result, so there is no second table to drift.
 
-Two modules declare a surface, and each is the one that can answer it:
+Three modules declare a surface, and each is the one that can answer it:
 
 | Module | Fluxor surface | Ops | Fence it returns |
 | --- | --- | --- | --- |
-| `namespace_router` | `storage.namespace` | `LOOKUP` `STAT` `CLOSE` `BIND` `RENAME` `DELETE` `SUBSCRIBE` `CHANGES` `CAPS`, by provider dispatch | `ReplicatedDurable` on the quorum path, `LocalDurable` WAL-only, `Volatile` with no WAL |
+| `namespace_router` | `storage.namespace` | `LOOKUP` `STAT` `LIST` `CLOSE` `BIND` `RENAME` `DELETE` `SUBSCRIBE` `CHANGES` `CAPS`, by provider dispatch | `ReplicatedDurable` on the quorum path, `LocalDurable` WAL-only, `Volatile` with no WAL |
+| `object_provider` | `storage.object` | `PRESENT` `PUT` `GET` `HEAD` `RANGE_GET` `DELETE` `LIST` `PUT_STREAMED_*`, by provider dispatch, each under the capability its caller presented | For a write, the namespace's fence for its bind, as the admin plane's answer carries it; `Volatile` for a read |
 | `loam_volume` | `storage.block` | `CAPS` `EXEC` `SUBMIT` `REAP` on its `blocks` channel; `READ`, `WRITE`, `FLUSH`, with `FUA` and `PREFLUSH`. `DISCARD` is not advertised and is refused | `Volatile` for a staged write; `RevisionMonotone` at the volume's committed revision for a flush, a `FUA` write or a `PREFLUSH` |
 
-`LIST` (0x1302) is the one surface op the provider dispatch answers
-`ENOSYS` to. It is served on the channel wire instead
-(`loam_wire::OP_LIST`), because a listing is cursor-paged and a
-`provider_call` returns one buffer. A consumer that needs listings
-reaches the module by its ports.
+`LIST` (0x1302) answers one page of names under a prefix, in key
+order after a cursor, through the dispatch; the channel wire's
+`loam_wire::OP_LIST` serves the same name-ordered walk, with each
+binding, to a consumer wired to the module's ports.
 
 `CAPS` advertises the optional ops this provider implements — BIND,
 RENAME, DELETE, SUBSCRIBE, CHANGES. The mandatory read ops carry no
@@ -46,8 +46,8 @@ whole-blob byte access — it has no bytes to return.
 honour, and by-contract resolution is precisely the mechanism that
 would route a real consumer to it. The `storage.object` surface is a
 composition — descriptors here, bytes from the body plane — which
-`admin_router` already performs; whoever exports a dispatch for it
-owns the claim.
+`admin_router` performs, and `object_provider` exports the dispatch
+that claims it.
 
 The fence column is what the dispatch actually returns, not a
 ceiling: `achieved_fence` reports `Volatile` when there is no WAL,

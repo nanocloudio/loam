@@ -81,6 +81,67 @@ pub const NAK_CONDITION: u8 = 0xFB;
 /// key's current one: a write that lost a race, or one already applied.
 pub const NAK_STALE: u8 = 0xFA;
 
+// ── Write acks ─────────────────────────────────────────────────────
+//
+//   [op][fence_len:u8][fence:fence_len]
+//
+// A bind, rename or unbind that applied is answered with its opcode and
+// the fence the namespace achieved for it (`fluxor::fence` wire form):
+// `ReplicatedDurable` with the commit's proof, `LocalDurable` behind a
+// WAL, `Volatile` without one. A consumer reports that fence onward
+// rather than guessing it. A refusal stays a bare `NAK_*` byte.
+
+/// The largest encoded fence a write ack carries: fluxor's fence wire
+/// maximum (`fence::WIRE_MAX_LEN`, asserted equal where both are seen).
+pub const ACK_FENCE_MAX: usize = 62;
+/// The largest write ack.
+pub const WRITE_ACK_MAX: usize = 2 + ACK_FENCE_MAX;
+
+fn is_write_op(op: u8) -> bool {
+    op == OP_BIND || op == OP_RENAME || op == OP_UNBIND
+}
+
+/// Encode the ack of applied write `op`, carrying `fence` (encoded).
+pub fn encode_write_ack(dst: &mut [u8], op: u8, fence: &[u8]) -> Result<usize, WireError> {
+    if !is_write_op(op) {
+        return Err(WireError::BadOpcode { observed: op });
+    }
+    if fence.len() > ACK_FENCE_MAX {
+        return Err(WireError::StringTooLong {
+            len: fence.len(),
+            max: ACK_FENCE_MAX,
+        });
+    }
+    let n = 2 + fence.len();
+    if dst.len() < n {
+        return Err(WireError::BufferTooSmall {
+            needed: n,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = op;
+    dst[1] = fence.len() as u8;
+    dst[2..n].copy_from_slice(fence);
+    Ok(n)
+}
+
+/// The opcode and encoded fence of a write ack.
+pub fn decode_write_ack(src: &[u8]) -> Result<(u8, &[u8]), WireError> {
+    let op = *src.first().ok_or(WireError::Truncated)?;
+    if !is_write_op(op) {
+        return Err(WireError::BadOpcode { observed: op });
+    }
+    let len = *src.get(1).ok_or(WireError::Truncated)? as usize;
+    if len > ACK_FENCE_MAX {
+        return Err(WireError::StringTooLong {
+            len,
+            max: ACK_FENCE_MAX,
+        });
+    }
+    let fence = src.get(2..2 + len).ok_or(WireError::Truncated)?;
+    Ok((op, fence))
+}
+
 /// When a binding change applies, beyond its revision.
 pub const COND_ANY: u8 = 0;
 /// Only if the key holds no live binding.
@@ -1586,9 +1647,18 @@ pub fn response_record_len(src: &[u8]) -> Result<Option<usize>, WireError> {
         }
     };
     match opcode {
-        // Bare acks: the applied opcode echoed back, or a refusal.
-        OP_BIND | OP_RENAME | OP_UNBIND | OP_GC_RELEASE | NAK_GENERIC | NAK_RESERVED_BYTE
-        | NAK_FENCED | NAK_CONDITION | NAK_STALE => complete(1),
+        // A write ack: [op][fence_len][fence].
+        OP_BIND | OP_RENAME | OP_UNBIND => match src.get(1) {
+            None => Ok(None),
+            Some(&l) if l as usize > ACK_FENCE_MAX => Err(WireError::StringTooLong {
+                len: l as usize,
+                max: ACK_FENCE_MAX,
+            }),
+            Some(&l) => complete(2 + l as usize),
+        },
+        // Bare acks: a release echoed back, or a refusal.
+        OP_GC_RELEASE | NAK_GENERIC | NAK_RESERVED_BYTE | NAK_FENCED | NAK_CONDITION
+        | NAK_STALE => complete(1),
         // [op][flag]
         OP_GC_RESERVE => complete(2),
         // [op][status][fence:u64][expires_at:u64]

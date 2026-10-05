@@ -24,11 +24,12 @@
 // both look busy, and only the split tells them apart.
 //
 // `stream` selects what the input carries. The plane emits decision
-// records; a public surface emits a one-byte acknowledgement per
-// operation. Both resolve into the same committed/refused pair, so both
-// are counted the same way and read the same way — but a surface's
-// acks are not decision records, and parsing them as such would report
-// every one of them as malformed.
+// records; a public surface emits an acknowledgement per operation —
+// the opcode it applied, with the fence it achieved, or a refusal. Both
+// resolve into the same committed/refused pair, so both are counted the
+// same way and read the same way — but a surface's acks are not
+// decision records, and parsing them as such would report every one of
+// them as malformed.
 
 use core::ffi::c_void;
 
@@ -55,6 +56,14 @@ use load_helpers::{copy_tag, write_hex_u32};
 #[path = "../../common/mechanics/loam_decision_wire.rs"]
 mod wire;
 
+#[path = "../../common/mechanics/loam_limits.rs"]
+mod limits;
+
+// A surface's acks: its write acks carry the fence they achieved, so an
+// ack is framed by the namespace wire rather than taken a byte at a time.
+#[path = "../../common/mechanics/loam_wire.rs"]
+mod ns_wire;
+
 const READ_BUF: usize = 512;
 /// Reassembly for records that span reads. Sized past the largest
 /// record the plane emits so a single record always fits.
@@ -73,13 +82,8 @@ define_params! {
 
 /// Input carries `loam_decision_wire` records from the metadata plane.
 const STREAM_DECISIONS: u32 = 0;
-/// Input carries a public surface's one-byte acknowledgements.
+/// Input carries a public surface's acknowledgements (`loam_wire`).
 const STREAM_ACKS: u32 = 1;
-
-/// Surface refusals. Anything else acknowledges the operation it
-/// echoes, so the opcode itself is the success byte.
-const ACK_REFUSED: u8 = 0xFF;
-const ACK_NOT_READY: u8 = 0xFE;
 
 #[repr(C)]
 pub struct ModuleState {
@@ -193,19 +197,30 @@ pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
 
             let mut off = 0usize;
             if s.stream == STREAM_ACKS {
-                // One byte, one operation: nothing to reassemble.
-                while off < s.asm_len {
-                    match s.asm[off] {
-                        ACK_REFUSED | ACK_NOT_READY => {
-                            s.window_aborted = s.window_aborted.wrapping_add(1);
-                            s.total_aborted = s.total_aborted.wrapping_add(1);
+                // An applied write echoes its opcode (and carries its
+                // fence); a refusal is a bare `NAK_*` byte.
+                loop {
+                    match ns_wire::response_record_len(&s.asm[off..s.asm_len]) {
+                        Ok(Some(len)) => {
+                            let op = s.asm[off];
+                            if op == ns_wire::OP_BIND
+                                || op == ns_wire::OP_RENAME
+                                || op == ns_wire::OP_UNBIND
+                            {
+                                s.window_committed = s.window_committed.wrapping_add(1);
+                                s.total_committed = s.total_committed.wrapping_add(1);
+                            } else {
+                                s.window_aborted = s.window_aborted.wrapping_add(1);
+                                s.total_aborted = s.total_aborted.wrapping_add(1);
+                            }
+                            off += len;
                         }
-                        _ => {
-                            s.window_committed = s.window_committed.wrapping_add(1);
-                            s.total_committed = s.total_committed.wrapping_add(1);
+                        Ok(None) => break,
+                        Err(_) => {
+                            s.unparsed = s.unparsed.wrapping_add(1);
+                            off += 1;
                         }
                     }
-                    off += 1;
                 }
             } else {
                 loop {

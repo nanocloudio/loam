@@ -253,10 +253,14 @@ and starves eviction. Lookup misses binary-search the snapshot;
 full arenas evict snapshot-covered slots (safe mid-merge: a
 pre-cursor evictee's record flows in from the old snapshot, and
 emit-tags are per-slot generation bytes so reused slots can't be
-mismarked); deletes TOMBSTONE (masking the on-disk record until
-compaction drops both, at the binding's revision so re-binds win
-normally); listings walk arena then snapshot without
-duplicates. Proven by `ns_scales_past_arena_capacity_via_snapshot`,
+mismarked); deletes TOMBSTONE at the binding's revision, masking
+the on-disk record, and compaction writes the tombstone into the
+next generation in the record's place — so a deleted key keeps the
+revision a re-bind must exceed across compactions and restarts, on
+every replica alike, and readers treat a snapshot tombstone as
+absent; listings walk arena then snapshot without duplicates.
+`a_deletion_survives_compaction_and_restart_at_its_revision` proves
+the revision outlives the arena, the log and a restart. Proven by `ns_scales_past_arena_capacity_via_snapshot`,
 which pushes 512 bindings past the arena capacity with live
 compaction interleaved, then restarts onto snapshot + tail. It is a
 no-op on `minimal`, where the tier is compiled out and a full arena
@@ -271,7 +275,8 @@ next_cursor=0 → definitively unreferenced; otherwise the caller
 deciding delete. Conservative direction survives at every edge:
 hash-only records, read failures, and snapshot records masked by
 an arena tombstone all answer "referenced" (the tombstoned blob
-is collected after compaction drops the record). While any volume
+is collected once compaction has replaced the record with the
+tombstone, which names no object). While any volume
 flush is open every page answers "referenced": the flush is writing
 bodies no binding names yet.
 

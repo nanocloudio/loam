@@ -9,3 +9,23 @@ required = true
 
 [observability]
 exempt = "diagnostic rate reporter; its output IS the measurement"
+
+# Capacity profiles (modules/common/mechanics/loam_limits.rs). The
+# counter frames a surface's acks with the namespace wire, which sizes
+# itself from the register; a graph picks one with `variant: <profile>`.
+[[variant]]
+name = "embedded"
+features = ["embedded"]
+default = true
+
+[[variant]]
+name = "minimal"
+features = ["minimal"]
+
+[[variant]]
+name = "node"
+features = ["node"]
+
+[[variant]]
+name = "server"
+features = ["server"]

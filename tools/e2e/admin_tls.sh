@@ -117,8 +117,8 @@ cmp -s "$W/v.read" <(head -c 65536 /dev/zero) || fail "a new volume does not rea
 refused "a second volume at the same path" volume create tenant /vols/v0 1048576 32768
 ok "volume delete" volume delete tenant /vols/v0
 
-# An export moves each body whole, in one admin answer.
-head -c 40000 /dev/urandom >"$W/a.bin"
+# Larger than one admin answer, so the export streams it.
+cp "$W/f.bin" "$W/a.bin"
 ok "put for the snapshot" put tenant /docs/a.bin "$W/a.bin"
 ok "snapshot create" snapshot create tenant snap "$W/snap.manifest"
 ok "snapshot restore" snapshot restore "$W/snap.manifest" restored

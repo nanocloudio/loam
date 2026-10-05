@@ -814,7 +814,7 @@ impl<const N: usize> PicNamespaceState<N> {
             if s.locked != 0 {
                 continue;
             }
-            if s.occupied && s.snapshotted != 0 && s.kind != KIND_TOMBSTONE {
+            if s.occupied && s.snapshotted != 0 {
                 evicted = Some(s.change_rev);
                 *s = BindingSlot::empty();
                 break;
@@ -857,31 +857,16 @@ impl<const N: usize> PicNamespaceState<N> {
         }
     }
 
-    /// The generation tagged `tag` is DURABLE: emitted live slots
-    /// become snapshot-covered (evictable), emitted tombstones are
-    /// fully superseded (freed). Slots mutated since their emit
-    /// cleared the tag and are untouched.
+    /// The generation tagged `tag` is DURABLE: emitted slots — live
+    /// bindings and tombstones alike, since the snapshot holds both —
+    /// become snapshot-covered (evictable). Slots mutated since their
+    /// emit cleared the tag and are untouched.
     pub fn finalize_emitted(&mut self, tag: u8) {
-        let mut dropped = 0u64;
         for s in self.slots.iter_mut() {
             if s.occupied && s.cmp_emitted == tag {
-                if s.kind == KIND_TOMBSTONE {
-                    // The deletion is now durably absent from the
-                    // snapshot, so the tombstone goes — and with it
-                    // the only evidence that the deletion happened at
-                    // its change position.
-                    if s.change_rev > dropped {
-                        dropped = s.change_rev;
-                    }
-                    *s = BindingSlot::empty();
-                } else {
-                    s.snapshotted = 1;
-                    s.cmp_emitted = 0;
-                }
+                s.snapshotted = 1;
+                s.cmp_emitted = 0;
             }
-        }
-        if dropped > 0 {
-            self.forget_change(dropped);
         }
     }
 

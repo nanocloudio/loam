@@ -42,7 +42,8 @@
 // chunks and commit belong to the session that opened it. A lease may
 // not reach past the grant that admitted it. Nothing else is admitted:
 // a refusal is answered `STATUS_FORBIDDEN` in the op's own ack shape,
-// and a byte that names no request closes the session.
+// and a byte that names no request is answered `FORBIDDEN` under the cid
+// it carries, then closes the session: nothing after it can be framed.
 //
 // A lease or volume request's holder is replaced with one bound to the
 // session's identity (`bound_holder`), so no session can name another
@@ -189,6 +190,10 @@ pub struct Outbox {
     pub link: u8,
     pub len: u32,
     pub sent: u32,
+    /// 1: close the network connection once this answer has gone out —
+    /// the answer to a byte that names no request, after which nothing
+    /// on the connection can be framed.
+    pub close_after: u8,
     pub buf: [u8; ANSWER_MAX],
 }
 
@@ -606,9 +611,21 @@ unsafe fn serve_net(s: &mut ModuleState, i: usize) {
                 }
                 Ok(l) => l,
                 Err(aw::WireError::Truncated) => return,
+                Err(aw::WireError::BadOpcode { .. }) => {
+                    // A byte that names no request: nothing after it can
+                    // be framed. It is answered refused, under the cid it
+                    // carries, before the connection closes, so the client
+                    // hears why rather than seeing the connection drop.
+                    if have < 5 {
+                        return;
+                    }
+                    let frame: &[u8] = &*(&s.net[i].rx[..5] as *const [u8]);
+                    refuse(s, Who::Net(i as u16), frame, aw::STATUS_FORBIDDEN);
+                    s.out.close_after = 1;
+                    end_net(s, i);
+                    return;
+                }
                 Err(_) => {
-                    // A byte that names no request: nothing after it
-                    // can be framed.
                     close_net(s, i);
                     return;
                 }
@@ -689,6 +706,14 @@ unsafe fn read_link(s: &mut ModuleState, l: usize) {
         } else {
             aw::request_len(frame) == Ok(frame.len())
         };
+        if !whole
+            && !is_cap_frame(frame[0])
+            && frame.len() >= 5
+            && matches!(aw::request_len(frame), Err(aw::WireError::BadOpcode { .. }))
+        {
+            // As on the network: answered refused, then the session ends.
+            refuse(s, Who::Link(j as u16), frame, aw::STATUS_FORBIDDEN);
+        }
         if !whole || !handle_frame(s, Who::Link(j as u16), frame) {
             // A record that is not exactly one frame: the session is
             // over, as a network one would be closed.
@@ -1175,6 +1200,12 @@ unsafe fn flush_answer(s: &mut ModuleState) -> bool {
                     return false;
                 }
                 s.out.sent += take as u32;
+            }
+            if s.out.close_after != 0 {
+                if !net_cmd(s, net_proto::CMD_CLOSE, &s.out.conn.to_le_bytes()) {
+                    return false;
+                }
+                s.out.close_after = 0;
             }
         }
         _ => {

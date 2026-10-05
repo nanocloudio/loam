@@ -62,10 +62,6 @@ mod proof;
 // consumer binds to. It owns the channel envelope (type ids, framing,
 // reassembly) and the committed-entry payload decode, so the bridge holds no
 // copy of Clustor's wire vocabulary and cannot drift from it.
-#[allow(
-    unexpected_cfgs,
-    reason = "clustor's facade source carries its host unit tests under cfg(test), which a PIC compile does not declare"
-)]
 #[path = "../../../target/fluxor/clustor-common/replica_facade.rs"]
 mod facade;
 

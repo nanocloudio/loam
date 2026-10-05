@@ -1022,6 +1022,10 @@ unsafe fn handle_lookup(s: &mut ModuleState, syscalls: &super::SyscallTable, byt
             };
             super::wire::encode_lookup_found(&mut s.list_scratch, &b)
         }
+        Some(Current::Snapshot(rec)) if rec.kind == super::state::KIND_TOMBSTONE => {
+            s.snap_misses = s.snap_misses.wrapping_add(1);
+            super::wire::encode_lookup_not_found(&mut s.list_scratch, rec.revision)
+        }
         Some(Current::Snapshot(rec)) => {
             s.snap_misses = s.snap_misses.wrapping_add(1);
             let b = super::wire::Binding {
@@ -1094,8 +1098,8 @@ enum Current {
 }
 
 /// The current state of `(root, path)`: the arena's entry, else the
-/// snapshot's record, else `None` (never bound, or a deletion compaction
-/// has since dropped).
+/// snapshot's record, else `None` (never bound). Either may be a
+/// tombstone (`KIND_TOMBSTONE`): the key was deleted at its revision.
 unsafe fn current(
     s: &ModuleState,
     syscalls: &super::SyscallTable,
@@ -1214,19 +1218,23 @@ unsafe fn walk_ordered(
                 let rec = b?;
                 idx += 1;
                 cur_path[..path_len].copy_from_slice(rec.path());
-                take(&Listed {
-                    path: rec.path(),
-                    binding: super::wire::Binding {
-                        object_id: rec.oid(),
-                        revision: rec.revision,
-                        kind: rec.kind,
-                        meta: super::wire::BindMeta {
-                            stamp_ms: rec.stamp_ms,
-                            size: rec.size,
-                            content_type: rec.content_type(),
+                if rec.kind == super::state::KIND_TOMBSTONE {
+                    true
+                } else {
+                    take(&Listed {
+                        path: rec.path(),
+                        binding: super::wire::Binding {
+                            object_id: rec.oid(),
+                            revision: rec.revision,
+                            kind: rec.kind,
+                            meta: super::wire::BindMeta {
+                                stamp_ms: rec.stamp_ms,
+                                size: rec.size,
+                                content_type: rec.content_type(),
+                            },
                         },
-                    },
-                })
+                    })
+                }
             }
         };
         if !took {
@@ -1305,6 +1313,7 @@ unsafe fn handle_referenced(s: &mut ModuleState, syscalls: &super::SyscallTable,
         let mut idx = cursor;
         while idx < end {
             match super::snapshot::snap_read_at(syscalls, &snap, idx) {
+                Some(rec) if rec.kind == super::state::KIND_TOMBSTONE => {}
                 Some(rec) => {
                     let matches = if rec.oid_len == 0 {
                         true // hash-only: conservative
@@ -1370,6 +1379,13 @@ unsafe fn respond_applied(
                 let resp = s.volume_resp;
                 let _ = s.reply.send(syscalls.channel_write, s.out_chan, &resp);
             }
+        }
+        Ok(op)
+            if op == super::wire::OP_BIND
+                || op == super::wire::OP_RENAME
+                || op == super::wire::OP_UNBIND =>
+        {
+            respond_write(s, syscalls, op)
         }
         Ok(op) => respond(s, syscalls, op),
         Err(ApplyFault::Reserved) => respond(s, syscalls, NAK_RESERVED),
@@ -1526,7 +1542,7 @@ unsafe fn apply_op(
             ),
             Some(Current::Snapshot(rec)) => (
                 rec.revision,
-                true,
+                rec.kind != super::state::KIND_TOMBSTONE,
                 rec.kind == dec.kind && rec.oid() == dec.object_id,
             ),
             Some(Current::Unreadable) => return Err(ApplyFault::Rejected),
@@ -1594,7 +1610,9 @@ unsafe fn apply_op(
             Some(Current::Arena(slot)) => {
                 (slot.revision, slot.kind != super::state::KIND_TOMBSTONE)
             }
-            Some(Current::Snapshot(rec)) => (rec.revision, true),
+            Some(Current::Snapshot(rec)) => {
+                (rec.revision, rec.kind != super::state::KIND_TOMBSTONE)
+            }
             Some(Current::Unreadable) => return Err(ApplyFault::Rejected),
             None => (0, false),
         };
@@ -1680,8 +1698,8 @@ unsafe fn is_volume_binding(
 /// Remove a binding: the key is tombstoned at `revision`. The tombstone
 /// masks any on-disk record for the key, and its revision is what a
 /// later bind must exceed, so a bind redelivered from before the delete
-/// is refused rather than reviving the key. Compaction drops it once the
-/// snapshot no longer holds the key.
+/// is refused rather than reviving the key. Compaction carries it into
+/// the snapshot, so the revision outlives the arena slot.
 unsafe fn remove_binding(
     s: &mut ModuleState,
     namespace_root: &[u8],
@@ -1728,6 +1746,9 @@ unsafe fn volume_binding(
         generation: s.snap_gen,
     };
     let rec = super::snapshot::snap_search(syscalls, &snap, namespace_root, path)?;
+    if rec.kind == super::state::KIND_TOMBSTONE {
+        return None;
+    }
     let volume = rec.kind == super::wire::KIND_VOLUME;
     Some((rec.revision, volume, volume && rec.oid() == object_id))
 }
@@ -2109,8 +2130,7 @@ unsafe fn compaction_step(s: &mut ModuleState, syscalls: &super::SyscallTable) {
         match (arena_next, old_next) {
             (None, None) => {
                 // Merge complete: make the new generation durable,
-                // switch to it, rotate the WAL, drop superseded
-                // tombstones.
+                // switch to it, rotate the WAL.
                 if !super::snapshot::snap_writer_finish(syscalls, &mut writer) {
                     compaction_abort(s, syscalls);
                     return;
@@ -2196,12 +2216,13 @@ unsafe fn compaction_step(s: &mut ModuleState, syscalls: &super::SyscallTable) {
                 if order != core::cmp::Ordering::Less {
                     // The arena's key comes first, or is the same key:
                     // the arena's entry is the newer.
-                    if slot.kind != super::state::KIND_TOMBSTONE {
-                        let rec = snap_record_from_slot(&slot);
-                        if !super::snapshot::snap_writer_append(syscalls, &mut writer, &rec) {
-                            compaction_abort(s, syscalls);
-                            return;
-                        }
+                    // Tombstones are written too: a deletion's revision
+                    // must outlive the compaction, or a re-created key
+                    // would start its revisions again.
+                    let rec = snap_record_from_slot(&slot);
+                    if !super::snapshot::snap_writer_append(syscalls, &mut writer, &rec) {
+                        compaction_abort(s, syscalls);
+                        return;
                     }
                     // Tag the emit; promoted to snapshot-covered
                     // only when this generation is durable.
@@ -2447,6 +2468,22 @@ unsafe fn write_fence_out(s: &ModuleState, ptr: *mut u8, cap: usize) {
 /// Take ownership of the one-byte answer this record owes. A channel
 /// that refuses it leaves it owed and the step re-offers it, rather
 /// than dropping an answer for a record already applied.
+/// Answer an applied write with its opcode and the fence it achieved.
+unsafe fn respond_write(s: &mut ModuleState, syscalls: &super::SyscallTable, op: u8) {
+    const _: () = assert!(super::wire::ACK_FENCE_MAX == super::abi::fence::WIRE_MAX_LEN);
+    if s.out_chan < 0 {
+        return;
+    }
+    let mut fence = [0u8; super::wire::ACK_FENCE_MAX];
+    let Some(fl) = achieved_fence(s).encode(&mut fence) else {
+        return;
+    };
+    let mut ack = [0u8; super::wire::WRITE_ACK_MAX];
+    if let Ok(n) = super::wire::encode_write_ack(&mut ack, op, &fence[..fl]) {
+        let _ = s.reply.send(syscalls.channel_write, s.out_chan, &ack[..n]);
+    }
+}
+
 unsafe fn respond(s: &mut ModuleState, syscalls: &super::SyscallTable, byte: u8) {
     if s.out_chan < 0 {
         return;

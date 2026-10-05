@@ -107,7 +107,11 @@ its session presented before the router sees it
 ([Sessions and authority](#sessions-and-authority)).
 The router demuxes each to the right downstream PIC, runs a 3-stage state machine for the composed
 `PUT_FILE`, and hosts the lifecycle sweep that reclaims orphaned body
-blobs and unbound object descriptors. The composed write's crash
+blobs and unbound object descriptors. A write's ack — `BIND`,
+`PUT_FILE`, `DELETE_FILE` — ends with the fence the namespace achieved
+for its bind, carried up from the namespace's own write ack, so a
+storage provider reports durability it was told rather than one it
+assumed. The composed write's crash
 model — idempotent retry, unreachable intermediate state, and
 conservative reclamation, with the fault matrix behind it — is in
 [`durability.md`](durability.md).
@@ -199,7 +203,8 @@ reach past the grant that admitted it. A refusal is
 `STATUS_FORBIDDEN`, distinct from `STATUS_NAK` because the remedy is
 a capability, not a retry, and it is encoded in the op's own ack
 shape so a client decodes it with the decoder it was already waiting
-on. A byte that names no request closes the session.
+on. A byte that names no request is answered `FORBIDDEN` under the cid
+it carries, and closes the session: nothing after it can be framed.
 
 Ops that name no key are judged by where their effect lands. A
 content-addressed `PUT_BODY` or `GET_BODY` cannot change bytes anyone

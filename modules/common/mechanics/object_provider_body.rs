@@ -38,8 +38,10 @@
 // again is a second look at the same request, never a second request.
 // `PUT_STREAMED_OPEN` and `PUT_STREAMED_WRITE` decide inside the call.
 //
-// The admin answers carry no fence, so a write's fence is `Volatile`:
-// taken, with no stronger claim this module can make for it.
+// A write reports the fence the namespace achieved for its bind, which
+// the admin plane's answer carries: `ReplicatedDurable` with the commit's
+// proof, `LocalDurable` behind a WAL. This module claims nothing of its
+// own; a read reports `Volatile`.
 //
 // The includer's scope provides `SyscallTable`, `abi`, `admin`
 // (loam_admin_wire), `body_wire`, `hash`, `limits`, `Sha256` and
@@ -206,6 +208,10 @@ const MODE_NEVER: u8 = 0xFF;
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct Op {
+    /// The fence a decided write achieved, as the admin plane reported
+    /// it (fluxor's fence wire form); empty for anything else.
+    pub fence: [u8; FENCE_LEN],
+    pub fence_len: u8,
     pub state: u8,
     pub kind: u8,
     pub grant: u8,
@@ -273,6 +279,9 @@ pub struct Read {
 
 #[repr(C)]
 pub struct Stream {
+    /// The fence its COMMIT achieved, kept with the decided answer.
+    pub fence: [u8; FENCE_LEN],
+    pub fence_len: u8,
     pub in_use: u8,
     pub grant: u8,
     /// The upload carrying the commit, 0xFF before COMMIT.
@@ -591,12 +600,19 @@ fn read_errno(status: u8) -> i32 {
     }
 }
 
-unsafe fn write_fence(ptr: u64, cap: u16) {
+/// Answer the caller's fence: `fence` as the admin plane reported it,
+/// or `Volatile` when there is none to report — a read, or a write the
+/// plane answered without one.
+unsafe fn write_fence(ptr: u64, cap: u16, fence: &[u8]) {
     if ptr == 0 || (cap as usize) < FENCE_LEN {
         return;
     }
     let out = core::slice::from_raw_parts_mut(ptr as usize as *mut u8, cap as usize);
-    let _ = super::abi::fence::Fence::Volatile.encode(out);
+    if fence.is_empty() || fence.len() > out.len() {
+        let _ = super::abi::fence::Fence::Volatile.encode(out);
+    } else {
+        put(out, fence);
+    }
 }
 
 fn fence_ok(ptr: u64, cap: u16) -> bool {
@@ -840,6 +856,17 @@ fn decide(s: &mut ModuleState, i: usize, result: i32) {
     s.ops[i].state = O_DECIDED;
     s.ops[i].result = result;
     s.ops[i].decided_ms = s.now_ms;
+    s.ops[i].fence_len = 0;
+}
+
+/// Decide write `i`, keeping the fence the admin plane reported for it.
+/// A fence too long to be one is not kept; the write then reports none.
+fn decide_write(s: &mut ModuleState, i: usize, result: i32, fence: &[u8]) {
+    decide(s, i, result);
+    if result == 0 && fence.len() <= FENCE_LEN {
+        put(&mut s.ops[i].fence, fence);
+        s.ops[i].fence_len = fence.len() as u8;
+    }
 }
 
 /// Store the key, content type and condition a write names on op `i`.
@@ -947,7 +974,8 @@ unsafe fn op_put(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i3
         }
         let rc = s.ops[i].result;
         if rc == 0 {
-            write_fence(fence_ptr, fence_cap);
+            let f = s.ops[i].fence;
+            write_fence(fence_ptr, fence_cap, &f[..s.ops[i].fence_len as usize]);
         }
         free_op(s, i);
         return rc;
@@ -1015,7 +1043,8 @@ unsafe fn op_delete(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) ->
         }
         let rc = s.ops[i].result;
         if rc == 0 {
-            write_fence(fence_ptr, fence_cap);
+            let f = s.ops[i].fence;
+            write_fence(fence_ptr, fence_cap, &f[..s.ops[i].fence_len as usize]);
         }
         free_op(s, i);
         return rc;
@@ -1150,7 +1179,7 @@ unsafe fn op_head(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i
     free_op(s, i);
     match n {
         Some(n) => {
-            write_fence(fence_ptr, fence_cap);
+            write_fence(fence_ptr, fence_cap, &[]);
             n as i32
         }
         None => E_NOMEM,
@@ -1262,7 +1291,7 @@ unsafe fn op_list(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i
         );
         free_op(s, i);
         if rc >= 0 {
-            write_fence(req.fence_out_ptr, req.fence_out_cap);
+            write_fence(req.fence_out_ptr, req.fence_out_cap, &[]);
         }
         return rc;
     }
@@ -1530,7 +1559,8 @@ unsafe fn stream_commit(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]
     if s.streams[i].decided != 0 {
         let rc = s.streams[i].result;
         if rc == 0 {
-            write_fence(fence_ptr, fence_cap);
+            let f = s.streams[i].fence;
+            write_fence(fence_ptr, fence_cap, &f[..s.streams[i].fence_len as usize]);
         }
         return rc;
     }
@@ -1540,13 +1570,16 @@ unsafe fn stream_commit(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]
             return E_INPROGRESS;
         }
         let rc = s.ops[o].result;
+        let (f, fl) = (s.ops[o].fence, s.ops[o].fence_len);
         free_op(s, o);
         let st = &mut s.streams[i];
         st.op = 0xFF;
         st.decided = 1;
         st.result = rc;
+        st.fence = f;
+        st.fence_len = fl;
         if rc == 0 {
-            write_fence(fence_ptr, fence_cap);
+            write_fence(fence_ptr, fence_cap, &f[..fl as usize]);
         }
         return rc;
     }
@@ -1991,7 +2024,7 @@ unsafe fn op_answered(s: &mut ModuleState, i: usize, frame: &[u8]) {
     match s.ops[i].kind {
         K_PUT | K_COMMIT => upload_answered(s, i, frame),
         K_DELETE => match aw::decode_admin_delete_file_ack(frame) {
-            Ok((_, status)) => decide(s, i, write_errno(status)),
+            Ok((_, status, fence)) => decide_write(s, i, write_errno(status), fence),
             Err(_) => decide(s, i, E_IO),
         },
         K_HEAD | K_GET => match aw::decode_admin_lookup_ack(frame) {
@@ -2063,10 +2096,12 @@ unsafe fn upload_answered(s: &mut ModuleState, i: usize, frame: &[u8]) {
             Err(_) => decide(s, i, E_IO),
         },
         _ => match aw::decode_admin_put_file_ack(frame) {
-            Ok((_, aw::STATUS_OK, Some(d))) if eq(d, &s.ops[i].digest) => decide(s, i, 0),
+            Ok((_, aw::STATUS_OK, Some(d), fence)) if eq(d, &s.ops[i].digest) => {
+                decide_write(s, i, 0, fence)
+            }
             // Stored under another digest than the bytes hashed to.
-            Ok((_, aw::STATUS_OK, _)) => decide(s, i, E_IO),
-            Ok((_, status, _)) => decide(s, i, write_errno(status)),
+            Ok((_, aw::STATUS_OK, _, _)) => decide(s, i, E_IO),
+            Ok((_, status, _, _)) => decide(s, i, write_errno(status)),
             Err(_) => decide(s, i, E_IO),
         },
     }

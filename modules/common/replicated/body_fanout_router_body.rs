@@ -75,7 +75,9 @@ const KIND_STREAM_ABORT: u8 = 8;
 const KIND_ADMIN_SCAN: u8 = 9;
 
 /// Concurrent upstream streams the router can fan out.
-const ROUTER_STREAMS: usize = 4;
+/// Streamed writes the router fans out at once: one per streamed composed
+/// write the admin plane can hold.
+const ROUTER_STREAMS: usize = super::limits::ADMIN_STREAMED_PUTFILE;
 
 use super::member_io::{now_ms, Inflight, MemberPull, Members};
 use super::placement::Fleet;

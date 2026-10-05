@@ -114,6 +114,9 @@ pub const STATUS_FORBIDDEN: u8 = 0x08;
 /// A write made on condition that nothing was bound found a binding.
 /// Distinct from `STATUS_CONFLICT` because the remedy differs: the key
 /// exists, and only a write that means to replace it can proceed.
+///
+/// To `GET_BODY`: the body is held, but is larger than one answer — it
+/// is read by range through a binding that names it.
 pub const STATUS_EXISTS: u8 = 0x09;
 
 /// How a composed write or delete decides against the key's current
@@ -217,6 +220,58 @@ pub enum WireError {
     BadOpcode { observed: u8 },
     BufferTooSmall { needed: usize, actual: usize },
     StringTooLong { len: usize, max: usize },
+}
+
+// ── Fences on write acks ───────────────────────────────────────────
+//
+// A write's ack (BIND, PUT_FILE, DELETE_FILE) ends with the fence the
+// namespace achieved for it, `[fence_len:u8][fence]` in fluxor's fence
+// wire form, empty when the write did not apply. A storage provider
+// reports it onward instead of guessing.
+
+/// The largest fence a write ack carries: fluxor's fence wire maximum.
+pub const ACK_FENCE_MAX: usize = 62;
+
+fn put_fence(dst: &mut [u8], at: usize, fence: &[u8]) -> Result<usize, WireError> {
+    if fence.len() > ACK_FENCE_MAX {
+        return Err(WireError::StringTooLong {
+            len: fence.len(),
+            max: ACK_FENCE_MAX,
+        });
+    }
+    let n = at + 1 + fence.len();
+    if dst.len() < n {
+        return Err(WireError::BufferTooSmall {
+            needed: n,
+            actual: dst.len(),
+        });
+    }
+    dst[at] = fence.len() as u8;
+    dst[at + 1..n].copy_from_slice(fence);
+    Ok(n)
+}
+
+fn get_fence(src: &[u8], at: usize) -> Result<&[u8], WireError> {
+    let len = *src.get(at).ok_or(WireError::Truncated)? as usize;
+    if len > ACK_FENCE_MAX {
+        return Err(WireError::StringTooLong {
+            len,
+            max: ACK_FENCE_MAX,
+        });
+    }
+    src.get(at + 1..at + 1 + len).ok_or(WireError::Truncated)
+}
+
+/// Length of a write ack whose fixed part is `fixed` bytes.
+fn fenced_len(src: &[u8], fixed: usize) -> Result<usize, WireError> {
+    let len = *src.get(fixed).ok_or(WireError::Truncated)? as usize;
+    if len > ACK_FENCE_MAX {
+        return Err(WireError::StringTooLong {
+            len,
+            max: ACK_FENCE_MAX,
+        });
+    }
+    Ok(fixed + 1 + len)
 }
 
 // ── AdminBind ──────────────────────────────────────────────────────
@@ -330,31 +385,34 @@ pub fn decode_admin_bind(src: &[u8]) -> Result<DecodedAdminBind<'_>, WireError> 
 
 // ── AdminBindAck ───────────────────────────────────────────────────
 
+/// `[op][cid][status][fence_len][fence]`.
 pub fn encode_admin_bind_ack(
     dst: &mut [u8],
     correlation_id: u32,
     status: u8,
+    fence: &[u8],
 ) -> Result<usize, WireError> {
-    let needed = 6;
-    if dst.len() < needed {
+    if dst.len() < 6 {
         return Err(WireError::BufferTooSmall {
-            needed,
+            needed: 6,
             actual: dst.len(),
         });
     }
     dst[0] = OP_BIND;
     dst[1..5].copy_from_slice(&correlation_id.to_le_bytes());
     dst[5] = status;
-    Ok(needed)
+    put_fence(dst, 6, fence)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DecodedAdminBindAck {
+pub struct DecodedAdminBindAck<'a> {
     pub correlation_id: u32,
     pub status: u8,
+    /// The fence the bind achieved; empty when it did not apply.
+    pub fence: &'a [u8],
 }
 
-pub fn decode_admin_bind_ack(src: &[u8]) -> Result<DecodedAdminBindAck, WireError> {
+pub fn decode_admin_bind_ack(src: &[u8]) -> Result<DecodedAdminBindAck<'_>, WireError> {
     if src.len() < 6 {
         return Err(WireError::Truncated);
     }
@@ -365,6 +423,7 @@ pub fn decode_admin_bind_ack(src: &[u8]) -> Result<DecodedAdminBindAck, WireErro
     Ok(DecodedAdminBindAck {
         correlation_id,
         status: src[5],
+        fence: get_fence(src, 6)?,
     })
 }
 
@@ -722,45 +781,47 @@ pub fn decode_admin_put_file(src: &[u8]) -> Result<DecodedAdminPutFile<'_>, Wire
     })
 }
 
+/// `[op][cid][status][digest:32][fence_len][fence]` when the put
+/// applied, `[op][cid][status][fence_len=0]` otherwise.
 pub fn encode_admin_put_file_ack(
     dst: &mut [u8],
     correlation_id: u32,
     status: u8,
     digest: Option<&[u8; DIGEST_LEN]>,
+    fence: &[u8],
 ) -> Result<usize, WireError> {
+    let fixed = if status == STATUS_OK {
+        6 + DIGEST_LEN
+    } else {
+        6
+    };
+    if dst.len() < fixed {
+        return Err(WireError::BufferTooSmall {
+            needed: fixed,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = OP_PUT_FILE;
+    dst[1..5].copy_from_slice(&correlation_id.to_le_bytes());
+    dst[5] = status;
     if status == STATUS_OK {
         let digest = digest.ok_or(WireError::BufferTooSmall {
             needed: 0,
             actual: 0,
         })?;
-        let needed = 1 + 4 + 1 + DIGEST_LEN;
-        if dst.len() < needed {
-            return Err(WireError::BufferTooSmall {
-                needed,
-                actual: dst.len(),
-            });
-        }
-        dst[0] = OP_PUT_FILE;
-        dst[1..5].copy_from_slice(&correlation_id.to_le_bytes());
-        dst[5] = status;
         dst[6..6 + DIGEST_LEN].copy_from_slice(digest);
-        Ok(needed)
+        put_fence(dst, fixed, fence)
     } else {
-        let needed = 1 + 4 + 1;
-        if dst.len() < needed {
-            return Err(WireError::BufferTooSmall {
-                needed,
-                actual: dst.len(),
-            });
-        }
-        dst[0] = OP_PUT_FILE;
-        dst[1..5].copy_from_slice(&correlation_id.to_le_bytes());
-        dst[5] = status;
-        Ok(needed)
+        put_fence(dst, fixed, &[])
     }
 }
 
-pub fn decode_admin_put_file_ack(src: &[u8]) -> Result<(u32, u8, Option<&[u8]>), WireError> {
+/// `(cid, status, digest, fence)`: the digest when the put applied, and
+/// the fence it achieved (empty otherwise).
+/// A put's answer: `(cid, status, digest, fence)`.
+pub type PutFileAck<'a> = (u32, u8, Option<&'a [u8]>, &'a [u8]);
+
+pub fn decode_admin_put_file_ack(src: &[u8]) -> Result<PutFileAck<'_>, WireError> {
     if src.len() < 6 {
         return Err(WireError::Truncated);
     }
@@ -769,15 +830,19 @@ pub fn decode_admin_put_file_ack(src: &[u8]) -> Result<(u32, u8, Option<&[u8]>),
     }
     let cid = u32::from_le_bytes(src[1..5].try_into().unwrap());
     let status = src[5];
-    let digest = if status == STATUS_OK {
+    if status == STATUS_OK {
         if src.len() < 6 + DIGEST_LEN {
             return Err(WireError::Truncated);
         }
-        Some(&src[6..6 + DIGEST_LEN])
+        Ok((
+            cid,
+            status,
+            Some(&src[6..6 + DIGEST_LEN]),
+            get_fence(src, 6 + DIGEST_LEN)?,
+        ))
     } else {
-        None
-    };
-    Ok((cid, status, digest))
+        Ok((cid, status, None, get_fence(src, 6)?))
+    }
 }
 
 // ── AdminGetFile / AdminDeleteFile (composed path ops) ────────────
@@ -1083,32 +1148,38 @@ pub fn decode_admin_delete_file(src: &[u8]) -> Result<DecodedAdminDeleteFile<'_>
     })
 }
 
+/// `[op][cid][status][fence_len][fence]`.
 pub fn encode_admin_delete_file_ack(
     dst: &mut [u8],
     correlation_id: u32,
     status: u8,
+    fence: &[u8],
 ) -> Result<usize, WireError> {
-    let needed = 1 + 4 + 1;
-    if dst.len() < needed {
+    if dst.len() < 6 {
         return Err(WireError::BufferTooSmall {
-            needed,
+            needed: 6,
             actual: dst.len(),
         });
     }
     dst[0] = OP_DELETE_FILE;
     dst[1..5].copy_from_slice(&correlation_id.to_le_bytes());
     dst[5] = status;
-    Ok(needed)
+    put_fence(dst, 6, fence)
 }
 
-pub fn decode_admin_delete_file_ack(src: &[u8]) -> Result<(u32, u8), WireError> {
+/// `(cid, status, fence)`.
+pub fn decode_admin_delete_file_ack(src: &[u8]) -> Result<(u32, u8, &[u8]), WireError> {
     if src.len() < 6 {
         return Err(WireError::Truncated);
     }
     if src[0] != OP_DELETE_FILE {
         return Err(WireError::BadOpcode { observed: src[0] });
     }
-    Ok((u32::from_le_bytes(src[1..5].try_into().unwrap()), src[5]))
+    Ok((
+        u32::from_le_bytes(src[1..5].try_into().unwrap()),
+        src[5],
+        get_fence(src, 6)?,
+    ))
 }
 
 // ── AdminListFiles ────────────────────────────────────────────────
@@ -1823,17 +1894,26 @@ pub fn response_len(src: &[u8]) -> Result<usize, WireError> {
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
     };
     match op {
-        OP_BIND | OP_DELETE_FILE | OP_PUT_FILE_CHUNK | OP_PUT_BODY_KEYED => Ok(6),
+        OP_BIND | OP_DELETE_FILE => fenced_len(src, 6),
+        OP_PUT_FILE_CHUNK | OP_PUT_BODY_KEYED => Ok(6),
         OP_DELETE_BODY => Ok(7),
         OP_PUT_FILE_OPEN => Ok(7),
         OP_STAT_FILE => Ok(14),
         OP_LEASE => Ok(LEASE_ACK_LEN),
         OP_VOLUME => Ok(14),
-        OP_PUT_BODY | OP_PUT_FILE => Ok(if status()? == STATUS_OK {
+        OP_PUT_BODY => Ok(if status()? == STATUS_OK {
             6 + DIGEST_LEN
         } else {
             6
         }),
+        OP_PUT_FILE => fenced_len(
+            src,
+            if status()? == STATUS_OK {
+                6 + DIGEST_LEN
+            } else {
+                6
+            },
+        ),
         OP_GET_BODY | OP_GET_FILE | OP_READ_FILE_RANGE => Ok(if status()? == STATUS_OK {
             10 + u32_at(6)?
         } else {
@@ -1872,13 +1952,13 @@ pub fn refusal(frame: &[u8], status: u8, out: &mut [u8]) -> usize {
         0
     };
     let n = match op {
-        OP_BIND => encode_admin_bind_ack(out, cid, status),
+        OP_BIND => encode_admin_bind_ack(out, cid, status, &[]),
         OP_PUT_BODY => encode_admin_put_body_ack(out, cid, status, None),
         OP_GET_BODY => encode_admin_get_body_ack(out, cid, status, None),
         // A streamed write's commit is answered as a whole-file put.
-        OP_PUT_FILE | OP_PUT_FILE_COMMIT => encode_admin_put_file_ack(out, cid, status, None),
+        OP_PUT_FILE | OP_PUT_FILE_COMMIT => encode_admin_put_file_ack(out, cid, status, None, &[]),
         OP_GET_FILE => encode_admin_get_file_ack(out, cid, status, None),
-        OP_DELETE_FILE => encode_admin_delete_file_ack(out, cid, status),
+        OP_DELETE_FILE => encode_admin_delete_file_ack(out, cid, status, &[]),
         OP_LIST_FILES => encode_admin_list_files_status(out, cid, status),
         OP_PUT_FILE_OPEN => encode_put_file_open_ack(out, cid, status, 0),
         OP_PUT_FILE_CHUNK => encode_put_file_chunk_ack(out, cid, status),

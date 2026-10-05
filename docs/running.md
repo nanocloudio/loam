@@ -93,7 +93,8 @@ key under bucket `tenant`. Reads need `read_state`; writes and leases
 `send_command`; the keyed body plane (`PUT_BODY_KEYED`, `DELETE_BODY`)
 `admin`. A request no presented chain admits is answered `FORBIDDEN`
 in its own ack shape, and the session stays open: the remedy is a
-capability, not a retry. A byte that names no request closes it.
+capability, not a retry. A byte that names no request is answered
+`FORBIDDEN` too, and closes the session: nothing after it can be framed.
 
 A lease or volume request's holder is replaced, on the way in, with
 one bound to the session's identity, so no client can name another's
@@ -227,8 +228,9 @@ Export is two sessions rather than a protocol: the applet asks the
 destination which digests it lacks — every entry's, and for a volume
 every page and extent its root reaches — sends only those, then
 binds the manifest's entries, so deduplication is free and a second
-export of the same manifest sends nothing. Each body moves whole,
-in one admin answer. The manifest is encryption-agnostic and its
+export of the same manifest sends nothing. A body moves whole when it
+fits one admin answer; a larger file is read by range from the
+source and written to the destination as a streamed file. The manifest is encryption-agnostic and its
 digests are over plaintext, so it means the same thing on both sides
 whatever keys each cluster holds.
 

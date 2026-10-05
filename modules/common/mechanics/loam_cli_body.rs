@@ -229,6 +229,12 @@ pub struct ModuleState {
     // a body moved during export
     pub mv: u8,
     pub mv_digest: [u8; 32],
+    /// The body is a file entry larger than one answer: it moves as a
+    /// streamed file, read by range and written by chunks.
+    pub mv_large: u8,
+    /// The root the manifest's entries are bound under at the source.
+    pub mf_root: [u8; super::limits::MAX_ROOT],
+    pub mf_root_len: u8,
 }
 
 unsafe fn sys(s: &ModuleState) -> &super::SyscallTable {
@@ -944,11 +950,8 @@ unsafe fn drive(s: &mut ModuleState) {
             let reader: &mut ac::NetReader = &mut *(&mut s.reader as *mut _);
             match ac::read_frame(reader, sysp, net_in) {
                 ac::Frame::Whole(ty, p) => {
-                    let mut k = 0;
-                    while k < s.nclients as usize {
-                        ac::feed(&mut s.clients[k], sysp, ty, p);
-                        k += 1;
-                    }
+                    let n = s.nclients as usize;
+                    ac::feed_all(&mut s.clients[..n], sysp, ty, p);
                 }
                 ac::Frame::None => break,
                 ac::Frame::Broken => {
@@ -1276,11 +1279,11 @@ unsafe fn cmd_rm(s: &mut ModuleState, answered: bool) {
         };
     }
     match aw::decode_admin_delete_file_ack(answer(s)) {
-        Ok((_, aw::STATUS_OK)) => {
+        Ok((_, aw::STATUS_OK, _)) => {
             say(s, b"deleted\n");
             finish(s, 0);
         }
-        Ok((_, st)) => fail_status(s, b"delete", st),
+        Ok((_, st, _)) => fail_status(s, b"delete", st),
         Err(_) => fail(s, b"the node's answer does not decode"),
     }
 }
@@ -1407,7 +1410,7 @@ unsafe fn cmd_put(s: &mut ModuleState, _answered: bool) {
             }
         }
         _ => match aw::decode_admin_put_file_ack(answer(s)) {
-            Ok((_, aw::STATUS_OK, Some(d))) if eq(d, &s.digest) => {
+            Ok((_, aw::STATUS_OK, Some(d), _)) if eq(d, &s.digest) => {
                 let dg = s.digest;
                 say(s, b"object ");
                 say_oid(s, &dg);
@@ -1416,8 +1419,10 @@ unsafe fn cmd_put(s: &mut ModuleState, _answered: bool) {
                 say(s, b"\n");
                 finish(s, 0);
             }
-            Ok((_, aw::STATUS_OK, _)) => fail(s, b"the node stored the bytes under another digest"),
-            Ok((_, st, _)) => fail_status(s, b"put", st),
+            Ok((_, aw::STATUS_OK, _, _)) => {
+                fail(s, b"the node stored the bytes under another digest")
+            }
+            Ok((_, st, _, _)) => fail_status(s, b"put", st),
             Err(_) => fail(s, b"the node's answer does not decode"),
         },
     }
@@ -1973,8 +1978,10 @@ unsafe fn mf_open(s: &mut ModuleState, file: &[u8]) -> bool {
             return false;
         }
         match mw::read_header(&s.mf[..s.mf_len as usize]) {
-            Ok(Some((_, count, n))) => {
+            Ok(Some((root, count, n))) => {
                 s.mf_count = count;
+                put(&mut s.mf_root, root);
+                s.mf_root_len = root.len() as u8;
                 mf_consume(s, n);
                 return true;
             }
@@ -2205,7 +2212,7 @@ unsafe fn cmd_sdelete(s: &mut ModuleState, answered: bool) {
             if answered || !plain {
                 let st = if plain {
                     match aw::decode_admin_delete_file_ack(answer(s)) {
-                        Ok((_, st)) => st,
+                        Ok((_, st, _)) => st,
                         Err(_) => 0xFF,
                     }
                 } else {
@@ -2250,26 +2257,100 @@ unsafe fn sdelete_next(s: &mut ModuleState, snap: &[u8]) {
 //
 // Pass one moves bodies: for each entry its body and, for a volume, every
 // page and extent its root reaches — each sent only if the destination
-// lacks it. Pass two binds. Nothing is bound before every body it needs
-// has landed.
+// lacks it. A body that fits one answer moves whole; a file larger than
+// that moves as a streamed file, which binds its key as it lands. Pass
+// two binds. Nothing is bound before every body it needs has landed.
 
 /// The body-move sub-flow: does the destination hold `mv_digest`? If
 /// not, fetch it from the source, check it, and store it there.
 const MV_ASK_DST: u8 = 1;
 const MV_FETCH: u8 = 2;
 const MV_STORE: u8 = 3;
+// A file entry larger than one answer moves as a streamed file: opened at
+// the destination under its key, read from the source by range (pinned to
+// its object), written by chunks, committed. The commit binds the key at
+// revision 1 with the same object the bind pass names, so that bind is the
+// same write again and is answered done.
+const MV_OPEN: u8 = 4;
+const MV_READ: u8 = 5;
+const MV_CHUNK: u8 = 6;
+const MV_COMMIT: u8 = 7;
 
 unsafe fn mv_start(s: &mut ModuleState, d: &[u8; 32]) {
     s.mv_digest = *d;
     s.mv = MV_ASK_DST;
+    s.mv_large = 0;
     send_get_body(s, 1, d)
+}
+
+/// Move the body of the entry in hand.
+unsafe fn mv_start_entry(s: &mut ModuleState) {
+    let d = s.entry_digest;
+    mv_start(s, &d);
+    s.mv_large = u8::from(s.kind != KIND_VOLUME && s.entry_size > MAX_BODY as u64);
+}
+
+/// Open the destination's streamed write for the entry in hand.
+unsafe fn mv_open(s: &mut ModuleState) {
+    let d = s.mv_digest;
+    let dst: &[u8] = &*(carg(s, 1).unwrap_or(&[]) as *const [u8]);
+    let key: &[u8] = &*(&s.key[..s.key_len as usize] as *const [u8]);
+    let ctype: &[u8] = &*(&s.ctype[..s.ctype_len as usize] as *const [u8]);
+    let cond = aw::WriteCond {
+        mode: aw::WRITE_ABSENT,
+        expect: &[],
+    };
+    let cid = next_cid(s);
+    s.off = 0;
+    s.mv = MV_OPEN;
+    match aw::encode_put_file_open(
+        &mut s.req,
+        cid,
+        dst,
+        key,
+        s.kind,
+        &cond,
+        ctype,
+        &d,
+        s.entry_size,
+    ) {
+        Ok(m) => ask(s, 1, m),
+        Err(_) => {
+            s.mv = 0;
+            fail(s, b"an entry is not one the wire carries")
+        }
+    }
+}
+
+/// Read the source's next range of the entry in hand.
+unsafe fn mv_read(s: &mut ModuleState) {
+    let left = s.entry_size - s.off;
+    let n = if left < MAX_BODY as u64 {
+        left as u32
+    } else {
+        MAX_BODY as u32
+    };
+    let oid = oid_of(&s.mv_digest);
+    let root: &[u8] = &*(&s.mf_root[..s.mf_root_len as usize] as *const [u8]);
+    let key: &[u8] = &*(&s.key[..s.key_len as usize] as *const [u8]);
+    let cid = next_cid(s);
+    s.mv = MV_READ;
+    match aw::encode_read_file_range(&mut s.req, cid, s.off, n, root, key, &oid) {
+        Ok(m) => ask(s, 0, m),
+        Err(_) => {
+            s.mv = 0;
+            fail(s, b"a read could not be encoded")
+        }
+    }
 }
 
 unsafe fn mv_step(s: &mut ModuleState, _answered: bool) {
     let d = s.mv_digest;
     match s.mv {
         MV_ASK_DST => match aw::decode_admin_get_body_ack(answer(s)) {
-            Ok((_, aw::STATUS_OK, _)) => s.mv = 0,
+            // Held — whole, or larger than one answer.
+            Ok((_, aw::STATUS_OK | aw::STATUS_EXISTS, _)) => s.mv = 0,
+            Ok((_, aw::STATUS_NOT_FOUND, _)) if s.mv_large != 0 => mv_open(s),
             Ok((_, aw::STATUS_NOT_FOUND, _)) => {
                 s.mv = MV_FETCH;
                 send_get_body(s, 0, &d)
@@ -2318,6 +2399,99 @@ unsafe fn mv_step(s: &mut ModuleState, _answered: bool) {
             Err(_) => {
                 s.mv = 0;
                 fail(s, b"the source's answer does not decode")
+            }
+        },
+        MV_OPEN => match aw::decode_put_file_open_ack(answer(s)) {
+            Ok((_, aw::STATUS_OK, pfid)) => {
+                s.pfid = pfid;
+                mv_read(s)
+            }
+            Ok((_, st, _)) => {
+                s.mv = 0;
+                fail_status(s, b"the destination", st)
+            }
+            Err(_) => {
+                s.mv = 0;
+                fail(s, b"the destination's answer does not decode")
+            }
+        },
+        MV_READ => match aw::decode_read_file_range_ack(answer(s)) {
+            Ok((_, aw::STATUS_OK, Some(bytes))) if !bytes.is_empty() => {
+                let bytes: &[u8] = &*(bytes as *const [u8]);
+                s.off += bytes.len() as u64;
+                let cid = next_cid(s);
+                let pfid = s.pfid;
+                s.mv = MV_CHUNK;
+                match aw::encode_put_file_chunk(&mut s.req, cid, pfid, bytes) {
+                    Ok(m) => ask(s, 1, m),
+                    Err(_) => {
+                        s.mv = 0;
+                        fail(s, b"a chunk could not be encoded")
+                    }
+                }
+            }
+            Ok((_, aw::STATUS_OK, _)) => {
+                s.mv = 0;
+                fail(s, b"the source's object ended before its size")
+            }
+            Ok((_, aw::STATUS_NOT_FOUND, _)) => {
+                s.mv = 0;
+                say(s, b"error: the source does not hold ");
+                say_oid(s, &d);
+                say(s, b", so this manifest cannot be exported whole\n");
+                finish(s, 1)
+            }
+            Ok((_, st, _)) => {
+                s.mv = 0;
+                fail_status(s, b"the source", st)
+            }
+            Err(_) => {
+                s.mv = 0;
+                fail(s, b"the source's answer does not decode")
+            }
+        },
+        MV_CHUNK => match aw::decode_put_file_chunk_ack(answer(s)) {
+            Ok((_, aw::STATUS_OK)) if s.off < s.entry_size => mv_read(s),
+            Ok((_, aw::STATUS_OK)) => {
+                let cid = next_cid(s);
+                let pfid = s.pfid;
+                s.mv = MV_COMMIT;
+                match aw::encode_put_file_commit(&mut s.req, cid, pfid) {
+                    Ok(m) => ask(s, 1, m),
+                    Err(_) => {
+                        s.mv = 0;
+                        fail(s, b"a commit could not be encoded")
+                    }
+                }
+            }
+            Ok((_, st)) => {
+                s.mv = 0;
+                fail_status(s, b"the destination", st)
+            }
+            Err(_) => {
+                s.mv = 0;
+                fail(s, b"the destination's answer does not decode")
+            }
+        },
+        MV_COMMIT => match aw::decode_admin_put_file_ack(answer(s)) {
+            Ok((_, aw::STATUS_OK, Some(g), _)) if eq(g, &d) => {
+                s.sent += 1;
+                s.mv = 0;
+            }
+            Ok((_, aw::STATUS_OK, _, _)) => {
+                s.mv = 0;
+                fail(
+                    s,
+                    b"the destination named a body differently than its content",
+                )
+            }
+            Ok((_, st, _, _)) => {
+                s.mv = 0;
+                fail_status(s, b"the destination", st)
+            }
+            Err(_) => {
+                s.mv = 0;
+                fail(s, b"the destination's answer does not decode")
             }
         },
         _ => match aw::decode_admin_put_body_ack(answer(s)) {
@@ -2382,8 +2556,7 @@ unsafe fn cmd_export(s: &mut ModuleState, answered: bool) {
                     continue;
                 }
                 s.st = EX_ENTRY;
-                let d = s.entry_digest;
-                return mv_start(s, &d);
+                return mv_start_entry(s);
             }
             EX_ENTRY => {
                 // The entry's body is at the destination.
@@ -2399,8 +2572,7 @@ unsafe fn cmd_export(s: &mut ModuleState, answered: bool) {
                     s.st = EX_BIND;
                     continue;
                 }
-                let d = s.entry_digest;
-                return mv_start(s, &d);
+                return mv_start_entry(s);
             }
             EX_ROOT => {
                 if !answered {
