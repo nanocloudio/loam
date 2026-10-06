@@ -82,12 +82,10 @@ wiring:
     to: http.net_in
   - from: http.net_out
     to: linux_net.net_in
-  - from: http.req_out
+  - from: http.request_out
     to: s3_serve.request_in
-    buffer_group: 1
   - from: s3_serve.response_out
-    to: http.resp_in
-    buffer_group: 2
+    to: http.response_in
   - from: object_provider.admin_out
     to: admin_gate.link0_in
     buffer_group: 3

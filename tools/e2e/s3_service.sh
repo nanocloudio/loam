@@ -8,8 +8,8 @@
 #
 # Gates:
 #   - the bundle refuses to run without a required parameter;
-#   - an object's life: PUT (a single record and a streamed multi-megabyte
-#     body), GET identical, HEAD's length, a range, the listing, a
+#   - an object's life: PUT (a single record, a 256 KiB body and a streamed
+#     multi-megabyte body), GET identical, HEAD's length, a range, the listing, a
 #     conditional create refused when the key exists, DELETE, then 404;
 #   - refusals: an unsigned request, a key whose capability does not
 #     reach the bucket;
@@ -75,8 +75,12 @@ else
 fi
 
 head -c 1000 /dev/urandom >"$W/small"
+head -c 262144 /dev/urandom >"$W/mid"
 head -c 3000000 /dev/urandom >"$W/large"
 expect 200 "$(s3 "${A[@]}" -X PUT -T "$W/small" "$URL/alpha/docs/small")" "PUT a single-record object"
+expect 200 "$(s3 "${A[@]}" -X PUT --data-binary @"$W/mid" "$URL/alpha/docs/mid")" "PUT a 256 KiB object"
+expect 200 "$(S3_OUT="$W/mid.back" s3 "${A[@]}" "$URL/alpha/docs/mid")" "GET the 256 KiB object"
+cmp -s "$W/mid" "$W/mid.back" || fail "the 256 KiB object came back different"
 expect 200 "$(s3 "${A[@]}" -X PUT -T "$W/large" "$URL/alpha/docs/large")" "PUT a streamed 3 MB object"
 expect 200 "$(S3_OUT="$W/large.back" s3 "${A[@]}" "$URL/alpha/docs/large")" "GET the streamed object"
 cmp -s "$W/large" "$W/large.back" || fail "GET returned different bytes"

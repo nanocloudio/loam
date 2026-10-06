@@ -72,14 +72,11 @@ wiring:
     to: http.net_in
   - from: http.net_out
     to: linux_net.net_in
-  # One whole record per write: both edges need a buffer group, distinct
-  # because they are independent channels.
-  - from: http.req_out
+  # The exchange: `http` asks, `s3_serve` answers.
+  - from: http.request_out
     to: s3_serve.request_in
-    buffer_group: 1
   - from: s3_serve.response_out
-    to: http.resp_in
-    buffer_group: 2
+    to: http.response_in
 
   # The provider's link: one record per buffer, both ways.
   - from: object_provider.admin_out
