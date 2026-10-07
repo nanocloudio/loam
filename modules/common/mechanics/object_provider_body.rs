@@ -338,6 +338,9 @@ pub struct ModuleState {
     pub stray_answers: u32,
     pub protocol_errors: u32,
     pub expired: u32,
+    /// The provider selector (`provider_selector::hash` of `volume`), or 0:
+    /// the graph's default `storage.object` provider.
+    pub selector: u32,
 }
 
 unsafe fn sys(s: &ModuleState) -> &super::SyscallTable {

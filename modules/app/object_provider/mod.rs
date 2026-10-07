@@ -44,13 +44,17 @@ mod body;
 /// Longest `spool_dir`: the body's own ceiling, so the parameter and
 /// the spool paths built from it cannot disagree.
 const SPOOL_DIR_MAX: usize = body::SPOOL_DIR_MAX;
+/// Longest `volume` name.
+const VOLUME_MAX: usize = 32;
 
 mod params_def {
-    use super::{SCHEMA_MAX, SPOOL_DIR_MAX};
+    use super::{SCHEMA_MAX, SPOOL_DIR_MAX, VOLUME_MAX};
 
     pub struct Config {
         pub spool_dir: [u8; SPOOL_DIR_MAX],
         pub spool_dir_len: usize,
+        pub volume: [u8; VOLUME_MAX],
+        pub volume_len: usize,
         /// A value was given that does not fit: refused, never clipped.
         pub too_long: bool,
     }
@@ -69,6 +73,22 @@ mod params_def {
                     i += 1;
                 }
                 s.spool_dir_len = len;
+            };
+        // A keyed provider: reached by this volume's selector, leaving the
+        // graph's default `storage.object` slot to another provider. Absent:
+        // the default provider.
+        2, volume, str, 0
+            => |s, d, len| {
+                if len > VOLUME_MAX {
+                    s.too_long = true;
+                    return;
+                }
+                let mut i = 0usize;
+                while i < len {
+                    s.volume[i] = *d.add(i);
+                    i += 1;
+                }
+                s.volume_len = len;
             };
     }
 }
@@ -109,6 +129,8 @@ pub unsafe extern "C" fn module_new(
         let mut cfg = params_def::Config {
             spool_dir: [0; SPOOL_DIR_MAX],
             spool_dir_len: 0,
+            volume: [0; VOLUME_MAX],
+            volume_len: 0,
             too_long: false,
         };
         if !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01 {
@@ -117,7 +139,7 @@ pub unsafe extern "C" fn module_new(
         if cfg.too_long || cfg.spool_dir_len == 0 {
             return refuse(
                 sys,
-                b"[object_provider] spool_dir is required: a directory of at most 192 bytes",
+                b"[object_provider] spool_dir is required (a directory of at most 192 bytes); volume is at most 32 bytes",
             );
         }
         if in_chan < 0 || out_chan < 0 {
@@ -126,14 +148,19 @@ pub unsafe extern "C" fn module_new(
                 b"[object_provider] admin_in and admin_out must be wired to an admin_gate link",
             );
         }
-        body::module_new_impl(
+        let rc = body::module_new_impl(
             in_chan,
             out_chan,
             &cfg.spool_dir[..cfg.spool_dir_len],
             state_ptr,
             state_size,
             syscalls as *const SyscallTable,
-        )
+        );
+        if rc == 0 && cfg.volume_len > 0 {
+            let s = &mut *(state_ptr as *mut body::ModuleState);
+            s.selector = abi::kernel_abi::provider_selector::hash(&cfg.volume[..cfg.volume_len]);
+        }
+        rc
     }
 }
 
@@ -147,6 +174,18 @@ pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
 }
 
 // ── storage.object provider exports ─────────────────────────────────
+
+/// The selector this provider answers to: the hash of its `volume`, or 0
+/// (the default provider) when it has none.
+#[no_mangle]
+#[link_section = ".text.module_provider_selector"]
+pub extern "C" fn module_provider_selector(state: *mut u8) -> u32 {
+    if state.is_null() {
+        return 0;
+    }
+    // SAFETY: the loader passes this module's own initialised state.
+    unsafe { (*(state as *const body::ModuleState)).selector }
+}
 
 #[no_mangle]
 #[link_section = ".text.module_provides_contract"]

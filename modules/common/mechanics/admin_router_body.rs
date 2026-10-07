@@ -303,7 +303,9 @@ pub struct ModuleState {
     /// Descriptors deleted by the sweep.
     pub gc_obj_deleted: u32,
     pub gc_inflight: u8,
-    pub gc_digests: [[u8; 32]; super::body_wire::MAX_SCAN_DIGESTS],
+    /// The page being swept: a body SCAN page or a descriptor OBJ_SCAN
+    /// page, whichever is larger.
+    pub gc_digests: [[u8; 32]; GC_QUEUE],
     pub gc_q_len: u8,
     pub gc_q_pos: u8,
     /// Snapshot-scan continuation cursor for the current digest's
@@ -355,6 +357,14 @@ pub struct ModuleState {
 
 /// Internal pending-op markers for the GC's downstream requests —
 /// outside the admin opcode space so drains can demux them.
+/// Entries one GC page holds: the larger of the two inventories' pages
+/// (body SCAN, descriptor OBJ_SCAN), since both fill the same queue.
+const GC_QUEUE: usize = if super::obj_wire::MAX_OBJ_SCAN > super::body_wire::MAX_SCAN_DIGESTS {
+    super::obj_wire::MAX_OBJ_SCAN
+} else {
+    super::body_wire::MAX_SCAN_DIGESTS
+};
+
 const GC_OP_SCAN: u8 = 0xF0;
 const GC_OP_CHECK: u8 = 0xF1;
 const GC_OP_DELETE: u8 = 0xF2;

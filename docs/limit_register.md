@@ -212,6 +212,7 @@ ceiling answers `EBUSY` or `ENOMEM`.
 | Provider scope | `SCOPE_MAX` | `mechanics/object_provider_body.rs` | 255 | Derived: the storage contract's grant scope |
 | Provider content type | `CTYPE_MAX` | `mechanics/object_provider_body.rs` | `CONTENT_TYPE_MAX` | Derived |
 | Spool directory | `SPOOL_DIR_MAX` | `mechanics/object_provider_body.rs` | 192 | Policy: the `spool_dir` parameter's longest path; the shim's parameter takes the body's value |
+| Provider volume | `VOLUME_MAX` | `app/object_provider/mod.rs` | 32 | Policy: the `volume` parameter's longest name, hashed to the provider's selector; longer is refused, never clipped |
 | Spool file name | `SPOOL_NAME_MAX` | `mechanics/object_provider_body.rs` | derived, 216 | Derived: the directory and the 24 bytes a spool file's name adds |
 | Provider request / answer | `object_provider_body::OUT_MAX`, `object_provider_body::RX_MAX` | `mechanics/object_provider_body.rs` | derived | Derived: a link record of the largest request, and of the largest answer |
 | Applet arguments | `ARGV_MAX` | `mechanics/loam_cli_body.rs` | 8192 | Policy: the argv record; its port is sized to it, so a longer one never arrives and the applet answers with help |

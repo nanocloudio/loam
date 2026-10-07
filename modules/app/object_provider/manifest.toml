@@ -11,7 +11,9 @@ timer_class = "wall_clock"
 # the grant that session holds. Keys are `root/path`. Writes are the
 # admin plane's composed, conditional writes; reads pin to the object
 # they resolved. Fence: `Volatile` — the admin plane's answers carry no
-# fence, so the provider claims none.
+# fence, so the provider claims none. With a `volume:` parameter it is a
+# keyed provider (reached by that volume's selector), leaving the graph's
+# default `storage.object` to another; without one it is the default.
 provides = ["storage.object"]
 
 [[ports]]
