@@ -43,7 +43,7 @@ fi
 # sibling checkout. A missing module here means the tree is unsynced or
 # unbuilt, which is worth saying plainly rather than discovering as a
 # resolution failure three steps later.
-STAGED="$LOAM_ROOT/target/fluxor/bcm2712/modules"
+STAGED="$LOAM_ROOT/target/fluxor/aarch64/modules"
 for m in consensus durability gateway peer_router \
          raft_metadata_client clustor_bridge metadata_e2e_probe; do
   if [ ! -f "$STAGED/$m.fmod" ]; then

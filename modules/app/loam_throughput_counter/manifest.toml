@@ -1,5 +1,5 @@
 version = "0.1.0"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 [[ports]]
 name = "acks"

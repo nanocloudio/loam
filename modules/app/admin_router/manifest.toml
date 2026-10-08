@@ -1,5 +1,5 @@
 version = "0.1.0"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # Composes the admin wire's operations over the namespace, object and
 # body planes, answering each request under the caller's

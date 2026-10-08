@@ -59,7 +59,7 @@ strays=$(find modules/common -type f -not -name '*.rs' | head -3 | tr '\n' ' ')
 
 # 7. The operator applet and every module a bundle runs are built, and
 #    the applet is a real PIC object rather than a stub.
-fmods=target/fluxor/bcm2712/modules
+fmods=target/fluxor/aarch64/modules
 sz=$(stat -c %s "$fmods/loam_cli.fmod" 2>/dev/null || echo 0)
 [ "$sz" -gt 4096 ] && ok "loam_cli.fmod is built ($sz bytes)" ||
   no "loam_cli.fmod is ${sz} bytes — run 'fluxor modules build --all'"

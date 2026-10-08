@@ -1,5 +1,5 @@
 version = "0.1.0"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 # A grant's window is checked against the kernel's trusted clock; a
 # request's deadline against the monotonic one.
 timer_class = "wall_clock"

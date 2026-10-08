@@ -1,5 +1,5 @@
 version = "0.1.0"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # Runtime e2e probe for the replicated metadata plane: sends one
 # loam_decision_wire Propose into raft_metadata_client.metadata_ops and

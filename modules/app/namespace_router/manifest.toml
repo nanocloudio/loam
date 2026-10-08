@@ -1,5 +1,5 @@
 version = "0.1.0"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # Canonical storage surface this module provides (fluxor
 # storage_capability_surface.md). Consumers reach it by naming the

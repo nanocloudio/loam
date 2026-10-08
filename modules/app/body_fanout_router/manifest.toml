@@ -1,5 +1,5 @@
 version = "0.1.0"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # Body fan-out router: sits between admin_router and a fleet of
 # body_store instances. Subscribes to placement_router's fleet_epoch
