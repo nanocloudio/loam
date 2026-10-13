@@ -96,7 +96,7 @@ pub struct Client {
     // ── Network ──
     pub net_in: i32,
     pub net_out: i32,
-    pub tag: u8,
+    pub tag: net_proto::RequesterTag,
     /// Another owner reads the transport and feeds this client
     /// (`feed`): clients dialing over one `tls` share its clear side.
     pub shared: u8,
@@ -248,7 +248,7 @@ pub fn init_net(
     c: &mut Client,
     net_in: i32,
     net_out: i32,
-    tag: u8,
+    tag: net_proto::RequesterTag,
     authority: &[u8],
     now_ms: u64,
 ) -> bool {

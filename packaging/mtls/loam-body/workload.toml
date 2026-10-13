@@ -39,19 +39,19 @@ example = "/var/lib/loam/bodies"
 description = "Directory holding the bodies, one file per content digest"
 
 [params.ca]
-type = "string"
+type = "file"
 required = true
-example = "/etc/loam/ca.pem"
+example = "../samples/ca.pem"
 description = "CA bundle a router's client certificate must chain to (PEM or DER)"
 
 [params.cert]
-type = "string"
+type = "file"
 required = true
-example = "/etc/loam/node.der"
+example = "../samples/node.der"
 description = "This node's certificate, DER"
 
 [params.key]
-type = "string"
+type = "file"
 required = true
-example = "/etc/loam/node.key.der"
+example = "../samples/node.key.der"
 description = "This node's private key, DER"

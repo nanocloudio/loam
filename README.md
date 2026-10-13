@@ -92,9 +92,10 @@ cannot yet take as run-time parameters.
 ## The operator applet
 
 `loam` is a PIC module run by `fluxor exec`, speaking the admin wire
-to a node over mutual TLS. Its client certificate and key are read
-from `~/.config/loam/` (`client.der`, `client.key.der`) when it is
-installed; the node's certificate is checked against the host's
+to a node over mutual TLS. Its client certificate and key are the
+operator's, read from `~/.config/loam/` (`client.der`, `client.key.der`)
+on every run (or `fluxor exec --identity CERT,KEY`) — the published
+applet holds no credential; the node's certificate is checked against the host's
 trusted CAs, or the bundle `FLUXOR_CA_BUNDLE` names.
 
 ```sh

@@ -5,9 +5,11 @@
 #   fluxor exec loam -- --admin node:7443 --capability ops.cap ls tenant
 #
 # The node's certificate must chain to a CA the host trusts (the bundle
-# `FLUXOR_CA_BUNDLE` names, when set) and name the host the applet dials. The node accepts the applet by its own certificate, read from
-# `$HOME/.config/loam/` when the applet is installed. Capabilities
-# authorise what it does.
+# `FLUXOR_CA_BUNDLE` names, when set) and name the host the applet dials. The node accepts the applet by the OPERATOR's certificate, which
+# each run brings — `fluxor exec` gives `$HOME/.config/loam/client.der` and
+# `client.key.der` (or `--identity CERT,KEY`) to the client `tls` below. The
+# bundle carries no credential, so one published applet serves every
+# operator. Capabilities authorise what it does.
 target: linux
 tick_us: 100
 
@@ -25,8 +27,6 @@ modules:
     mode: 0                       # client
     peer_auth: ca_dns
     trust: system
-    cert_file: "${HOME}/.config/loam/client.der"
-    key_file: "${HOME}/.config/loam/client.key.der"
     ecdh_bits_per_step: 32
 
 wiring:

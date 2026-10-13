@@ -152,9 +152,11 @@ fluxor run node.yaml
 ```
 
 A client certificate must chain to `ca`. The operator applet is the
-client: installed once, with its certificate and key under
-`~/.config/loam/` (`client.der`, `client.key.der`, DER), and run with
-the node's address and a capability file:
+client: installed once (the bundle carries no credential), and run with
+the operator's certificate and key under `~/.config/loam/` (`client.der`,
+`client.key.der`, DER) — `fluxor exec` gives them to the applet on each
+run, or `--identity CERT,KEY` names others — the node's address and a
+capability file:
 
 ```sh
 fluxor install packaging/cli/workload.toml

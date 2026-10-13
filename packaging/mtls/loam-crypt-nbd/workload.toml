@@ -66,15 +66,15 @@ max = 300000
 description = "The writer lease's time to live, milliseconds"
 
 [params.cert]
-type = "string"
+type = "file"
 required = true
-example = "/etc/loam/node.der"
+example = "../samples/node.der"
 description = "This node's certificate, DER"
 
 [params.key]
-type = "string"
+type = "file"
 required = true
-example = "/etc/loam/node.key.der"
+example = "../samples/node.key.der"
 description = "This node's private key, DER"
 
 [params.crypt_key]

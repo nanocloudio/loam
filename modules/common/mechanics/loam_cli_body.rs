@@ -72,8 +72,8 @@ const BEGIN_PATIENCE_MS: u64 = 10_000;
 const BEGIN_RETRY_MS: u64 = 200;
 const DEFAULT_ADMIN: &[u8] = b"localhost:7443";
 /// The tags this applet's two dials carry on the shared `tls`.
-const TAG_A: u8 = 1;
-const TAG_B: u8 = 2;
+const TAG_A: super::abi::contracts::net::net_proto::RequesterTag = 1;
+const TAG_B: super::abi::contracts::net::net_proto::RequesterTag = 2;
 
 pub const STEP_DONE: i32 = 1;
 
@@ -658,7 +658,7 @@ unsafe fn open_session(
     k: usize,
     authority: &[u8],
     cap_file: &[u8],
-    tag: u8,
+    tag: super::abi::contracts::net::net_proto::RequesterTag,
 ) -> bool {
     let now = s.now_ms;
     let sysp: &super::SyscallTable = &*s.syscalls;

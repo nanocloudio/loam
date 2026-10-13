@@ -3,8 +3,9 @@
 #
 # The graph (linux.yaml, beside this file): cli_in → loam_cli → cli_out,
 # and loam_cli → tls (client) → linux_net for the admin plane. The client
-# certificate and its key are read from `$HOME/.config/loam/` when the
-# applet is installed. The node's certificate is verified against the
+# certificate and its key are the operator's, given by `fluxor exec` from
+# `$HOME/.config/loam/` (or `--identity CERT,KEY`) on each run; the bundle
+# holds none. The node's certificate is verified against the
 # host's trusted CAs; `FLUXOR_CA_BUNDLE` names another bundle for a run.
 [workload]
 name = "loam"

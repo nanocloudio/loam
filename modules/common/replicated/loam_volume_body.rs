@@ -368,7 +368,12 @@ pub unsafe fn configure(
 /// Bring up the admin transport the parameters chose: the network
 /// through a client-mode `tls` when an `admin` authority is set, else an
 /// in-graph link as `link_session`.
-pub unsafe fn connect(state_ptr: *mut u8, admin_in: i32, admin_out: i32, tag: u8) {
+pub unsafe fn connect(
+    state_ptr: *mut u8,
+    admin_in: i32,
+    admin_out: i32,
+    tag: super::abi::contracts::net::net_proto::RequesterTag,
+) {
     let s = &mut *(state_ptr as *mut ModuleState);
     let t = now_ms(s);
     if s.admin_len > 0 {
