@@ -143,6 +143,7 @@ pub unsafe extern "C" fn module_new(
             !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
+            parse_extended(s, params, params_len);
         } else {
             params_def::set_defaults(s);
         }
@@ -162,6 +163,42 @@ pub unsafe extern "C" fn module_new(
             );
         }
         0
+    }
+}
+
+/// The extended entries past the schema's end marker, `[tag][0x00][len BE]
+/// [payload]` (what a str param's 255 bytes cannot hold): `capability_chains`
+/// (20), the chains themselves. The end is found as the SDK's parser finds
+/// it, walking the basic entries to `0xFF` — their length field is advisory
+/// (writers differ on whether it counts the marker).
+///
+/// # Safety
+/// `params` is valid for `params_len` bytes.
+unsafe fn parse_extended(s: &mut body::ModuleState, params: *const u8, params_len: usize) {
+    let data = core::slice::from_raw_parts(params, params_len);
+    let mut pos = 4usize;
+    loop {
+        if pos + 2 > params_len {
+            return; // no end marker: no extended entries
+        }
+        let (tag, elen) = (data[pos], data[pos + 1] as usize);
+        pos += 2;
+        if tag == 0xFF {
+            break;
+        }
+        pos += elen;
+    }
+    while pos + 4 <= params_len {
+        let (tag, zero) = (data[pos], data[pos + 1]);
+        let len = ((data[pos + 2] as usize) << 8) | data[pos + 3] as usize;
+        let at = pos + 4;
+        if zero != 0 || at + len > params_len {
+            break; // not an extended entry: the rest is not ours to read
+        }
+        if tag == 20 {
+            body::set_capability_chains(s, &data[at..at + len]);
+        }
+        pos = at + len;
     }
 }
 

@@ -28,9 +28,10 @@ provides = ["storage.block"]
 # | 4   | block_size   | u32  | 4096    | Block size the device presents |
 # | 5   | holder       | str  | random  | The writer's chosen holder, 32 hex |
 # | 6   | fence        | str  | —       | The fence an attach flow bound its key release to |
-# | 7   | capability   | str  | —       | Path of the capability file, one `fxcap1.` chain per line; required |
+# | 7   | capability   | str  | —       | Path of the capability file, one `fxcap1.` chain per line; required unless `capability_chains` |
 # | 8   | admin        | str  | —       | The gate's `host[:port]`; unset, the module is a link session |
 # | 9   | session      | u32  | 1       | The link session id (link only) |
+# | 20  | capability_chains | bytes (extended entry) | — | The chains themselves, one per line — what a node hands the volume subgraph it starts as a workload, which cannot read the node's files; wins over `capability` |
 
 [[ports]]
 name = "admin_in"

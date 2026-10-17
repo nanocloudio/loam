@@ -191,6 +191,10 @@ pub struct ModuleState {
     /// Where the capability file is, and whether it has been loaded.
     pub cap_path: [u8; CAP_PATH_MAX],
     pub cap_path_len: u16,
+    /// The chains themselves, handed over by whoever started this volume
+    /// (`capability_chains`): a workload reads none of its node's files.
+    pub cap_text: [u8; super::admin_client::CAP_FILE_MAX],
+    pub cap_text_len: u16,
     pub cap_loaded: u8,
     /// The gate's authority; empty, the module is a link session.
     pub admin: [u8; super::admin_client::AUTHORITY_MAX],
@@ -416,6 +420,17 @@ pub fn set_capability(s: &mut ModuleState, v: &[u8]) {
         s.cap_path[i] = v[i];
     }
     s.cap_path_len = v.len() as u16;
+}
+
+/// `capability_chains`: the chains as text, one per line, as a capability
+/// file holds them. Refused (bad_param) past what a file may hold.
+pub fn set_capability_chains(s: &mut ModuleState, v: &[u8]) {
+    if v.len() > s.cap_text.len() {
+        s.bad_param = 1;
+        return;
+    }
+    s.cap_text[..v.len()].copy_from_slice(v);
+    s.cap_text_len = v.len() as u16;
 }
 
 pub fn set_root(s: &mut ModuleState, v: &[u8]) {
@@ -1855,6 +1870,19 @@ unsafe fn lease_guard(s: &mut ModuleState, t: u64) {
 /// client. True once it is ready; a client that fails ends the device.
 unsafe fn admin_up(s: &mut ModuleState, t: u64) -> bool {
     let sys = &*s.syscalls;
+    if s.cap_loaded == 0 && s.cap_text_len > 0 {
+        // Handed over whole: loaded as a file's lines would be.
+        let text: &[u8] = &*(&s.cap_text[..s.cap_text_len as usize] as *const [u8]);
+        if !super::admin_client::load_chains(&mut s.client, text) {
+            fail(s, EINVAL, b"[loam_volume] capability_chains holds a line that is not a chain, or too many");
+            return false;
+        }
+        if s.client.chain_count == 0 {
+            fail(s, EINVAL, b"[loam_volume] capability_chains holds no chain");
+            return false;
+        }
+        s.cap_loaded = 1;
+    }
     if s.cap_loaded == 0 {
         if s.cap_path_len == 0 {
             fail(
