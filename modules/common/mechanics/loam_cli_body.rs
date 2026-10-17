@@ -12,7 +12,9 @@
 // request at a time: a command is a resumable sequence of requests, each
 // sent when the last is answered. Files are read and written through the
 // `fs` contract, a block at a time, so a command's memory does not grow
-// with the data it moves.
+// with the data it moves. No `fs` call waits on the device: one that is
+// not answered yet (`EAGAIN`, `EINPROGRESS`) is asked again on a later
+// step, and a file being read or written resumes where it stopped.
 //
 //   lookup  <root> <path>                       the binding at a path
 //   ls      <root> [prefix]                     the bindings under a prefix
@@ -86,6 +88,12 @@ const FS_FSYNC: u32 = 0x0905;
 const FS_WRITE: u32 = 0x0906;
 const FS_OPEN_CREATE: u32 = 0x0909;
 const FS_UNLINK: u32 = 0x090A;
+const FS_FSYNC_NAME: u32 = 0x0912;
+/// `EAGAIN`: not now, nothing consumed — ask again on a later step.
+const EAGAIN: i32 = -11;
+/// `EINPROGRESS`: taken, not yet decided — ask the same again on a later
+/// step; that later answer is the decision.
+const EINPROGRESS: i32 = -36;
 const TIMER_MILLIS: u32 = 0x0602;
 const RANDOM: u32 = 0x0C3C;
 
@@ -156,6 +164,12 @@ pub struct ModuleState {
     pub nclients: u8,
     pub reader: ac::NetReader,
     pub cap_scratch: [u8; ac::CAP_FILE_MAX],
+    /// The capability file being read for the next session to open: a
+    /// read that resumes across steps, with `cap_scratch`.
+    pub cap_load: ac::ChainFileLoad,
+    /// How many sessions the command needs; `nclients` counts the ones
+    /// opened so far.
+    pub want_clients: u8,
     // the command
     pub cmd: u8,
     pub st: u8,
@@ -179,6 +193,14 @@ pub struct ModuleState {
     pub hash: super::Sha256,
     pub digest: [u8; 32],
     pub buf: [u8; MAX_BODY],
+    /// `buf[..buf_len]` holds bytes read so far, or bytes staged for a
+    /// write of which `buf[..wr_at]` the provider has already taken.
+    pub buf_len: u32,
+    pub wr_at: u32,
+    /// Zeros still owed to the file after the staged bytes.
+    pub zero_left: u64,
+    /// Where a file creation stands: its `UNLINK` or its `OPEN_CREATE`.
+    pub fc: u8,
     // a listing page held while its entries are worked through
     pub list: [u8; aw::RESPONSE_MAX],
     pub list_len: u32,
@@ -224,6 +246,9 @@ pub struct ModuleState {
     pub mf_count: u32,
     pub mf_seen: u32,
     pub mf_pass: u8,
+    /// Where opening the manifest stands: `MF_CLOSED`, `MF_OPENED` (its
+    /// header not yet taken), `MF_READY`.
+    pub mf_stage: u8,
     pub count: u64,
     pub sent: u64,
     // a body moved during export
@@ -588,35 +613,103 @@ fn help(s: &mut ModuleState) {
 }
 
 // ── Files ──────────────────────────────────────────────────────────────────
+//
+// No `fs` call waits on the device, so each helper here is one step of a
+// file operation, its progress held in the state: `Pending` means ask
+// again on a later step (the device moves only between steps), and the
+// caller returns with its stage unchanged so the next step resumes it.
 
-unsafe fn fs_open(s: &ModuleState, path: &[u8]) -> i32 {
+/// One step of a file operation.
+enum Io {
+    Done,
+    /// Not answered yet: resume on a later step.
+    Pending,
+    Failed,
+}
+
+/// One step of an operation that yields a descriptor.
+enum FdPoll {
+    Ready(i32),
+    Pending,
+    Failed,
+}
+
+/// One step of a read into `buf`.
+enum Fill {
+    /// `buf[..n]` holds what was asked for, or less only at the end of
+    /// the file.
+    Done(usize),
+    Pending,
+    Failed,
+}
+
+/// True when `rc` is not an answer yet. Neither is ever a failure, an
+/// end of data or an absence.
+const fn pending(rc: i32) -> bool {
+    rc == EAGAIN || rc == EINPROGRESS
+}
+
+/// `op` on `path`. Every ask of one operation frames the same bytes, so
+/// a re-asked `EINPROGRESS` is the byte-identical request.
+unsafe fn path_call(s: &ModuleState, op: u32, path: &[u8]) -> i32 {
     let mut p = [0u8; PATH_MAX];
     if path.len() > PATH_MAX {
         return -22;
     }
     put(&mut p, path);
-    (sys(s).provider_call)(-1, FS_OPEN, p.as_mut_ptr(), path.len())
+    (sys(s).provider_call)(-1, op, p.as_mut_ptr(), path.len())
 }
 
-/// A new, empty file at `path`.
-unsafe fn fs_create(s: &ModuleState, path: &[u8]) -> i32 {
-    let mut p = [0u8; PATH_MAX];
-    if path.len() > PATH_MAX {
-        return -22;
-    }
-    put(&mut p, path);
-    let _ = (sys(s).provider_call)(-1, FS_UNLINK, p.as_mut_ptr(), path.len());
-    (sys(s).provider_call)(-1, FS_OPEN_CREATE, p.as_mut_ptr(), path.len())
-}
-
-unsafe fn fs_unlink(s: &ModuleState, path: &[u8]) {
-    let mut p = [0u8; PATH_MAX];
-    if path.len() <= PATH_MAX {
-        put(&mut p, path);
-        let _ = (sys(s).provider_call)(-1, FS_UNLINK, p.as_mut_ptr(), path.len());
+unsafe fn fs_open(s: &ModuleState, path: &[u8]) -> FdPoll {
+    let fd = path_call(s, FS_OPEN, path);
+    if pending(fd) {
+        FdPoll::Pending
+    } else if fd < 0 {
+        FdPoll::Failed
+    } else {
+        FdPoll::Ready(fd)
     }
 }
 
+const FC_UNLINK: u8 = 0;
+const FC_CREATE: u8 = 1;
+
+/// A new, empty file at `path`: what was there is unlinked, then the
+/// file is created. Both may be undecided for some steps; `fc` holds
+/// which is being asked.
+unsafe fn fs_create(s: &mut ModuleState, path: &[u8]) -> FdPoll {
+    if s.fc == FC_UNLINK {
+        let rc = path_call(s, FS_UNLINK, path);
+        if pending(rc) {
+            return FdPoll::Pending;
+        }
+        // Removed, absent or not removable: the creation decides.
+        s.fc = FC_CREATE;
+    }
+    let fd = path_call(s, FS_OPEN_CREATE, path);
+    if pending(fd) {
+        return FdPoll::Pending;
+    }
+    s.fc = FC_UNLINK;
+    if fd < 0 {
+        FdPoll::Failed
+    } else {
+        FdPoll::Ready(fd)
+    }
+}
+
+/// Remove `path`; `Pending` until the provider has decided. Whether it
+/// was removed is not asked: the caller is failing either way.
+unsafe fn fs_unlink(s: &ModuleState, path: &[u8]) -> Io {
+    if pending(path_call(s, FS_UNLINK, path)) {
+        Io::Pending
+    } else {
+        Io::Done
+    }
+}
+
+/// `CLOSE` never waits and always releases the descriptor; anything that
+/// must be durable is fenced before it.
 unsafe fn fs_close(s: &mut ModuleState) {
     if s.fd >= 0 {
         let fd = s.fd;
@@ -625,60 +718,176 @@ unsafe fn fs_close(s: &mut ModuleState) {
     }
 }
 
-/// Fill `buf[..n]` from `fd`; the count read, short only at the end.
-unsafe fn fs_read_full(s: &mut ModuleState, n: usize) -> Option<usize> {
-    let fd = s.fd;
-    let mut got = 0;
-    while got < n {
-        let rc = (sys(s).provider_call)(fd, FS_READ, s.buf.as_mut_ptr().add(got), n - got);
-        if rc < 0 {
-            return None;
-        }
-        if rc == 0 {
-            break;
-        }
-        got += rc as usize;
+unsafe fn fs_close2(s: &mut ModuleState) {
+    if s.fd2 >= 0 {
+        let fd = s.fd2;
+        let _ = (sys(s).provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        s.fd2 = -1;
     }
-    Some(got)
 }
 
-unsafe fn fs_write_all(s: &ModuleState, fd: i32, b: &[u8]) -> bool {
-    if b.is_empty() {
-        return true;
+/// Fence `fd`'s bytes: `Done` once the provider answers that they are
+/// durable.
+unsafe fn fs_fsync(s: &ModuleState, fd: i32) -> Io {
+    let rc = (sys(s).provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
+    if pending(rc) {
+        Io::Pending
+    } else if rc < 0 {
+        Io::Failed
+    } else {
+        Io::Done
     }
-    let rc = (sys(s).provider_call)(fd, FS_WRITE, b.as_ptr() as *mut u8, b.len());
-    rc >= 0 && rc as usize == b.len()
+}
+
+/// Fence the directory entry `fs_create` minted for `path`: `Done` once
+/// the provider answers that a later mount finds the file by it.
+///
+/// A file's `FSYNC` makes its bytes durable, never its name, so a file
+/// this applet created is reported written only after both: a power cut
+/// between them could leave the bytes reachable by no name. The path is
+/// framed from the same held argument on every ask, so an undecided
+/// fence is re-asked byte-identically. A provider that cannot fence a
+/// name answers a failure, and the command fails rather than claim a
+/// file it cannot vouch for.
+unsafe fn fs_fence_name(s: &ModuleState, path: &[u8]) -> Io {
+    let rc = path_call(s, FS_FSYNC_NAME, path);
+    if pending(rc) {
+        Io::Pending
+    } else if rc < 0 {
+        Io::Failed
+    } else {
+        Io::Done
+    }
+}
+
+/// Fill `buf` from `fd` up to `n` bytes, on from the `buf_len` already
+/// read. Reads while bytes keep moving; a read not answered yet resumes
+/// on a later step, and only a read answering 0 is the end of the file.
+/// The caller sets `buf_len` to 0 once it has taken what was read.
+unsafe fn fs_fill(s: &mut ModuleState, n: usize) -> Fill {
+    let fd = s.fd;
+    let n = n.min(MAX_BODY);
+    loop {
+        let got = (s.buf_len as usize).min(n);
+        if got == n {
+            return Fill::Done(got);
+        }
+        let rc = (sys(s).provider_call)(fd, FS_READ, s.buf.as_mut_ptr().add(got), n - got);
+        if pending(rc) {
+            return Fill::Pending;
+        }
+        if rc < 0 {
+            return Fill::Failed;
+        }
+        if rc == 0 {
+            return Fill::Done(got);
+        }
+        s.buf_len = (got + (rc as usize).min(n - got)) as u32;
+    }
+}
+
+/// Stage `b` in `buf` to be written by `fs_drain`.
+fn stage(s: &mut ModuleState, b: &[u8]) {
+    let n = b.len().min(MAX_BODY);
+    put(&mut s.buf, b);
+    s.buf_len = n as u32;
+    s.wr_at = 0;
+}
+
+/// Offer `fd` the staged bytes, then the `zero_left` zeros owed after
+/// them. A short count advances by what the provider took and the rest
+/// is offered again; once it answers that it can take none now, the
+/// rest waits for a later step.
+unsafe fn fs_drain(s: &mut ModuleState, fd: i32) -> Io {
+    loop {
+        if s.wr_at >= s.buf_len {
+            if s.zero_left == 0 {
+                s.buf_len = 0;
+                s.wr_at = 0;
+                return Io::Done;
+            }
+            let n = if s.zero_left < MAX_BODY as u64 {
+                s.zero_left as usize
+            } else {
+                MAX_BODY
+            };
+            let mut i = 0;
+            while i < n && i < s.buf.len() {
+                s.buf[i] = 0;
+                i += 1;
+            }
+            s.buf_len = n as u32;
+            s.wr_at = 0;
+            s.zero_left -= n as u64;
+        }
+        let Some(b) = s.buf.get(s.wr_at as usize..s.buf_len as usize) else {
+            return Io::Failed;
+        };
+        let len = b.len();
+        let rc = (sys(s).provider_call)(fd, FS_WRITE, b.as_ptr() as *mut u8, len);
+        if pending(rc) {
+            return Io::Pending;
+        }
+        if rc <= 0 {
+            return Io::Failed;
+        }
+        s.wr_at += (rc as usize).min(len) as u32;
+    }
 }
 
 // ── Sessions and requests ──────────────────────────────────────────────────
 
-/// Open session `k` to `authority` with the chains in `cap_file`.
+/// Open session `k` to `authority` with the chains in `cap_file`, one
+/// step of reading the file per call: `Pending` while it is not read.
 unsafe fn open_session(
     s: &mut ModuleState,
     k: usize,
     authority: &[u8],
     cap_file: &[u8],
     tag: super::abi::contracts::net::net_proto::RequesterTag,
-) -> bool {
+) -> Io {
     let now = s.now_ms;
     let sysp: &super::SyscallTable = &*s.syscalls;
     let mut path = [0u8; PATH_MAX];
     if cap_file.len() > PATH_MAX {
         fail(s, b"the capability file's path is too long");
-        return false;
+        return Io::Failed;
     }
     put(&mut path, cap_file);
     let scratch: &mut [u8; ac::CAP_FILE_MAX] = &mut *(&mut s.cap_scratch as *mut _);
-    if let Err(why) = ac::load_chain_file(&mut s.clients[k], sysp, &path[..cap_file.len()], scratch)
-    {
-        fail(s, why);
-        return false;
+    let ld: &mut ac::ChainFileLoad = &mut *(&mut s.cap_load as *mut _);
+    match ac::load_chain_file(
+        &mut s.clients[k],
+        sysp,
+        &path[..cap_file.len()],
+        scratch,
+        ld,
+    ) {
+        ac::LoadPoll::Loaded => {}
+        ac::LoadPoll::Pending => return Io::Pending,
+        ac::LoadPoll::Failed(why) => {
+            // One call per arm: a match yielding the message would lower
+            // to a table of absolute pointers.
+            match why {
+                ac::LOAD_UNOPENABLE => fail(s, b"the capability file cannot be opened"),
+                ac::LOAD_TOO_LARGE => {
+                    fail(s, b"the capability file is larger than MAX_CHAINS chains")
+                }
+                ac::LOAD_BAD_LINE => fail(
+                    s,
+                    b"the capability file holds a line that is not a chain, or too many",
+                ),
+                ac::LOAD_EMPTY => fail(s, b"the capability file holds no chain"),
+                _ => fail(s, b"the capability file cannot be read"),
+            }
+            return Io::Failed;
+        }
     }
     match s.transport {
         Transport::Net { net_in, net_out } => {
             if !ac::init_net(&mut s.clients[k], net_in, net_out, tag, authority, now) {
                 fail(s, b"the authority is too long");
-                return false;
+                return Io::Failed;
             }
             ac::share_transport(&mut s.clients[k]);
         }
@@ -687,7 +896,7 @@ unsafe fn open_session(
             ac::init_link(&mut s.clients[k], link_in, link_out, tag as u32, now);
         }
     }
-    true
+    Io::Done
 }
 
 /// Send the `n`-byte request in `req` on session `k` and await its answer.
@@ -791,6 +1000,12 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
             return 0;
         }
     }
+    if s.nclients < s.want_clients {
+        open_sessions(s);
+        if s.nclients < s.want_clients || s.done != 0 {
+            return 0;
+        }
+    }
     drive(s);
     if s.out_len as usize > OUT_FLUSH {
         let _ = flush_out(s);
@@ -800,11 +1015,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
 
 unsafe fn close_all(s: &mut ModuleState) {
     fs_close(s);
-    if s.fd2 >= 0 {
-        let fd = s.fd2;
-        let _ = (sys(s).provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        s.fd2 = -1;
-    }
+    fs_close2(s);
     let sysp: &super::SyscallTable = &*s.syscalls;
     let mut k = 0;
     while k < s.nclients as usize {
@@ -815,8 +1026,8 @@ unsafe fn close_all(s: &mut ModuleState) {
     }
 }
 
-/// Take the argv record, choose the command, open its sessions. False
-/// while the record has not arrived.
+/// Take the argv record and choose the command; its sessions open after,
+/// in `open_sessions`. False while the record has not arrived.
 unsafe fn start(s: &mut ModuleState) -> bool {
     let n = if s.args_chan >= 0 {
         (sys(s).channel_read)(s.args_chan, s.argv.as_mut_ptr(), ARGV_MAX)
@@ -895,28 +1106,40 @@ unsafe fn start(s: &mut ModuleState) -> bool {
         fail(s, b"missing arguments (see `loam help`)");
         return true;
     }
-    let Some(cap) = opt(s, s.cap_at) else {
+    if opt(s, s.cap_at).is_none() {
         fail(s, b"--capability <file> is required");
         return true;
-    };
-    let mut capb = [0u8; PATH_MAX];
-    let cl = cap.len().min(PATH_MAX);
-    put(&mut capb, cap);
-    let admin = opt(s, s.admin_at).unwrap_or(DEFAULT_ADMIN);
-    let mut adminb = [0u8; ac::AUTHORITY_MAX];
-    let al = admin.len().min(ac::AUTHORITY_MAX);
-    put(&mut adminb, admin);
-    if !open_session(s, 0, &adminb[..al], &capb[..cl], TAG_A) {
-        return true;
     }
-    s.nclients = 1;
-    if cmd == C_EXPORT {
+    s.want_clients = if cmd == C_EXPORT { 2 } else { 1 };
+    true
+}
+
+/// Open the command's sessions in turn, each once its capability file is
+/// read; the file may take some steps. Called each step until
+/// `nclients` reaches `want_clients` or the command has failed.
+unsafe fn open_sessions(s: &mut ModuleState) {
+    if s.nclients == 0 {
+        let Some(cap) = opt(s, s.cap_at) else {
+            return fail(s, b"--capability <file> is required");
+        };
+        let mut capb = [0u8; PATH_MAX];
+        let cl = cap.len().min(PATH_MAX);
+        put(&mut capb, cap);
+        let admin = opt(s, s.admin_at).unwrap_or(DEFAULT_ADMIN);
+        let mut adminb = [0u8; ac::AUTHORITY_MAX];
+        let al = admin.len().min(ac::AUTHORITY_MAX);
+        put(&mut adminb, admin);
+        match open_session(s, 0, &adminb[..al], &capb[..cl], TAG_A) {
+            Io::Done => s.nclients = 1,
+            Io::Pending | Io::Failed => return,
+        }
+    }
+    if s.nclients == 1 && s.want_clients == 2 {
         let (Some(to), Some(tocap)) = (opt(s, s.to_at), opt(s, s.to_cap_at)) else {
-            fail(
+            return fail(
                 s,
                 b"export needs --to <host:port> and --to-capability <file>",
             );
-            return true;
         };
         let mut tob = [0u8; ac::AUTHORITY_MAX];
         let tl = to.len().min(ac::AUTHORITY_MAX);
@@ -924,12 +1147,10 @@ unsafe fn start(s: &mut ModuleState) -> bool {
         let mut tcb = [0u8; PATH_MAX];
         let tcl = tocap.len().min(PATH_MAX);
         put(&mut tcb, tocap);
-        if !open_session(s, 1, &tob[..tl], &tcb[..tcl], TAG_B) {
-            return true;
+        if let Io::Done = open_session(s, 1, &tob[..tl], &tcb[..tcl], TAG_B) {
+            s.nclients = 2;
         }
-        s.nclients = 2;
     }
-    true
 }
 
 /// Move the sessions, deliver an answer, or advance the command.
@@ -1290,12 +1511,21 @@ unsafe fn cmd_rm(s: &mut ModuleState, answered: bool) {
 
 // ── put ────────────────────────────────────────────────────────────────────
 
-const PUT_HASH: u8 = 0;
-const PUT_OPENED: u8 = 1;
-const PUT_CHUNKED: u8 = 2;
-const PUT_DONE: u8 = 3;
+/// `put` stages. The file is read twice — once for the digest and size,
+/// once to send — each read resuming across steps while the provider
+/// has not answered.
+const PUT_OPEN: u8 = 0;
+const PUT_HASH: u8 = 1;
+const PUT_REOPEN: u8 = 2;
+/// Reading a file small enough for one request.
+const PUT_WHOLE: u8 = 3;
+const PUT_OPENED: u8 = 4;
+const PUT_CHUNKED: u8 = 5;
+/// Reading the next chunk.
+const PUT_READ: u8 = 6;
+const PUT_DONE: u8 = 7;
 
-unsafe fn cmd_put(s: &mut ModuleState, _answered: bool) {
+unsafe fn cmd_put(s: &mut ModuleState, answered: bool) {
     let (root, path) = key_args(s);
     let file: &[u8] = &*(carg(s, 2).unwrap_or(&[]) as *const [u8]);
     let expect: &[u8] = &*(opt(s, s.if_at).unwrap_or(&[]) as *const [u8]);
@@ -1310,47 +1540,76 @@ unsafe fn cmd_put(s: &mut ModuleState, _answered: bool) {
         },
         expect,
     };
-    match s.st {
-        PUT_HASH => {
-            // Pass one: the digest and the size, a block at a time.
-            s.fd = fs_open(s, file);
-            if s.fd < 0 {
-                return fail(s, b"the file cannot be opened");
-            }
-            s.hash = super::Sha256::new();
-            s.size = 0;
-            loop {
-                let Some(n) = fs_read_full(s, MAX_BODY) else {
-                    return fail(s, b"the file cannot be read");
+    loop {
+        match s.st {
+            PUT_OPEN => {
+                // Pass one: the digest and the size, a block at a time.
+                s.fd = match fs_open(s, file) {
+                    FdPoll::Ready(fd) => fd,
+                    FdPoll::Pending => return,
+                    FdPoll::Failed => return fail(s, b"the file cannot be opened"),
                 };
+                s.hash = super::Sha256::new();
+                s.size = 0;
+                s.buf_len = 0;
+                s.st = PUT_HASH;
+            }
+            PUT_HASH => {
+                let n = match fs_fill(s, MAX_BODY) {
+                    Fill::Done(n) => n,
+                    Fill::Pending => return,
+                    Fill::Failed => return fail(s, b"the file cannot be read"),
+                };
+                s.buf_len = 0;
                 let b: &[u8] = &*(&s.buf[..n] as *const [u8]);
                 s.hash.update(b);
                 s.size += n as u64;
                 if s.size > super::body_wire::MAX_STREAM_TOTAL {
                     return fail(s, b"the file is larger than the largest object (1 GiB)");
                 }
-                if n < MAX_BODY {
-                    break;
+                if n == MAX_BODY {
+                    continue;
                 }
+                s.digest = core::mem::take(&mut s.hash).finalize();
+                fs_close(s);
+                s.st = PUT_REOPEN;
             }
-            s.digest = core::mem::take(&mut s.hash).finalize();
-            fs_close(s);
-            s.fd = fs_open(s, file);
-            if s.fd < 0 {
-                return fail(s, b"the file cannot be opened");
-            }
-            s.off = 0;
-            let cid = next_cid(s);
-            if s.size as usize <= MAX_BODY {
-                // One request carries it whole.
-                let Some(n) = fs_read_full(s, s.size as usize) else {
-                    return fail(s, b"the file cannot be read");
+            PUT_REOPEN => {
+                s.fd = match fs_open(s, file) {
+                    FdPoll::Ready(fd) => fd,
+                    FdPoll::Pending => return,
+                    FdPoll::Failed => return fail(s, b"the file cannot be opened"),
                 };
+                s.off = 0;
+                s.buf_len = 0;
+                if s.size as usize <= MAX_BODY {
+                    // One request carries it whole.
+                    s.st = PUT_WHOLE;
+                    continue;
+                }
+                s.st = PUT_OPENED;
+                let cid = next_cid(s);
+                let d = s.digest;
+                return match aw::encode_put_file_open(
+                    &mut s.req, cid, root, path, 0, &cond, ctype, &d, s.size,
+                ) {
+                    Ok(m) => ask(s, 0, m),
+                    Err(_) => fail(s, b"the key, condition or type is not one the wire carries"),
+                };
+            }
+            PUT_WHOLE => {
+                let n = match fs_fill(s, s.size as usize) {
+                    Fill::Done(n) => n,
+                    Fill::Pending => return,
+                    Fill::Failed => return fail(s, b"the file cannot be read"),
+                };
+                s.buf_len = 0;
                 if n as u64 != s.size {
                     return fail(s, b"the file changed while it was being sent");
                 }
                 let body: &[u8] = &*(&s.buf[..n] as *const [u8]);
                 s.st = PUT_DONE;
+                let cid = next_cid(s);
                 return match aw::encode_admin_put_file(
                     &mut s.req, cid, root, path, 0, &cond, ctype, body,
                 ) {
@@ -1358,142 +1617,222 @@ unsafe fn cmd_put(s: &mut ModuleState, _answered: bool) {
                     Err(_) => fail(s, b"the key, condition or type is not one the wire carries"),
                 };
             }
-            s.st = PUT_OPENED;
-            let d = s.digest;
-            match aw::encode_put_file_open(&mut s.req, cid, root, path, 0, &cond, ctype, &d, s.size)
-            {
-                Ok(m) => ask(s, 0, m),
-                Err(_) => fail(s, b"the key, condition or type is not one the wire carries"),
-            }
-        }
-        PUT_OPENED | PUT_CHUNKED => {
-            if s.st == PUT_OPENED {
-                match aw::decode_put_file_open_ack(answer(s)) {
-                    Ok((_, aw::STATUS_OK, pfid)) => s.pfid = pfid,
-                    Ok((_, st, _)) => return fail_status(s, b"put", st),
-                    Err(_) => return fail(s, b"the node's answer does not decode"),
+            PUT_OPENED | PUT_CHUNKED => {
+                if !answered {
+                    return;
                 }
-            } else {
-                match aw::decode_put_file_chunk_ack(answer(s)) {
-                    Ok((_, aw::STATUS_OK)) => {}
-                    Ok((_, st)) => return fail_status(s, b"put", st),
-                    Err(_) => return fail(s, b"the node's answer does not decode"),
+                if s.st == PUT_OPENED {
+                    match aw::decode_put_file_open_ack(answer(s)) {
+                        Ok((_, aw::STATUS_OK, pfid)) => s.pfid = pfid,
+                        Ok((_, st, _)) => return fail_status(s, b"put", st),
+                        Err(_) => return fail(s, b"the node's answer does not decode"),
+                    }
+                } else {
+                    match aw::decode_put_file_chunk_ack(answer(s)) {
+                        Ok((_, aw::STATUS_OK)) => {}
+                        Ok((_, st)) => return fail_status(s, b"put", st),
+                        Err(_) => return fail(s, b"the node's answer does not decode"),
+                    }
                 }
+                if s.off >= s.size {
+                    let cid = next_cid(s);
+                    let pfid = s.pfid;
+                    s.st = PUT_DONE;
+                    return match aw::encode_put_file_commit(&mut s.req, cid, pfid) {
+                        Ok(m) => ask(s, 0, m),
+                        Err(_) => fail(s, b"a commit could not be encoded"),
+                    };
+                }
+                s.buf_len = 0;
+                s.st = PUT_READ;
             }
-            let cid = next_cid(s);
-            let pfid = s.pfid;
-            if s.off >= s.size {
-                s.st = PUT_DONE;
-                return match aw::encode_put_file_commit(&mut s.req, cid, pfid) {
+            PUT_READ => {
+                let left = s.size - s.off;
+                let want = if left < MAX_BODY as u64 {
+                    left as usize
+                } else {
+                    MAX_BODY
+                };
+                let n = match fs_fill(s, want) {
+                    Fill::Done(n) => n,
+                    Fill::Pending => return,
+                    Fill::Failed => return fail(s, b"the file cannot be read"),
+                };
+                s.buf_len = 0;
+                if n != want {
+                    return fail(s, b"the file changed while it was being sent");
+                }
+                s.off += n as u64;
+                s.st = PUT_CHUNKED;
+                let cid = next_cid(s);
+                let pfid = s.pfid;
+                let chunk: &[u8] = &*(&s.buf[..n] as *const [u8]);
+                return match aw::encode_put_file_chunk(&mut s.req, cid, pfid, chunk) {
                     Ok(m) => ask(s, 0, m),
-                    Err(_) => fail(s, b"a commit could not be encoded"),
+                    Err(_) => fail(s, b"a chunk could not be encoded"),
                 };
             }
-            let left = s.size - s.off;
-            let want = if left < MAX_BODY as u64 {
-                left as usize
-            } else {
-                MAX_BODY
-            };
-            let Some(n) = fs_read_full(s, want) else {
-                return fail(s, b"the file cannot be read");
-            };
-            if n != want {
-                return fail(s, b"the file changed while it was being sent");
-            }
-            s.off += n as u64;
-            s.st = PUT_CHUNKED;
-            let chunk: &[u8] = &*(&s.buf[..n] as *const [u8]);
-            match aw::encode_put_file_chunk(&mut s.req, cid, pfid, chunk) {
-                Ok(m) => ask(s, 0, m),
-                Err(_) => fail(s, b"a chunk could not be encoded"),
+            _ => {
+                if !answered {
+                    return;
+                }
+                return match aw::decode_admin_put_file_ack(answer(s)) {
+                    Ok((_, aw::STATUS_OK, Some(d), _)) if eq(d, &s.digest) => {
+                        let dg = s.digest;
+                        say(s, b"object ");
+                        say_oid(s, &dg);
+                        say(s, b"\nsize ");
+                        say_u64(s, s.size);
+                        say(s, b"\n");
+                        finish(s, 0);
+                    }
+                    Ok((_, aw::STATUS_OK, _, _)) => {
+                        fail(s, b"the node stored the bytes under another digest")
+                    }
+                    Ok((_, st, _, _)) => fail_status(s, b"put", st),
+                    Err(_) => fail(s, b"the node's answer does not decode"),
+                };
             }
         }
-        _ => match aw::decode_admin_put_file_ack(answer(s)) {
-            Ok((_, aw::STATUS_OK, Some(d), _)) if eq(d, &s.digest) => {
-                let dg = s.digest;
-                say(s, b"object ");
-                say_oid(s, &dg);
-                say(s, b"\nsize ");
-                say_u64(s, s.size);
-                say(s, b"\n");
-                finish(s, 0);
-            }
-            Ok((_, aw::STATUS_OK, _, _)) => {
-                fail(s, b"the node stored the bytes under another digest")
-            }
-            Ok((_, st, _, _)) => fail_status(s, b"put", st),
-            Err(_) => fail(s, b"the node's answer does not decode"),
-        },
     }
 }
 
 // ── get ────────────────────────────────────────────────────────────────────
 
+/// `get` stages.
+const GET_LOOKUP: u8 = 0;
+const GET_FOUND: u8 = 1;
+/// Creating the file; then asking for the first range.
+const GET_CREATE: u8 = 2;
+/// A range asked for.
+const GET_RANGE: u8 = 3;
+/// A range's bytes, staged, being written.
+const GET_WRITE: u8 = 4;
+/// Every byte written: fenced before the file is said to be written.
+const GET_SYNC: u8 = 5;
+/// The bytes did not hash to the digest: the file is removed.
+const GET_UNLINK: u8 = 6;
+/// The written file's name being fenced.
+const GET_NAME: u8 = 7;
+
 unsafe fn cmd_get(s: &mut ModuleState, answered: bool) {
     let (root, path) = key_args(s);
     let file: &[u8] = &*(carg(s, 2).unwrap_or(&[]) as *const [u8]);
-    if !answered {
-        s.st = 0;
-        return send_lookup(s, 0, root, path);
-    }
-    if s.st == 0 {
-        let Some(found) = lookup_answer(s) else {
-            return;
-        };
-        let Some((_, _, oid, olen, size)) = found else {
-            return fail(s, b"not found");
-        };
-        let Some(d) = digest_of(&oid[..olen]) else {
-            return fail(s, b"the path is bound to something that is not content");
-        };
-        s.digest = d;
-        s.size = size;
-        s.off = 0;
-        s.hash = super::Sha256::new();
-        s.fd = fs_create(s, file);
-        if s.fd < 0 {
-            return fail(s, b"the file cannot be created");
-        }
-        s.st = 1;
-    } else {
-        match aw::decode_read_file_range_ack(answer(s)) {
-            Ok((_, aw::STATUS_OK, Some(bytes))) if !bytes.is_empty() => {
-                let fd = s.fd;
-                if !fs_write_all(s, fd, bytes) {
-                    return fail(s, b"the file cannot be written");
-                }
-                s.hash.update(bytes);
-                s.off += bytes.len() as u64;
+    loop {
+        match s.st {
+            GET_LOOKUP => {
+                s.st = GET_FOUND;
+                return send_lookup(s, 0, root, path);
             }
-            Ok((_, aw::STATUS_OK, _)) => return fail(s, b"the object ended before its size"),
-            Ok((_, st, _)) => return fail_status(s, b"read", st),
-            Err(_) => return fail(s, b"the node's answer does not decode"),
+            GET_FOUND => {
+                if !answered {
+                    return;
+                }
+                let Some(found) = lookup_answer(s) else {
+                    return;
+                };
+                let Some((_, _, oid, olen, size)) = found else {
+                    return fail(s, b"not found");
+                };
+                let Some(d) = digest_of(&oid[..olen]) else {
+                    return fail(s, b"the path is bound to something that is not content");
+                };
+                s.digest = d;
+                s.size = size;
+                s.off = 0;
+                s.hash = super::Sha256::new();
+                s.st = GET_CREATE;
+            }
+            GET_CREATE => {
+                s.fd = match fs_create(s, file) {
+                    FdPoll::Ready(fd) => fd,
+                    FdPoll::Pending => return,
+                    FdPoll::Failed => return fail(s, b"the file cannot be created"),
+                };
+                s.st = GET_WRITE;
+            }
+            GET_RANGE => {
+                if !answered {
+                    return;
+                }
+                match aw::decode_read_file_range_ack(answer(s)) {
+                    Ok((_, aw::STATUS_OK, Some(bytes))) if !bytes.is_empty() => {
+                        let bytes: &[u8] = &*(bytes as *const [u8]);
+                        if bytes.len() > MAX_BODY {
+                            return fail(s, b"an answer larger than any the wire carries");
+                        }
+                        stage(s, bytes);
+                        s.hash.update(bytes);
+                        s.off += bytes.len() as u64;
+                        s.st = GET_WRITE;
+                    }
+                    Ok((_, aw::STATUS_OK, _)) => {
+                        return fail(s, b"the object ended before its size")
+                    }
+                    Ok((_, st, _)) => return fail_status(s, b"read", st),
+                    Err(_) => return fail(s, b"the node's answer does not decode"),
+                }
+            }
+            GET_WRITE => {
+                let fd = s.fd;
+                match fs_drain(s, fd) {
+                    Io::Done => {}
+                    Io::Pending => return,
+                    Io::Failed => return fail(s, b"the file cannot be written"),
+                }
+                if s.off >= s.size {
+                    let got = core::mem::take(&mut s.hash).finalize();
+                    if got != s.digest {
+                        fs_close(s);
+                        s.st = GET_UNLINK;
+                        continue;
+                    }
+                    s.st = GET_SYNC;
+                    continue;
+                }
+                let left = s.size - s.off;
+                let n = if left < MAX_BODY as u64 {
+                    left as u32
+                } else {
+                    MAX_BODY as u32
+                };
+                let oid = oid_of(&s.digest);
+                let cid = next_cid(s);
+                s.st = GET_RANGE;
+                return match aw::encode_read_file_range(&mut s.req, cid, s.off, n, root, path, &oid)
+                {
+                    Ok(m) => ask(s, 0, m),
+                    Err(_) => fail(s, b"a read could not be encoded"),
+                };
+            }
+            GET_SYNC => {
+                let fd = s.fd;
+                match fs_fsync(s, fd) {
+                    Io::Done => {}
+                    Io::Pending => return,
+                    Io::Failed => return fail(s, b"the file cannot be written"),
+                }
+                fs_close(s);
+                s.st = GET_NAME;
+            }
+            GET_NAME => {
+                match fs_fence_name(s, file) {
+                    Io::Done => {}
+                    Io::Pending => return,
+                    Io::Failed => return fail(s, b"the file's name cannot be made durable"),
+                }
+                say(s, b"wrote ");
+                say_u64(s, s.size);
+                say(s, b" bytes\n");
+                return finish(s, 0);
+            }
+            _ => {
+                if let Io::Pending = fs_unlink(s, file) {
+                    return;
+                }
+                return fail(s, b"the bytes read do not hash to the object's digest");
+            }
         }
-    }
-    if s.off >= s.size {
-        let got = core::mem::take(&mut s.hash).finalize();
-        fs_close(s);
-        if got != s.digest {
-            fs_unlink(s, file);
-            return fail(s, b"the bytes read do not hash to the object's digest");
-        }
-        say(s, b"wrote ");
-        say_u64(s, s.size);
-        say(s, b" bytes\n");
-        return finish(s, 0);
-    }
-    let left = s.size - s.off;
-    let n = if left < MAX_BODY as u64 {
-        left as u32
-    } else {
-        MAX_BODY as u32
-    };
-    let oid = oid_of(&s.digest);
-    let cid = next_cid(s);
-    match aw::encode_read_file_range(&mut s.req, cid, s.off, n, root, path, &oid) {
-        Ok(m) => ask(s, 0, m),
-        Err(_) => fail(s, b"a read could not be encoded"),
     }
 }
 
@@ -1769,6 +2108,13 @@ unsafe fn cmd_vdelete(s: &mut ModuleState, answered: bool) {
     }
 }
 
+/// `volume read` stages past the walk's own (3 to 5): creating the file,
+/// and fencing it once every byte is written.
+const VREAD_CREATE: u8 = 6;
+const VREAD_SYNC: u8 = 7;
+/// The written file's name being fenced.
+const VREAD_NAME: u8 = 8;
+
 /// `volume read`: the committed revision's bytes in a window, through the
 /// map — root, leaf, extent — with unwritten extents reading as zeros.
 unsafe fn cmd_vread(s: &mut ModuleState, answered: bool) {
@@ -1801,13 +2147,22 @@ unsafe fn cmd_vread(s: &mut ModuleState, answered: bool) {
             }) else {
                 return fail(s, b"the path is bound, but not to a volume");
             };
-            s.fd = fs_create(s, file);
-            if s.fd < 0 {
-                return fail(s, b"the file cannot be created");
-            }
+            s.entry_digest = d;
+            s.st = VREAD_CREATE;
+            cmd_vread(s, false)
+        }
+        VREAD_CREATE => {
+            s.fd = match fs_create(s, file) {
+                FdPoll::Ready(fd) => fd,
+                FdPoll::Pending => return,
+                FdPoll::Failed => return fail(s, b"the file cannot be created"),
+            };
             s.st = 2;
+            let d = s.entry_digest;
             send_get_body(s, 0, &d)
         }
+        VREAD_SYNC => vread_sync(s),
+        VREAD_NAME => vread_name(s, file),
         2 => {
             let Some(page) = body_answer(s, b"map root") else {
                 return;
@@ -1864,19 +2219,29 @@ unsafe fn vread_next(s: &mut ModuleState, answered: bool) {
             s.leaf_len = b.len() as u32;
             s.st = 3;
         } else {
-            // An extent arrived: its part of the window into the file.
+            // An extent arrived: its part of the window, staged for the
+            // file.
             let index = divmod(s.off, es).0;
             let start = (s.off - index * es) as usize;
             let end = ((s.size - index * es).min(es)) as usize;
-            if b.len() < end {
+            let Some(part) = b.get(start..end) else {
                 return fail(s, b"an extent is shorter than the volume's geometry");
+            };
+            if part.len() > MAX_BODY {
+                return fail(s, b"an extent is larger than any answer carries");
             }
-            let fd = s.fd;
-            if !fs_write_all(s, fd, &b[start..end]) {
-                return fail(s, b"the file cannot be written");
-            }
+            stage(s, part);
             s.off = index * es + end as u64;
+            s.st = 3;
         }
+    }
+    // What is staged goes to the file before the walk moves on; a write
+    // the provider cannot take now resumes on a later step, here.
+    let fd = s.fd;
+    match fs_drain(s, fd) {
+        Io::Done => {}
+        Io::Pending => return,
+        Io::Failed => return fail(s, b"the file cannot be written"),
     }
     while s.off < s.size {
         let index = divmod(s.off, es).0;
@@ -1903,23 +2268,44 @@ unsafe fn vread_next(s: &mut ModuleState, answered: bool) {
         if extent == mp::ZERO_DIGEST {
             let start = s.off - index * es;
             let end = (s.size - index * es).min(es);
-            let zero = [0u8; 4096];
-            let mut left = end - start;
-            let fd = s.fd;
-            while left > 0 {
-                let n = if left < 4096 { left as usize } else { 4096 };
-                if !fs_write_all(s, fd, &zero[..n]) {
-                    return fail(s, b"the file cannot be written");
-                }
-                left -= n as u64;
-            }
+            s.zero_left = end - start;
             s.off = index * es + end;
-            continue;
+            s.st = 3;
+            match fs_drain(s, fd) {
+                Io::Done => continue,
+                Io::Pending => return,
+                Io::Failed => return fail(s, b"the file cannot be written"),
+            }
         }
         s.st = 5;
         return send_get_body(s, 0, &extent);
     }
+    s.st = VREAD_SYNC;
+    vread_sync(s)
+}
+
+/// Every byte of the window is written: fenced, its name fenced, then
+/// said.
+unsafe fn vread_sync(s: &mut ModuleState) {
+    let fd = s.fd;
+    match fs_fsync(s, fd) {
+        Io::Done => {}
+        Io::Pending => return,
+        Io::Failed => return fail(s, b"the file cannot be written"),
+    }
     fs_close(s);
+    s.st = VREAD_NAME;
+    let file: &[u8] = &*(carg(s, 4).unwrap_or(&[]) as *const [u8]);
+    vread_name(s, file)
+}
+
+/// The window's bytes are durable: fence the name that finds them.
+unsafe fn vread_name(s: &mut ModuleState, file: &[u8]) {
+    match fs_fence_name(s, file) {
+        Io::Done => {}
+        Io::Pending => return,
+        Io::Failed => return fail(s, b"the file's name cannot be made durable"),
+    }
     say(s, b"read ");
     say_u64(s, s.size - carg(s, 2).and_then(parse_u64).unwrap_or(0));
     say(s, b" bytes\n");
@@ -1928,26 +2314,50 @@ unsafe fn vread_next(s: &mut ModuleState, answered: bool) {
 
 // ── Manifests, a record at a time ──────────────────────────────────────────
 
-/// Fill the manifest buffer from `fd2`.
-unsafe fn mf_fill(s: &mut ModuleState) -> bool {
+/// Where opening the manifest stands.
+const MF_CLOSED: u8 = 0;
+const MF_OPENED: u8 = 1;
+const MF_READY: u8 = 2;
+
+/// What a manifest read answered.
+enum Mf {
+    /// The header, or the next record, is in hand.
+    Got,
+    /// Not read yet: ask again on a later step.
+    Wait,
+    /// The records are spent, or the command has ended (`done`).
+    End,
+}
+
+/// Read more of the manifest from `fd2`. A read not answered yet is
+/// `Pending`, with nothing taken; only a read answering 0 is the end.
+unsafe fn mf_fill(s: &mut ModuleState) -> Io {
     if s.mf_eof != 0 {
-        return true;
+        return Io::Done;
     }
     let at = s.mf_len as usize;
-    let room = s.mf.len() - at;
+    let room = s.mf.len().saturating_sub(at);
     if room == 0 {
-        return true;
+        return Io::Done;
     }
     let fd = s.fd2;
     let rc = (sys(s).provider_call)(fd, FS_READ, s.mf.as_mut_ptr().add(at), room);
+    if pending(rc) {
+        return Io::Pending;
+    }
     if rc < 0 {
-        return false;
+        return Io::Failed;
     }
     if rc == 0 {
         s.mf_eof = 1;
     }
-    s.mf_len += rc as u32;
-    true
+    s.mf_len += (rc as usize).min(room) as u32;
+    Io::Done
+}
+
+/// Whether the manifest buffer is full: what it holds cannot grow.
+fn mf_full(s: &ModuleState) -> bool {
+    s.mf_eof == 0 && s.mf_len as usize >= s.mf.len()
 }
 
 fn mf_consume(s: &mut ModuleState, n: usize) {
@@ -1960,51 +2370,68 @@ fn mf_consume(s: &mut ModuleState, n: usize) {
     s.mf_len = (have - n) as u32;
 }
 
-/// Open a manifest and take its header. False with the command ended.
-unsafe fn mf_open(s: &mut ModuleState, file: &[u8]) -> bool {
-    let mut p = [0u8; PATH_MAX];
-    put(&mut p, file);
-    s.fd2 = fs_open(s, &p[..file.len().min(PATH_MAX)]);
-    if s.fd2 < 0 {
-        fail(s, b"the manifest cannot be opened");
-        return false;
+/// Open a manifest and take its header, across steps while the file is
+/// not read. `End` with the command ended.
+unsafe fn mf_open(s: &mut ModuleState, file: &[u8]) -> Mf {
+    if s.mf_stage == MF_CLOSED {
+        s.fd2 = match fs_open(s, file) {
+            FdPoll::Ready(fd) => fd,
+            FdPoll::Pending => return Mf::Wait,
+            FdPoll::Failed => {
+                fail(s, b"the manifest cannot be opened");
+                return Mf::End;
+            }
+        };
+        s.mf_len = 0;
+        s.mf_eof = 0;
+        s.mf_seen = 0;
+        s.mf_stage = MF_OPENED;
     }
-    s.mf_len = 0;
-    s.mf_eof = 0;
-    s.mf_seen = 0;
+    if s.mf_stage == MF_READY {
+        return Mf::Got;
+    }
     loop {
-        if !mf_fill(s) {
-            fail(s, b"the manifest cannot be read");
-            return false;
-        }
         match mw::read_header(&s.mf[..s.mf_len as usize]) {
             Ok(Some((root, count, n))) => {
                 s.mf_count = count;
                 put(&mut s.mf_root, root);
                 s.mf_root_len = root.len() as u8;
                 mf_consume(s, n);
-                return true;
+                s.mf_stage = MF_READY;
+                return Mf::Got;
             }
-            Ok(None) if s.mf_eof == 0 => continue,
+            Ok(None) if s.mf_eof == 0 && !mf_full(s) => {}
             _ => {
                 fail(s, b"the file is not a manifest");
-                return false;
+                return Mf::End;
+            }
+        }
+        match mf_fill(s) {
+            Io::Done => {}
+            Io::Pending => return Mf::Wait,
+            Io::Failed => {
+                fail(s, b"the manifest cannot be read");
+                return Mf::End;
             }
         }
     }
 }
 
-/// The manifest's next record into `key`, `entry_digest`, `kind`. False
+/// Close the manifest, so that `mf_open` reads it from the start again.
+unsafe fn mf_close(s: &mut ModuleState) {
+    fs_close2(s);
+    s.mf_stage = MF_CLOSED;
+}
+
+/// The manifest's next record into `key`, `entry_digest`, `kind`. `End`
 /// at the end; the command is ended if the manifest is short or corrupt.
-unsafe fn mf_next(s: &mut ModuleState) -> bool {
+/// `Wait` while the record is not read: the same call on a later step
+/// resumes it.
+unsafe fn mf_next(s: &mut ModuleState) -> Mf {
     if s.mf_seen == s.mf_count {
-        return false;
+        return Mf::End;
     }
     loop {
-        if !mf_fill(s) {
-            fail(s, b"the manifest cannot be read");
-            return false;
-        }
         let have: &[u8] = &*(&s.mf[..s.mf_len as usize] as *const [u8]);
         match mw::read_record(have) {
             Ok(Some((e, n))) => {
@@ -2017,15 +2444,23 @@ unsafe fn mf_next(s: &mut ModuleState) -> bool {
                 s.ctype_len = e.content_type.len() as u8;
                 mf_consume(s, n);
                 s.mf_seen += 1;
-                return true;
+                return Mf::Got;
             }
-            Ok(None) if s.mf_eof == 0 => continue,
+            Ok(None) if s.mf_eof == 0 && !mf_full(s) => {}
             _ => {
                 fail(
                     s,
                     b"the manifest ends before its declared count, or is corrupt",
                 );
-                return false;
+                return Mf::End;
+            }
+        }
+        match mf_fill(s) {
+            Io::Done => {}
+            Io::Pending => return Mf::Wait,
+            Io::Failed => {
+                fail(s, b"the manifest cannot be read");
+                return Mf::End;
             }
         }
     }
@@ -2070,22 +2505,42 @@ fn bind_status(s: &ModuleState, plain: bool) -> u8 {
 
 // ── snapshot create / restore / delete ─────────────────────────────────────
 
+/// `snapshot create` stages past the listing's own (0 to 2): the header
+/// and each record written, then the header again with the count, and
+/// the fence that makes the manifest the command says it wrote.
+const SC_HEAD: u8 = 3;
+const SC_RECORD: u8 = 4;
+const SC_SEEK: u8 = 5;
+const SC_FINAL: u8 = 6;
+const SC_SYNC: u8 = 7;
+/// The manifest's name being fenced.
+const SC_NAME: u8 = 8;
+
 unsafe fn cmd_screate(s: &mut ModuleState, answered: bool) {
     let src: &[u8] = &*(carg(s, 0).unwrap_or(&[]) as *const [u8]);
     let snap: &[u8] = &*(carg(s, 1).unwrap_or(&[]) as *const [u8]);
     let file: &[u8] = &*(carg(s, 2).unwrap_or(&[]) as *const [u8]);
     match s.st {
         0 => {
-            s.fd2 = fs_create(s, file);
-            if s.fd2 < 0 {
-                return fail(s, b"the manifest file cannot be created");
-            }
+            s.fd2 = match fs_create(s, file) {
+                FdPoll::Ready(fd) => fd,
+                FdPoll::Pending => return,
+                FdPoll::Failed => return fail(s, b"the manifest file cannot be created"),
+            };
             let mut h = [0u8; mw::HEADER_MAX];
             let Ok(n) = mw::encode_header(&mut h, src, 0) else {
                 return fail(s, b"the root is longer than a root may be");
             };
-            if !fs_write_all(s, s.fd2, &h[..n]) {
-                return fail(s, b"the manifest file cannot be written");
+            stage(s, &h[..n]);
+            s.st = SC_HEAD;
+            cmd_screate(s, false)
+        }
+        SC_HEAD => {
+            let fd = s.fd2;
+            match fs_drain(s, fd) {
+                Io::Done => {}
+                Io::Pending => return,
+                Io::Failed => return fail(s, b"the manifest file cannot be written"),
             }
             s.count = 0;
             s.after_len = 0;
@@ -2118,13 +2573,24 @@ unsafe fn cmd_screate(s: &mut ModuleState, answered: bool) {
                 let Ok(n) = mw::encode_record(&mut r, &e) else {
                     return fail(s, b"an entry is not one a manifest carries");
                 };
-                if !fs_write_all(s, s.fd2, &r[..n]) {
-                    return fail(s, b"the manifest file cannot be written");
-                }
+                stage(s, &r[..n]);
                 s.count += 1;
+                s.st = SC_RECORD;
+                return cmd_screate(s, false);
             }
             screate_next(s, src, snap)
         }
+        SC_RECORD => {
+            let fd = s.fd2;
+            match fs_drain(s, fd) {
+                Io::Done => {}
+                Io::Pending => return,
+                Io::Failed => return fail(s, b"the manifest file cannot be written"),
+            }
+            s.st = 2;
+            screate_next(s, src, snap)
+        }
+        SC_SEEK | SC_FINAL | SC_SYNC | SC_NAME => screate_finish(s, src, file),
         _ => {}
     }
 }
@@ -2143,16 +2609,52 @@ unsafe fn screate_next(s: &mut ModuleState, src: &[u8], snap: &[u8]) {
         s.st = 1;
         return send_list(s, 0, src, &[]);
     }
-    // Every entry is in: the header again, with the count.
-    let mut h = [0u8; mw::HEADER_MAX];
-    let n = mw::encode_header(&mut h, src, s.count as u32).unwrap_or(0);
+    s.st = SC_SEEK;
+    let file: &[u8] = &*(carg(s, 2).unwrap_or(&[]) as *const [u8]);
+    screate_finish(s, src, file)
+}
+
+/// Every entry is in: the header again, with the count, then the fence.
+/// Each part resumes on a later step while the provider has not
+/// answered.
+unsafe fn screate_finish(s: &mut ModuleState, src: &[u8], file: &[u8]) {
     let fd = s.fd2;
-    let zero = [0u8; 4];
-    let ok = (sys(s).provider_call)(fd, FS_SEEK, zero.as_ptr() as *mut u8, 4) >= 0
-        && fs_write_all(s, fd, &h[..n])
-        && (sys(s).provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0) >= 0;
-    if !ok {
-        return fail(s, b"the manifest file cannot be finished");
+    if s.st == SC_SEEK {
+        let zero = [0u8; 4];
+        let rc = (sys(s).provider_call)(fd, FS_SEEK, zero.as_ptr() as *mut u8, 4);
+        if pending(rc) {
+            return;
+        }
+        if rc < 0 {
+            return fail(s, b"the manifest file cannot be finished");
+        }
+        let mut h = [0u8; mw::HEADER_MAX];
+        let n = mw::encode_header(&mut h, src, s.count as u32).unwrap_or(0);
+        stage(s, &h[..n]);
+        s.st = SC_FINAL;
+    }
+    if s.st == SC_FINAL {
+        match fs_drain(s, fd) {
+            Io::Done => {}
+            Io::Pending => return,
+            Io::Failed => return fail(s, b"the manifest file cannot be finished"),
+        }
+        s.st = SC_SYNC;
+    }
+    if s.st == SC_SYNC {
+        match fs_fsync(s, fd) {
+            Io::Done => {}
+            Io::Pending => return,
+            Io::Failed => return fail(s, b"the manifest file cannot be finished"),
+        }
+        s.st = SC_NAME;
+    }
+    // The manifest is what `snapshot restore` finds by name, so the
+    // name is fenced before the snapshot is reported.
+    match fs_fence_name(s, file) {
+        Io::Done => {}
+        Io::Pending => return,
+        Io::Failed => return fail(s, b"the manifest file's name cannot be made durable"),
     }
     say(s, b"entries ");
     say_u64(s, s.count);
@@ -2160,35 +2662,57 @@ unsafe fn screate_next(s: &mut ModuleState, src: &[u8], snap: &[u8]) {
     finish(s, 0);
 }
 
+/// `snapshot restore` stages.
+const SR_OPEN: u8 = 0;
+/// An entry's binding asked for.
+const SR_BOUND: u8 = 1;
+/// The next record being read.
+const SR_NEXT: u8 = 2;
+
 unsafe fn cmd_srestore(s: &mut ModuleState, answered: bool) {
     let file: &[u8] = &*(carg(s, 0).unwrap_or(&[]) as *const [u8]);
     let dst: &[u8] = &*(carg(s, 1).unwrap_or(&[]) as *const [u8]);
-    if s.st == 0 {
-        if !mf_open(s, file) {
-            return;
-        }
-        s.count = 0;
-        s.st = 1;
-    } else {
-        let plain = s.kind != KIND_VOLUME;
-        if answered || !plain {
-            let st = bind_status(s, plain);
-            if st != aw::STATUS_OK {
-                return fail_status(s, b"restore bind", st);
+    loop {
+        match s.st {
+            SR_OPEN => match mf_open(s, file) {
+                Mf::Got => {
+                    s.count = 0;
+                    s.st = SR_NEXT;
+                }
+                Mf::Wait | Mf::End => return,
+            },
+            SR_BOUND => {
+                let plain = s.kind != KIND_VOLUME;
+                if plain && !answered {
+                    return;
+                }
+                let st = bind_status(s, plain);
+                if st != aw::STATUS_OK {
+                    return fail_status(s, b"restore bind", st);
+                }
+                s.count += 1;
+                s.st = SR_NEXT;
             }
-            s.count += 1;
+            _ => {
+                return match mf_next(s) {
+                    Mf::Got => {
+                        s.st = SR_BOUND;
+                        bind_entry(s, 0, dst)
+                    }
+                    Mf::Wait => {}
+                    Mf::End => {
+                        if s.done != 0 {
+                            return;
+                        }
+                        say(s, b"bound ");
+                        say_u64(s, s.count);
+                        say(s, b"\n");
+                        finish(s, 0);
+                    }
+                };
+            }
         }
     }
-    if mf_next(s) {
-        return bind_entry(s, 0, dst);
-    }
-    if s.done != 0 {
-        return;
-    }
-    say(s, b"bound ");
-    say_u64(s, s.count);
-    say(s, b"\n");
-    finish(s, 0);
 }
 
 unsafe fn cmd_sdelete(s: &mut ModuleState, answered: bool) {
@@ -2532,6 +3056,12 @@ const EX_LEAF: u8 = 4;
 const EX_EXTENT: u8 = 5;
 /// Binding at the destination.
 const EX_BIND: u8 = 6;
+/// Pass one's next record being read from the manifest.
+const EX_NEXT: u8 = 7;
+/// Pass two: the manifest opened again.
+const EX_REOPEN: u8 = 8;
+/// Pass two's next record being read.
+const EX_BIND_NEXT: u8 = 9;
 
 unsafe fn cmd_export(s: &mut ModuleState, answered: bool) {
     let file: &[u8] = &*(carg(s, 0).unwrap_or(&[]) as *const [u8]);
@@ -2541,23 +3071,28 @@ unsafe fn cmd_export(s: &mut ModuleState, answered: bool) {
             return;
         }
         match s.st {
-            EX_OPEN => {
-                if !mf_open(s, file) {
-                    return;
+            EX_OPEN => match mf_open(s, file) {
+                Mf::Got => {
+                    s.sent = 0;
+                    s.count = 0;
+                    s.mf_pass = 1;
+                    s.st = EX_NEXT;
                 }
-                s.sent = 0;
-                s.count = 0;
-                s.mf_pass = 1;
-                if !mf_next(s) {
+                Mf::Wait | Mf::End => return,
+            },
+            EX_NEXT => match mf_next(s) {
+                Mf::Got => {
+                    s.st = EX_ENTRY;
+                    return mv_start_entry(s);
+                }
+                Mf::Wait => return,
+                Mf::End => {
                     if s.done != 0 {
                         return;
                     }
                     s.st = EX_BIND;
-                    continue;
                 }
-                s.st = EX_ENTRY;
-                return mv_start_entry(s);
-            }
+            },
             EX_ENTRY => {
                 // The entry's body is at the destination.
                 if s.kind == KIND_VOLUME {
@@ -2565,14 +3100,7 @@ unsafe fn cmd_export(s: &mut ModuleState, answered: bool) {
                     let d = s.entry_digest;
                     return send_get_body(s, 0, &d);
                 }
-                if !mf_next(s) {
-                    if s.done != 0 {
-                        return;
-                    }
-                    s.st = EX_BIND;
-                    continue;
-                }
-                return mv_start_entry(s);
+                s.st = EX_NEXT;
             }
             EX_ROOT => {
                 if !answered {
@@ -2609,40 +3137,48 @@ unsafe fn cmd_export(s: &mut ModuleState, answered: bool) {
                 return export_extent(s);
             }
             EX_EXTENT => return export_extent(s),
+            EX_REOPEN => match mf_open(s, file) {
+                Mf::Got => s.st = EX_BIND_NEXT,
+                Mf::Wait | Mf::End => return,
+            },
+            EX_BIND_NEXT => {
+                return match mf_next(s) {
+                    Mf::Got => {
+                        s.st = EX_BIND;
+                        bind_entry(s, 1, dst)
+                    }
+                    Mf::Wait => {}
+                    Mf::End => {
+                        if s.done != 0 {
+                            return;
+                        }
+                        say(s, b"sent ");
+                        say_u64(s, s.sent);
+                        say(s, b"\nbound ");
+                        say_u64(s, s.count);
+                        say(s, b"\n");
+                        finish(s, 0)
+                    }
+                };
+            }
             _ => {
                 // Pass two: bind.
                 if s.mf_pass == 1 {
                     s.mf_pass = 2;
-                    if s.fd2 >= 0 {
-                        let fd = s.fd2;
-                        let _ = (sys(s).provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-                        s.fd2 = -1;
-                    }
-                    if !mf_open(s, file) {
-                        return;
-                    }
-                } else {
-                    let plain = s.kind != KIND_VOLUME;
-                    if answered || !plain {
-                        let st = bind_status(s, plain);
-                        if st != aw::STATUS_OK {
-                            return fail_status(s, b"export bind", st);
-                        }
-                        s.count += 1;
-                    }
+                    mf_close(s);
+                    s.st = EX_REOPEN;
+                    continue;
                 }
-                if mf_next(s) {
-                    return bind_entry(s, 1, dst);
-                }
-                if s.done != 0 {
+                let plain = s.kind != KIND_VOLUME;
+                if plain && !answered {
                     return;
                 }
-                say(s, b"sent ");
-                say_u64(s, s.sent);
-                say(s, b"\nbound ");
-                say_u64(s, s.count);
-                say(s, b"\n");
-                return finish(s, 0);
+                let st = bind_status(s, plain);
+                if st != aw::STATUS_OK {
+                    return fail_status(s, b"export bind", st);
+                }
+                s.count += 1;
+                s.st = EX_BIND_NEXT;
             }
         }
     }
@@ -2674,18 +3210,10 @@ unsafe fn export_child(s: &mut ModuleState) {
         s.child_i += 1;
         return mv_start(s, &c);
     }
-    // Every child is across: the next entry.
+    // Every child is across: the next entry, once the manifest yields it.
     s.leaf_len = 0;
-    if !mf_next(s) {
-        if s.done != 0 {
-            return;
-        }
-        s.st = EX_BIND;
-        return cmd_export(s, false);
-    }
-    s.st = EX_ENTRY;
-    let d = s.entry_digest;
-    mv_start(s, &d)
+    s.st = EX_NEXT;
+    cmd_export(s, false)
 }
 
 /// The leaf's next extent moved; then back to the root's children.

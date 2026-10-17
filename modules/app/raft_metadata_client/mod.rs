@@ -144,13 +144,15 @@ pub unsafe extern "C" fn module_new(
                 );
             }
         }
-        // A failed WAL open is reported through the heartbeat and by
-        // refusing proposals, not by refusing to instantiate: a module
-        // that never starts never steps, so its absence is the only
-        // symptom and the cause is invisible. Nothing is logged here —
-        // the network the diagnostic transport rides comes up as part
-        // of this same graph, so an init-time line has nowhere to go.
-        let _ = body::open_wal_from_state(state_ptr);
+        // Only arms the WAL's open and replay: no `fs` call may wait on
+        // the device inside this constructor, so the steps run them. A
+        // failed open is reported through the heartbeat and by refusing
+        // proposals, not by refusing to instantiate: a module that never
+        // starts never steps, so its absence is the only symptom and the
+        // cause is invisible. Nothing is logged here — the network the
+        // diagnostic transport rides comes up as part of this same
+        // graph, so an init-time line has nowhere to go.
+        let _ = body::begin_wal_boot_from_state(state_ptr);
         0
     }
 }
@@ -173,8 +175,10 @@ pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
 /// nothing to do are both simply silent — which is the pair a bring-up
 /// most needs to tell apart, and telling them apart from outside is
 /// otherwise guesswork. Fields: `w` the WAL descriptor (a leading `-`
-/// means it never opened), `p`/`c`/`a` proposals taken in, committed
-/// and refused, `e` decode and append failures, `q` in flight.
+/// means it is not open: `-0000000b`, `EAGAIN`, while the open is still
+/// undecided, otherwise the provider's refusal code), `p`/`c`/`a`
+/// proposals taken in, committed and refused, `e` decode and append
+/// failures, `q` in flight.
 unsafe fn heartbeat(state_ptr: *mut u8) {
     if state_ptr.is_null() {
         return;

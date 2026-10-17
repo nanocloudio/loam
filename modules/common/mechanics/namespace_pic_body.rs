@@ -11,11 +11,19 @@
 //
 //   `module_new_impl`          — channel-only; the arena is the sole
 //                                state. Lost across module re-creation.
-//   `module_new_with_wal_impl` — opens a pre-existing WAL file via the
-//                                fluxor `fs` contract, replays its
-//                                records into the arena, and configures
-//                                the step body to durable-log each
-//                                future op before applying it.
+//   `module_new_with_wal_impl` — arms a boot that opens (creating if
+//                                missing) a WAL file via the fluxor
+//                                `fs` contract, replays its records
+//                                into the arena, and configures the
+//                                step body to durable-log each future
+//                                op before applying it.
+//
+// No `fs` call waits on the device, so `module_new` asks nothing of the
+// provider. The WAL open, its name fence, the snapshot open and the
+// replay run as a BOOT PHASE driven from `module_step`, resumable across
+// as many steps as the device needs; the step consumes no input and
+// answers no request until it is done. A boot that is refused (the WAL
+// cannot be opened, or its name cannot be fenced) fails every step.
 //
 // Order on the apply path is log-then-arena. A WAL append that fsyncs
 // before the in-memory state mutates means a successful arena state
@@ -62,10 +70,10 @@ const REQ_ASM: usize =
     super::wire::REQUEST_RECORD_MAX + READ_BUF * (super::limits::OPS_PER_STEP as usize + 1);
 
 /// Inline WAL-path buffer in `ModuleState`. The TLV parameter
-/// handler populates this; the PIC mod.rs uses it to drive
-/// `open_and_replay_wal` after init. 256 bytes covers any
-/// reasonable filesystem path with headroom.
-pub const WAL_PATH_BUF: usize = 256;
+/// handler populates this; the PIC mod.rs arms the boot from it with
+/// `open_wal_from_state` after init. The register's `WAL_PATH_BUF`, so
+/// the snapshot and rotation names derived from it always fit.
+pub const WAL_PATH_BUF: usize = super::limits::WAL_PATH_BUF;
 
 /// The namespace PIC answers with a 1-byte ack or an encoded lookup /
 /// list / referenced response, all bounded by a read buffer.
@@ -147,6 +155,21 @@ pub struct ModuleState {
     /// set, each successful apply path writes a record + fsyncs before
     /// the arena mutates.
     pub wal_fd: i32,
+    /// Boot phase: `BOOT_READY` once the module may serve, otherwise
+    /// the stage of the WAL open, snapshot open or replay the step is
+    /// driving (see `boot_step`).
+    pub boot: u8,
+    /// Resumable WAL open (create + name fence) for the boot.
+    pub wal_opener: super::wal::WalOpener,
+    /// Resumable open of the best snapshot generation for the boot.
+    pub snap_opener: super::snapshot::SnapBestOpener,
+    /// Resumable WAL replay for the boot. Its buffer is the appender's
+    /// frame, idle until the boot is done.
+    pub replay: super::wal::WalReplay,
+    /// Length of a replayed record the arena could not decide yet (a
+    /// snapshot read it needs is being fetched), or 0. It stays in the
+    /// replay buffer and is applied before any later record.
+    pub replay_hold: u32,
     /// Per-record scratch for the replicated-mode Propose encode.
     /// Sized to hold the 8-byte header plus the largest legal payload
     /// — avoids any runtime allocation under no_std.
@@ -164,6 +187,14 @@ pub struct ModuleState {
     /// Committed-stream staging: whether the record answers a live
     /// local request and therefore owes an ack byte.
     pub wal_stage_live: u8,
+    /// The staged record is durable but its apply could not be decided
+    /// yet: a snapshot read it needs is being fetched. The appender is
+    /// idle and still holds the payload; the step re-applies it, and
+    /// takes no other work, until it decides.
+    pub stage_durable: u8,
+    /// Proof of the committed record staged, retained like `last_proof`
+    /// once that record applies.
+    pub stage_proof: super::decision::CommitProof,
     /// Object ids a lifecycle sweep has reserved for deletion, by
     /// hash. A BIND naming a reserved id is refused with
     /// `NAK_RESERVED` so the sweep's absence proof holds up to the
@@ -200,11 +231,20 @@ pub struct ModuleState {
     pub snap_gen: u64,
     /// Incremental compactor: merges (old snapshot × arena) into
     /// the other generation slot, bounded records per step.
+    /// `cmp_running` is set from the trigger until the WAL rotation
+    /// that ends a compaction resolves; `cmp_phase` is where it is.
     pub cmp_running: u8,
+    pub cmp_phase: u8,
     pub cmp_target_slot: u8,
-    pub cmp_writer_fd: i32,
-    pub cmp_writer_count: u32,
-    pub cmp_writer_gen: u64,
+    /// The generation being written. Owns the record bytes the
+    /// provider has not taken yet.
+    pub cmp_writer: super::snapshot::SnapWriter,
+    /// Re-open of the generation just written, before it is switched to.
+    pub cmp_reopen: super::snapshot::SnapOpener,
+    /// The WAL rotation that ends a compaction. While it is busy no
+    /// record is appended to the live log — the rename discards it —
+    /// so intake of mutating records and the committed drain wait.
+    pub rotator: super::wal::WalRotator,
     pub cmp_snap_idx: u32,
     pub cmp_last_key_valid: u8,
     /// The key the merge last emitted from the arena: root, then path.
@@ -270,6 +310,29 @@ pub const GC_RESERVE_MAX: usize = 4;
 /// "retry this" from "this was wrong".
 pub const NAK_RESERVED: u8 = 0xFD;
 
+/// Boot phases. `BOOT_READY` is also a channel-only module's state.
+pub const BOOT_READY: u8 = 0;
+pub const BOOT_WAL: u8 = 1;
+pub const BOOT_SNAP: u8 = 2;
+pub const BOOT_REPLAY: u8 = 3;
+pub const BOOT_FAILED: u8 = 4;
+
+/// What every step answers after a refused boot: the WAL is missing or
+/// refuses to open, or its name cannot be made durable.
+pub const BOOT_REFUSED: i32 = -3;
+
+/// Replayed records handed to the arena per boot step. Bounded so a long
+/// log boots across steps rather than holding one past its deadline.
+const REPLAY_PER_STEP: u32 = 512;
+
+/// Compaction phases.
+const CMP_IDLE: u8 = 0;
+const CMP_OPEN: u8 = 1;
+const CMP_MERGE: u8 = 2;
+const CMP_FINISH: u8 = 3;
+const CMP_REOPEN: u8 = 4;
+const CMP_ROTATE: u8 = 5;
+
 pub const WAL_STAGE_NONE: u8 = 0;
 pub const WAL_STAGE_REQUEST: u8 = 1;
 pub const WAL_STAGE_COMMITTED: u8 = 2;
@@ -295,16 +358,20 @@ pub unsafe fn module_new_impl(
     init_state(in_chan, out_chan, state_ptr, state_size, syscalls)
 }
 
-/// Open + replay a WAL at `wal_path`, then initialize the module so
-/// future apply calls durable-log before mutating the arena.
+/// Initialize the module and arm a boot that opens (creating if
+/// missing) the WAL at `wal_path` and replays it, so future apply calls
+/// durable-log before mutating the arena.
+///
+/// Nothing is asked of the provider here: the open, its name fence, the
+/// snapshot open and the replay run from `module_step_impl` (see
+/// `boot_step`), which answers `BOOT_REFUSED` on every step once the
+/// WAL refuses to open or its name cannot be fenced.
 ///
 /// Returns:
-///   `0` on success (WAL opened + replayed; torn tails OK).
+///   `0` with the boot armed.
 ///   `-1` for null state/syscalls.
 ///   `-2` for an undersized state buffer.
-///   `-3` if the WAL file is missing or otherwise refuses to open
-///        (fluxor's `fs` provider does NOT auto-create — see
-///        `modules/common/mechanics/wal_io.rs:wal_open`).
+///   `-3` if `wal_path` is empty or does not fit `WAL_PATH_BUF`.
 ///
 /// SAFETY: same constraints as `module_new_impl`, plus `wal_path`
 /// must be a valid byte slice for the duration of this call.
@@ -320,95 +387,243 @@ pub unsafe fn module_new_with_wal_impl(
     if rc != 0 {
         return rc;
     }
-    open_and_replay_wal(state_ptr, wal_path)
+    arm_wal_boot(state_ptr, wal_path)
 }
 
-/// Open + replay a WAL against an already-initialized `ModuleState`.
+/// Arm the WAL boot against an already-initialized `ModuleState`.
 /// Used by the TLV path (init_state → parse_tlv populates state's
-/// inline path → open_and_replay) AND by the raw-bytes path
-/// (`module_new_with_wal_impl`).
+/// inline path → arm) AND by the raw-bytes path
+/// (`module_new_with_wal_impl`). The path is kept in state: the boot
+/// re-asks the provider with it on every step, and the snapshot
+/// compactor derives its generation filenames from it.
 ///
 /// SAFETY: `state_ptr` must reference a `ModuleState` already
 /// initialized via `init_state` or equivalent.
-pub unsafe fn open_and_replay_wal(state_ptr: *mut u8, wal_path: &[u8]) -> i32 {
+pub unsafe fn arm_wal_boot(state_ptr: *mut u8, wal_path: &[u8]) -> i32 {
     if state_ptr.is_null() {
         return -1;
     }
     let s = &mut *(state_ptr as *mut ModuleState);
-    let sys = match s.syscalls.as_ref() {
-        Some(t) => t,
-        None => return -1,
-    };
-    // Create-on-missing so first-boot doesn't require an
-    // external pre-touch step. Existing files open cleanly with
-    // the same opcode.
-    let fd = match super::wal::wal_open_or_create(sys, wal_path) {
-        Ok(fd) => fd,
-        Err(_) => return -3,
-    };
-    s.wal_fd = fd;
-    // The appender's tail knowledge belongs to the previous fd.
-    s.appender.reset();
-    s.wal_stage = WAL_STAGE_NONE;
-    s.wal_stage_live = 0;
-    // Stash the path: the snapshot compactor derives its
-    // generation filenames from it. The TLV boot path passes
-    // `&s.wal_path` itself — skip the (overlapping) self-copy.
-    if wal_path.len() <= WAL_PATH_BUF && wal_path.as_ptr() != s.wal_path.as_ptr() {
-        s.wal_path[..wal_path.len()].copy_from_slice(wal_path);
-        s.wal_path_len = wal_path.len() as u16;
-    } else if wal_path.as_ptr() == s.wal_path.as_ptr() {
-        s.wal_path_len = wal_path.len() as u16;
+    if s.syscalls.is_null() {
+        return -1;
     }
-
-    // Open the best (highest valid generation) snapshot BEFORE
-    // replay: the WAL tail is revision-gated, so replaying over
-    // any snapshot generation converges.
+    if wal_path.is_empty() || wal_path.len() > WAL_PATH_BUF {
+        return BOOT_REFUSED;
+    }
+    // The TLV boot path passes `&s.wal_path` itself — skip the
+    // (overlapping) self-copy.
+    if wal_path.as_ptr() != s.wal_path.as_ptr() {
+        for (d, b) in s.wal_path.iter_mut().zip(wal_path.iter()) {
+            *d = *b;
+        }
+    }
+    s.wal_path_len = wal_path.len() as u16;
+    s.wal_fd = -1;
     s.snap_fd = -1;
-    // `minimal` carries no snapshot tier: the arena is the whole set
-    // there and the WAL is its durable record. Guarding at the one
-    // activation point keeps every downstream `snap_active != 0`
-    // check correct without a second condition, and lets the
-    // optimiser drop the compactor with it.
-    if super::limits::SNAPSHOT_TIER {
-        if let Some((snap, slot)) = super::snapshot::snap_open_best(sys, wal_path) {
-            s.snap_active = 1;
-            s.snap_slot = slot;
-            s.snap_fd = snap.fd;
-            s.snap_count = snap.count;
-            s.snap_gen = snap.generation;
-        }
-    }
-
-    let mut scratch = [0u8; super::wal::MAX_WAL_REC];
-    let sptr = state_ptr as *mut ModuleState;
-    let mut replay_errors: u32 = 0;
-    let replay_rc = super::wal::wal_replay(sys, fd, &mut scratch, |payload| {
-        // A deletion reservation belongs to a sweep in THIS process, and
-        // a restart has ended it. Reinstating one the sweep never got to
-        // release would refuse every volume flush from then on.
-        // What a reservation decided about expired flushes is part of
-        // the log's history, though, and replays.
-        let op = super::wire::peek_opcode(payload);
-        if op == Some(super::wire::OP_GC_RESERVE) {
-            if let Ok((_, now)) = super::wire::decode_gc_reserve_req(payload) {
-                let _ = (*sptr).leases.end_expired_flushes(now);
-            }
-            return true;
-        }
-        if op == Some(super::wire::OP_GC_RELEASE) {
-            return true;
-        }
-        if apply_op(&mut *sptr, sys, payload).is_err() {
-            replay_errors = replay_errors.wrapping_add(1);
-        }
-        true
-    });
-    if let Ok(applied) = replay_rc {
-        s.ops_applied = applied;
-        s.apply_errors = replay_errors;
-    }
+    s.snap_active = 0;
+    s.wal_opener = super::wal::WalOpener::new();
+    s.snap_opener = super::snapshot::SnapBestOpener::new();
+    s.replay.reset();
+    s.replay_hold = 0;
+    s.boot = BOOT_WAL;
     0
+}
+
+/// True once the boot is done and the module serves. A channel-only
+/// module is born booted.
+///
+/// SAFETY: `state_ptr` must reference an initialized `ModuleState`.
+pub unsafe fn booted(state_ptr: *const u8) -> bool {
+    if state_ptr.is_null() {
+        return false;
+    }
+    (*(state_ptr as *const ModuleState)).boot == BOOT_READY
+}
+
+/// Drive the boot one step further: `Ok(true)` once the module may
+/// serve, `Ok(false)` while the provider has not decided something the
+/// boot needs (the step does nothing else meanwhile), `Err` when the
+/// boot is refused — on this step and every later one.
+///
+/// The order is the one the one-shot open had: WAL open-or-create with
+/// its name fence, then the best snapshot generation, then the replay
+/// over it. The snapshot is opened BEFORE the replay because the WAL
+/// tail is revision-gated against it, so replaying over any snapshot
+/// generation converges.
+unsafe fn boot_step(s: &mut ModuleState, syscalls: &super::SyscallTable) -> Result<bool, i32> {
+    loop {
+        let len = (s.wal_path_len as usize).min(WAL_PATH_BUF);
+        let path: &[u8] = &*(s.wal_path.get(..len).unwrap_or(&[]) as *const [u8]);
+        match s.boot {
+            BOOT_READY => return Ok(true),
+            BOOT_WAL => {
+                // Create-on-missing so first boot doesn't require an
+                // external pre-touch step. The name fence that follows
+                // creation is part of the open: a WAL whose name a power
+                // cut could erase carries no durability claim, so a
+                // provider that cannot fence it refuses the boot.
+                match s.wal_opener.poll(syscalls, path, true) {
+                    super::wal::OpenPoll::Pending => return Ok(false),
+                    super::wal::OpenPoll::Ready(fd) => {
+                        s.wal_fd = fd;
+                        // The appender's tail knowledge belongs to the
+                        // previous fd.
+                        s.appender.reset();
+                        s.wal_stage = WAL_STAGE_NONE;
+                        s.wal_stage_live = 0;
+                        s.stage_durable = 0;
+                        s.replay.reset();
+                        s.replay_hold = 0;
+                        // `minimal` carries no snapshot tier: the arena
+                        // is the whole set there and the WAL is its
+                        // durable record. Guarding at the one activation
+                        // point keeps every downstream `snap_active != 0`
+                        // check correct without a second condition, and
+                        // lets the optimiser drop the compactor with it.
+                        s.boot = if super::limits::SNAPSHOT_TIER {
+                            BOOT_SNAP
+                        } else {
+                            BOOT_REPLAY
+                        };
+                    }
+                    super::wal::OpenPoll::Failed(_) => {
+                        s.boot = BOOT_FAILED;
+                        return Err(BOOT_REFUSED);
+                    }
+                }
+            }
+            BOOT_SNAP => match s.snap_opener.poll(syscalls, path) {
+                super::snapshot::BestPoll::Pending => return Ok(false),
+                super::snapshot::BestPoll::Done(best) => {
+                    if let Some((snap, slot)) = best {
+                        s.snap_active = 1;
+                        s.snap_slot = slot;
+                        s.snap_fd = snap.fd;
+                        s.snap_count = snap.count;
+                        s.snap_gen = snap.generation;
+                    }
+                    s.boot = BOOT_REPLAY;
+                }
+            },
+            BOOT_REPLAY => {
+                if !replay_slice(s, syscalls) {
+                    return Ok(false);
+                }
+                s.boot = BOOT_READY;
+            }
+            _ => return Err(BOOT_REFUSED),
+        }
+    }
+}
+
+/// Replay up to `REPLAY_PER_STEP` WAL records into the arena. True once
+/// the log is replayed.
+///
+/// Records are taken one per `WalReplay::poll` so that a record whose
+/// apply cannot be decided yet — a snapshot read it needs is being
+/// fetched — stops the replay with that record still in the buffer
+/// (`replay_hold`), and is applied before anything after it. A poll that
+/// hands over no record and is not done is the provider fetching: the
+/// replay resumes on a later step where it stopped.
+///
+/// A replay that fails to read part-way keeps what it applied, as the
+/// one-shot replay did: the log up to there is the arena's state.
+unsafe fn replay_slice(s: &mut ModuleState, syscalls: &super::SyscallTable) -> bool {
+    let sptr = s as *mut ModuleState;
+    // The appender is idle for the whole boot, so its frame outlives
+    // every step of the replay, as `WalReplay` needs.
+    let scratch: &mut [u8] = &mut *((*sptr).appender.idle_buffer() as *mut [u8]);
+    if scratch.is_empty() {
+        // Not reachable: nothing stages an append during the boot.
+        return false;
+    }
+    let fd = s.wal_fd;
+    let mut handed = 0u32;
+    while handed < REPLAY_PER_STEP {
+        if s.replay_hold != 0 {
+            let n = s.replay_hold as usize;
+            let Some(payload) = scratch.get(..n) else {
+                s.replay_hold = 0;
+                continue;
+            };
+            if !replay_apply(&mut *sptr, syscalls, payload) {
+                return false;
+            }
+            s.replay_hold = 0;
+            handed = handed.wrapping_add(1);
+            continue;
+        }
+        let mut took = false;
+        let mut held = 0usize;
+        let rc = (*sptr)
+            .replay
+            .poll(syscalls, fd, &mut *scratch, 1, |payload| {
+                took = true;
+                if !replay_apply(&mut *sptr, syscalls, payload) {
+                    held = payload.len();
+                }
+                true
+            });
+        if held != 0 {
+            s.replay_hold = held as u32;
+        }
+        match rc {
+            super::wal::ReplayPoll::Pending => {
+                if !took {
+                    return false;
+                }
+            }
+            super::wal::ReplayPoll::Done(applied) => {
+                s.ops_applied = applied;
+                // A record held on the last poll still has to land.
+                if s.replay_hold != 0 {
+                    continue;
+                }
+                return true;
+            }
+            super::wal::ReplayPoll::Failed(_) => {
+                if s.replay_hold != 0 {
+                    continue;
+                }
+                return true;
+            }
+        }
+        handed = handed.wrapping_add(1);
+    }
+    false
+}
+
+/// Apply one replayed record. False when its apply cannot be decided
+/// yet (a snapshot read is being fetched): nothing changed, and the
+/// caller offers the same record again later.
+unsafe fn replay_apply(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    payload: &[u8],
+) -> bool {
+    // A deletion reservation belongs to a sweep in THIS process, and
+    // a restart has ended it. Reinstating one the sweep never got to
+    // release would refuse every volume flush from then on.
+    // What a reservation decided about expired flushes is part of
+    // the log's history, though, and replays.
+    let op = super::wire::peek_opcode(payload);
+    if op == Some(super::wire::OP_GC_RESERVE) {
+        if let Ok((_, now)) = super::wire::decode_gc_reserve_req(payload) {
+            let _ = s.leases.end_expired_flushes(now);
+        }
+        return true;
+    }
+    if op == Some(super::wire::OP_GC_RELEASE) {
+        return true;
+    }
+    match apply_op(s, syscalls, payload) {
+        Err(ApplyFault::Pending) => false,
+        Err(_) => {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            true
+        }
+        Ok(_) => true,
+    }
 }
 
 /// Populate `state.wal_path[..wal_path_len]` from the kernel-supplied
@@ -442,10 +657,10 @@ pub unsafe fn decode_wal_path_params(
     }
 }
 
-/// Open a WAL using the path the TLV param handler stored in
+/// Arm the WAL boot using the path the TLV param handler stored in
 /// `state.wal_path[..wal_path_len]`. Returns 0 when `wal_path_len
-/// == 0` (channel-only mode), otherwise delegates to
-/// `open_and_replay_wal`.
+/// == 0` (channel-only mode), otherwise delegates to `arm_wal_boot`;
+/// the open itself happens on the steps that follow.
 ///
 /// SAFETY: `state_ptr` must reference an initialized `ModuleState`.
 pub unsafe fn open_wal_from_state(state_ptr: *mut u8) -> i32 {
@@ -459,7 +674,7 @@ pub unsafe fn open_wal_from_state(state_ptr: *mut u8) -> i32 {
     }
     let path_ptr = s.wal_path.as_ptr();
     let path = core::slice::from_raw_parts(path_ptr, len);
-    open_and_replay_wal(state_ptr, path)
+    arm_wal_boot(state_ptr, path)
 }
 
 unsafe fn init_state(
@@ -492,6 +707,7 @@ unsafe fn init_state(
         witness: [0u8; 32],
     };
     s.has_proof = 0;
+    s.stage_proof = s.last_proof;
     s.req_asm_len = 0;
     s.req_resyncing = 0;
     for slot in s.ns_open.iter_mut() {
@@ -512,11 +728,49 @@ unsafe fn init_state(
     s.wal_fd = -1;
     s.wal_stage = WAL_STAGE_NONE;
     s.wal_stage_live = 0;
+    s.stage_durable = 0;
     core::ptr::write_bytes(
         core::ptr::addr_of_mut!(s.appender) as *mut u8,
         0,
         core::mem::size_of::<super::wal::WalAppender>(),
     );
+    // A channel-only module is born booted; `arm_wal_boot` re-arms it.
+    // The step machines below are all valid zeroed, and zeroed in place
+    // for the same reason as the arena: some of them carry buffers.
+    s.boot = BOOT_READY;
+    s.replay_hold = 0;
+    core::ptr::write_bytes(
+        core::ptr::addr_of_mut!(s.wal_opener) as *mut u8,
+        0,
+        core::mem::size_of::<super::wal::WalOpener>(),
+    );
+    core::ptr::write_bytes(
+        core::ptr::addr_of_mut!(s.snap_opener) as *mut u8,
+        0,
+        core::mem::size_of::<super::snapshot::SnapBestOpener>(),
+    );
+    core::ptr::write_bytes(
+        core::ptr::addr_of_mut!(s.replay) as *mut u8,
+        0,
+        core::mem::size_of::<super::wal::WalReplay>(),
+    );
+    core::ptr::write_bytes(
+        core::ptr::addr_of_mut!(s.cmp_writer) as *mut u8,
+        0,
+        core::mem::size_of::<super::snapshot::SnapWriter>(),
+    );
+    core::ptr::write_bytes(
+        core::ptr::addr_of_mut!(s.cmp_reopen) as *mut u8,
+        0,
+        core::mem::size_of::<super::snapshot::SnapOpener>(),
+    );
+    core::ptr::write_bytes(
+        core::ptr::addr_of_mut!(s.rotator) as *mut u8,
+        0,
+        core::mem::size_of::<super::wal::WalRotator>(),
+    );
+    s.cmp_running = 0;
+    s.cmp_phase = CMP_IDLE;
     s.gc_reserved = [0u64; GC_RESERVE_MAX];
     // All-zero is the empty table; in place for the same reason as
     // the binding arena.
@@ -528,7 +782,6 @@ unsafe fn init_state(
     s.lease_resp = [0u8; super::wire::LEASE_RESP_LEN];
     s.volume_resp = [0u8; super::wire::VOLUME_RESP_LEN];
     s.snap_fd = -1;
-    s.cmp_writer_fd = -1;
     s.wal_path_len = 0;
     for sub in s.subs.iter_mut() {
         sub.in_use = 0;
@@ -557,6 +810,16 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         None => return -1,
     };
 
+    // Nothing is taken off any stream until the boot is done: the arena
+    // is not yet the log's state, so an answer now would be a guess.
+    if s.boot != BOOT_READY {
+        match boot_step(s, syscalls) {
+            Ok(true) => {}
+            Ok(false) => return 0,
+            Err(rc) => return rc,
+        }
+    }
+
     // An owed answer owns the step until the channel takes it. The
     // record it answers has already left its stream and changed the
     // arena, so letting new work overtake it would leave a requester
@@ -567,17 +830,33 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
 
     // A staged append owns the step until it resolves: the record it
     // describes has left its stream and no other work may overtake
-    // it, reuse the frame buffer, or acknowledge ahead of it.
+    // it, reuse the frame buffer, or acknowledge ahead of it. That
+    // includes a durable record whose apply is waiting on a snapshot
+    // read (`stage_durable`): the appender is idle then, and only the
+    // apply is re-asked.
     if s.wal_stage != WAL_STAGE_NONE {
-        match s.appender.poll(syscalls, s.wal_fd) {
-            super::wal::AppendState::Pending => return 0,
-            super::wal::AppendState::Durable => resolve_staged(s, syscalls, true),
-            _ => resolve_staged(s, syscalls, false),
+        let durable = if s.stage_durable != 0 {
+            true
+        } else {
+            match s.appender.poll(syscalls, s.wal_fd) {
+                super::wal::AppendState::Pending => return 0,
+                super::wal::AppendState::Durable => true,
+                _ => false,
+            }
+        };
+        if !resolve_staged(s, syscalls, durable) {
+            return 0;
         }
     }
 
     // Incremental snapshot compaction: bounded records/step.
     compaction_step(s, syscalls);
+    // A WAL rotation in flight owns the log: nothing may be appended to
+    // the live file, which the rename is about to discard, and the lease
+    // table the new log is being seeded from must hold still. Every
+    // mutating record is logged before it applies, so holding back the
+    // ones not yet logged is what keeps both true.
+    let rotating = s.rotator.busy();
 
     // `requests` is a byte stream. Refill a reassembly buffer, then
     // take whole records off the front of it — up to the step budget,
@@ -684,14 +963,28 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                 handled = handled.wrapping_add(1);
                 continue;
             }
-            match op {
+            let answered = match op {
                 super::wire::OP_LOOKUP => handle_lookup(s, syscalls, bytes),
                 super::wire::OP_LIST => handle_list(s, syscalls, bytes),
                 super::wire::OP_VOLUME_ROOTS => handle_volume_roots(s, syscalls, bytes),
                 _ => handle_referenced(s, syscalls, bytes),
+            };
+            if !answered {
+                // A snapshot read it needs is being fetched. The request
+                // stays at the head of the stream, unanswered, and is
+                // asked again next step; nothing behind it overtakes it.
+                req_off -= rec_len;
+                break;
             }
             handled = handled.wrapping_add(1);
             continue;
+        }
+
+        // Not logged yet, so it waits for the rotation, at the head of
+        // the stream.
+        if rotating {
+            req_off -= rec_len;
+            break;
         }
 
         // Replicated mode: mutating ops are proposed to the metadata
@@ -759,6 +1052,20 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         // AlreadyBound) replays the same way, so net state stays
         // consistent whichever side of a restart it lands on.
         let result = apply_op(s, syscalls, bytes);
+        if result == Err(ApplyFault::Pending) {
+            if s.wal_fd >= 0 {
+                // Durable, but a snapshot read the decision needs is
+                // being fetched. The appender still holds the record; it
+                // stays staged and is applied on a later step.
+                s.wal_stage = WAL_STAGE_REQUEST;
+                s.stage_durable = 1;
+            } else {
+                // Nothing was logged: the request goes back to the head
+                // of the stream and is asked again.
+                req_off -= rec_len;
+            }
+            break;
+        }
         if result.is_ok() {
             s.ops_applied = s.ops_applied.wrapping_add(1);
         } else {
@@ -779,7 +1086,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         s.req_asm_len = remaining;
     }
 
-    if s.replicated != 0 {
+    if s.replicated != 0 && !rotating && s.wal_stage == WAL_STAGE_NONE {
         drain_committed(s, syscalls);
     }
     0
@@ -905,6 +1212,7 @@ unsafe fn drain_committed(s: &mut ModuleState, syscalls: &super::SyscallTable) {
                 super::wal::AppendState::Pending => {
                     s.wal_stage = WAL_STAGE_COMMITTED;
                     s.wal_stage_live = u8::from(live);
+                    s.stage_proof = proof;
                     off += rec_len;
                     break;
                 }
@@ -920,6 +1228,21 @@ unsafe fn drain_committed(s: &mut ModuleState, syscalls: &super::SyscallTable) {
             }
         }
         let result = apply_op(s, syscalls, inner);
+        if result == Err(ApplyFault::Pending) {
+            if s.wal_fd >= 0 {
+                // Logged, not yet decided: a snapshot read the apply
+                // needs is being fetched. Staged like an append still in
+                // flight, so it owns the following steps until it lands.
+                s.wal_stage = WAL_STAGE_COMMITTED;
+                s.wal_stage_live = u8::from(live);
+                s.stage_durable = 1;
+                s.stage_proof = proof;
+                off += rec_len;
+            }
+            // Without a log, the record stays in the reassembly buffer
+            // and is offered again on the next drain.
+            break;
+        }
         match result {
             Ok(_) => {
                 s.ops_applied = s.ops_applied.wrapping_add(1);
@@ -957,24 +1280,25 @@ const STAGED_REC: usize = super::wal::MAX_WAL_REC;
 /// licenses the arena mutation and the success ack; without it the
 /// record is refused, because a refusal the requester can see is the
 /// only honest answer to a durability failure.
-unsafe fn resolve_staged(s: &mut ModuleState, syscalls: &super::SyscallTable, durable: bool) {
-    let stage = core::mem::replace(&mut s.wal_stage, WAL_STAGE_NONE);
+///
+/// Returns false, leaving the record staged with `stage_durable` set,
+/// when it is durable but its apply cannot be decided yet: a snapshot
+/// read it needs is being fetched. Nothing has changed then, and the
+/// step asks again later.
+unsafe fn resolve_staged(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    durable: bool,
+) -> bool {
+    let stage = s.wal_stage;
     let live = s.wal_stage_live != 0;
-    s.wal_stage_live = 0;
     let owes_ack = stage == WAL_STAGE_REQUEST || live;
-    if !durable {
-        s.apply_errors = s.apply_errors.wrapping_add(1);
-        if stage == WAL_STAGE_COMMITTED && live {
-            s.outstanding = s.outstanding.saturating_sub(1);
-        }
-        if owes_ack {
-            respond(s, syscalls, 0xFF);
-        }
-        return;
-    }
     let mut payload = [0u8; STAGED_REC];
     let n = s.appender.payload().len();
-    if n == 0 || n > payload.len() {
+    if !durable || n == 0 || n > payload.len() {
+        s.wal_stage = WAL_STAGE_NONE;
+        s.wal_stage_live = 0;
+        s.stage_durable = 0;
         s.apply_errors = s.apply_errors.wrapping_add(1);
         if stage == WAL_STAGE_COMMITTED && live {
             s.outstanding = s.outstanding.saturating_sub(1);
@@ -982,34 +1306,62 @@ unsafe fn resolve_staged(s: &mut ModuleState, syscalls: &super::SyscallTable, du
         if owes_ack {
             respond(s, syscalls, 0xFF);
         }
-        return;
+        return true;
     }
-    payload[..n].copy_from_slice(s.appender.payload());
-    let result = apply_op(s, syscalls, &payload[..n]);
+    for (d, b) in payload.iter_mut().zip(s.appender.payload().iter()) {
+        *d = *b;
+    }
+    let Some(record) = payload.get(..n) else {
+        // Not reachable: `n` was bounded above.
+        s.wal_stage = WAL_STAGE_NONE;
+        s.wal_stage_live = 0;
+        s.stage_durable = 0;
+        return true;
+    };
+    let result = apply_op(s, syscalls, record);
+    if result == Err(ApplyFault::Pending) {
+        s.stage_durable = 1;
+        return false;
+    }
+    s.wal_stage = WAL_STAGE_NONE;
+    s.wal_stage_live = 0;
+    s.stage_durable = 0;
     if stage == WAL_STAGE_COMMITTED && live {
         s.outstanding = s.outstanding.saturating_sub(1);
     }
     if result.is_ok() {
         s.ops_applied = s.ops_applied.wrapping_add(1);
+        // The fence this PIC reports is as strong as the last commit it
+        // applied, whichever step that apply landed on.
+        if stage == WAL_STAGE_COMMITTED {
+            s.last_proof = s.stage_proof;
+            s.has_proof = 1;
+        }
     } else {
         s.apply_errors = s.apply_errors.wrapping_add(1);
     }
     if owes_ack {
-        respond_applied(s, syscalls, &payload[..n], result);
+        respond_applied(s, syscalls, record, result);
     }
+    true
 }
 
 /// Serve a LOOKUP request: look up the binding in the arena,
 /// build a Found/NotFound response, write it to out_chan. No
 /// arena mutation, no WAL write — reads are idempotent and
 /// channel-only.
-unsafe fn handle_lookup(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) {
+///
+/// Every `handle_*` read answers whether it answered: `false` means a
+/// snapshot read it needs is being fetched, nothing was sent, and the
+/// caller keeps the request to ask again on a later step. A pending
+/// read is never answered as not-found.
+unsafe fn handle_lookup(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) -> bool {
     let req = match super::wire::decode_lookup_req(bytes) {
         Ok(r) => r,
         Err(_) => {
             s.apply_errors = s.apply_errors.wrapping_add(1);
             respond(s, syscalls, 0xFF);
-            return;
+            return true;
         }
     };
     let n = match current(s, syscalls, req.namespace_root, req.path) {
@@ -1049,10 +1401,12 @@ unsafe fn handle_lookup(s: &mut ModuleState, syscalls: &super::SyscallTable, byt
         Some(Current::Unreadable) => {
             s.apply_errors = s.apply_errors.wrapping_add(1);
             respond(s, syscalls, 0xFF);
-            return;
+            return true;
         }
+        Some(Current::Pending) => return false,
     };
     send_list_scratch(s, syscalls, n);
+    true
 }
 
 /// Answer with the record built in `list_scratch`, or a refusal when it
@@ -1095,6 +1449,9 @@ enum Current {
     Snapshot(super::snapshot::SnapRecord),
     /// The snapshot could not be read, so nothing can be said.
     Unreadable,
+    /// The snapshot read is being fetched: ask again on a later step.
+    /// Not an absence.
+    Pending,
 }
 
 /// The current state of `(root, path)`: the arena's entry, else the
@@ -1118,7 +1475,11 @@ unsafe fn current(
         count: s.snap_count,
         generation: s.snap_gen,
     };
-    super::snapshot::snap_search(syscalls, &snap, root, path).map(Current::Snapshot)
+    match super::snapshot::snap_search(syscalls, &snap, root, path) {
+        super::snapshot::SnapRead::Ready(found) => found.map(Current::Snapshot),
+        super::snapshot::SnapRead::Pending => Some(Current::Pending),
+        super::snapshot::SnapRead::Failed => Some(Current::Unreadable),
+    }
 }
 
 /// One entry of a name-ordered walk: its path and binding.
@@ -1131,9 +1492,11 @@ struct Listed<'a> {
 /// and sorts after `after`, in name order, merging the arena (which
 /// wins for any key it holds, a tombstone hiding it) with the snapshot.
 /// `take` answers whether it took an entry; a `false` stops the walk
-/// without consuming it. Returns whether entries remain, or `None` when
+/// without consuming it. Returns whether entries remain; `Failed` when
 /// the snapshot could not be read — a listing that skipped part of it
-/// would be wrong rather than short.
+/// would be wrong rather than short — and `Pending` when a read it needs
+/// is being fetched, in which case whatever `take` was handed is to be
+/// discarded and the walk asked again later.
 unsafe fn walk_ordered(
     s: &ModuleState,
     syscalls: &super::SyscallTable,
@@ -1141,7 +1504,8 @@ unsafe fn walk_ordered(
     prefix: &[u8],
     after: &[u8],
     mut take: impl FnMut(&Listed<'_>) -> bool,
-) -> Option<bool> {
+) -> super::snapshot::SnapRead<bool> {
+    use super::snapshot::SnapRead;
     let snap = super::snapshot::OpenSnapshot {
         fd: s.snap_fd,
         count: s.snap_count,
@@ -1152,7 +1516,11 @@ unsafe fn walk_ordered(
     let mut cur_len = after.len();
     cur_path[..cur_len].copy_from_slice(after);
     let mut idx = if snap_on {
-        super::snapshot::snap_seek_after(syscalls, &snap, root, after)?
+        match super::snapshot::snap_seek_after(syscalls, &snap, root, after) {
+            SnapRead::Ready(i) => i,
+            SnapRead::Pending => return SnapRead::Pending,
+            SnapRead::Failed => return SnapRead::Failed,
+        }
     } else {
         0
     };
@@ -1162,7 +1530,11 @@ unsafe fn walk_ordered(
         // The snapshot's next record in range, if any.
         let mut b: Option<super::snapshot::SnapRecord> = None;
         while snap_on && idx < snap.count {
-            let rec = super::snapshot::snap_read_at(syscalls, &snap, idx)?;
+            let rec = match super::snapshot::snap_read_at(syscalls, &snap, idx) {
+                SnapRead::Ready(r) => r,
+                SnapRead::Pending => return SnapRead::Pending,
+                SnapRead::Failed => return SnapRead::Failed,
+            };
             if super::hash::bytes_cmp(rec.root(), root) != core::cmp::Ordering::Equal {
                 break;
             }
@@ -1179,11 +1551,16 @@ unsafe fn walk_ordered(
             break;
         }
         let (from_arena, path_len) = match (a, &b) {
-            (None, None) => return Some(false),
-            (Some(i), None) => (Some(i), s.bindings.slot_ref(i)?.path_len as usize),
+            (None, None) => return SnapRead::Ready(false),
+            (Some(i), None) => match s.bindings.slot_ref(i) {
+                Some(slot) => (Some(i), slot.path_len as usize),
+                None => return SnapRead::Failed,
+            },
             (None, Some(rec)) => (None, rec.path_len as usize),
             (Some(i), Some(rec)) => {
-                let slot = s.bindings.slot_ref(i)?;
+                let Some(slot) = s.bindings.slot_ref(i) else {
+                    return SnapRead::Failed;
+                };
                 match super::hash::bytes_cmp(slot.path(), rec.path()) {
                     core::cmp::Ordering::Greater => (None, rec.path_len as usize),
                     order => {
@@ -1198,7 +1575,9 @@ unsafe fn walk_ordered(
         };
         let took = match from_arena {
             Some(i) => {
-                let slot = s.bindings.slot_ref(i)?;
+                let Some(slot) = s.bindings.slot_ref(i) else {
+                    return SnapRead::Failed;
+                };
                 cur_path[..path_len].copy_from_slice(slot.path());
                 if slot.kind == super::state::KIND_TOMBSTONE {
                     true
@@ -1215,7 +1594,9 @@ unsafe fn walk_ordered(
                 }
             }
             None => {
-                let rec = b?;
+                let Some(rec) = b else {
+                    return SnapRead::Failed;
+                };
                 idx += 1;
                 cur_path[..path_len].copy_from_slice(rec.path());
                 if rec.kind == super::state::KIND_TOMBSTONE {
@@ -1238,7 +1619,7 @@ unsafe fn walk_ordered(
             }
         };
         if !took {
-            return Some(true);
+            return SnapRead::Ready(true);
         }
         cur_len = path_len;
     }
@@ -1246,20 +1627,20 @@ unsafe fn walk_ordered(
 
 /// Serve a LIST request: one page of a root's live bindings under a
 /// prefix, in name order after a cursor. Read-only, channel-only.
-unsafe fn handle_list(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) {
+unsafe fn handle_list(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) -> bool {
     let req = match super::wire::decode_list_req(bytes) {
         Ok(r) => r,
         Err(_) => {
             s.apply_errors = s.apply_errors.wrapping_add(1);
             respond(s, syscalls, 0xFF);
-            return;
+            return true;
         }
     };
     let max = (req.max as usize).clamp(1, super::wire::MAX_LIST_PAGE);
     let scratch: &mut [u8] = &mut *(&mut s.list_scratch[..] as *mut [u8]);
     let Some(mut w) = super::wire::ListWriter::new(scratch) else {
         respond(s, syscalls, 0xFF);
-        return;
+        return true;
     };
     let more = walk_ordered(
         s,
@@ -1270,26 +1651,33 @@ unsafe fn handle_list(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes
         |e| w.count() < max && w.push(e.path, &e.binding),
     );
     match more {
-        Some(more) => {
+        super::snapshot::SnapRead::Ready(more) => {
             let n = w.finish(more);
             send_list_scratch(s, syscalls, Ok(n));
         }
-        None => {
+        // The half-built page is dropped; the request is asked again.
+        super::snapshot::SnapRead::Pending => return false,
+        super::snapshot::SnapRead::Failed => {
             s.apply_errors = s.apply_errors.wrapping_add(1);
             respond(s, syscalls, 0xFF);
         }
     }
+    true
 }
 
 /// Serve a REFERENCED request: does any binding hold this object
 /// id? Read-only, channel-only.
-unsafe fn handle_referenced(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) {
+unsafe fn handle_referenced(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    bytes: &[u8],
+) -> bool {
     let (cursor, oid) = match super::wire::decode_referenced_req(bytes) {
         Ok(v) => v,
         Err(_) => {
             s.apply_errors = s.apply_errors.wrapping_add(1);
             respond(s, syscalls, 0xFF);
-            return;
+            return true;
         }
     };
     // Page 0 checks the arena (fast, complete for the hot set);
@@ -1313,8 +1701,9 @@ unsafe fn handle_referenced(s: &mut ModuleState, syscalls: &super::SyscallTable,
         let mut idx = cursor;
         while idx < end {
             match super::snapshot::snap_read_at(syscalls, &snap, idx) {
-                Some(rec) if rec.kind == super::state::KIND_TOMBSTONE => {}
-                Some(rec) => {
+                super::snapshot::SnapRead::Ready(rec)
+                    if rec.kind == super::state::KIND_TOMBSTONE => {}
+                super::snapshot::SnapRead::Ready(rec) => {
                     let matches = if rec.oid_len == 0 {
                         true // hash-only: conservative
                     } else {
@@ -1325,7 +1714,10 @@ unsafe fn handle_referenced(s: &mut ModuleState, syscalls: &super::SyscallTable,
                         break;
                     }
                 }
-                None => {
+                // Being fetched: not an answer either way. The page is
+                // asked again, from its cursor, on a later step.
+                super::snapshot::SnapRead::Pending => return false,
+                super::snapshot::SnapRead::Failed => {
                     // Read failure: conservative.
                     referenced = true;
                     break;
@@ -1343,6 +1735,7 @@ unsafe fn handle_referenced(s: &mut ModuleState, syscalls: &super::SyscallTable,
     {
         let _ = s.reply.send(syscalls.channel_write, s.out_chan, &out);
     }
+    true
 }
 
 /// Answer one applied record. A reserve carries whether the id is now
@@ -1392,7 +1785,9 @@ unsafe fn respond_applied(
         Err(ApplyFault::Fenced) => respond(s, syscalls, super::wire::NAK_FENCED),
         Err(ApplyFault::Condition) => respond(s, syscalls, super::wire::NAK_CONDITION),
         Err(ApplyFault::Stale) => respond(s, syscalls, super::wire::NAK_STALE),
-        Err(ApplyFault::Rejected) => respond(s, syscalls, 0xFF),
+        // `Pending` is intercepted by every caller before an answer is
+        // owed; were one to reach here it is not a success either.
+        Err(ApplyFault::Rejected) | Err(ApplyFault::Pending) => respond(s, syscalls, 0xFF),
     }
 }
 
@@ -1414,6 +1809,10 @@ enum ApplyFault {
     /// that lost a race, or one already applied and since superseded.
     Stale,
     Rejected,
+    /// Not decided: a snapshot read the decision needs is being
+    /// fetched. Nothing changed. Never an answer — every caller of
+    /// `apply_op` holds the record and applies it again on a later step.
+    Pending,
 }
 
 /// Apply one op with snapshot semantics wrapped around the pure
@@ -1510,7 +1909,7 @@ unsafe fn apply_op(
     }
     if op == super::wire::OP_VOLUME {
         let req = super::wire::decode_volume_req(payload).map_err(|_| ApplyFault::Rejected)?;
-        let (status, revision) = judge_volume(s, syscalls, &req);
+        let (status, revision) = judge_volume(s, syscalls, &req)?;
         super::wire::encode_volume_resp(&mut s.volume_resp, status, revision)
             .map_err(|_| ApplyFault::Rejected)?;
         return Ok(op);
@@ -1527,7 +1926,7 @@ unsafe fn apply_op(
         // plain bind creating one, or replacing one, would be a commit
         // nobody fenced.
         if dec.kind == super::wire::KIND_VOLUME
-            || is_volume_binding(s, syscalls, dec.namespace_root, dec.path)
+            || volume_gate(s, syscalls, dec.namespace_root, dec.path)?
         {
             return Err(ApplyFault::Fenced);
         }
@@ -1546,6 +1945,7 @@ unsafe fn apply_op(
                 rec.kind == dec.kind && rec.oid() == dec.object_id,
             ),
             Some(Current::Unreadable) => return Err(ApplyFault::Rejected),
+            Some(Current::Pending) => return Err(ApplyFault::Pending),
             None => (0, false, false),
         };
         if dec.revision <= cur_rev {
@@ -1595,15 +1995,15 @@ unsafe fn apply_op(
     }
     if op == super::wire::OP_RENAME {
         let dec = super::wire::decode_rename(payload).map_err(|_| ApplyFault::Rejected)?;
-        if is_volume_binding(s, syscalls, dec.namespace_root, dec.from)
-            || is_volume_binding(s, syscalls, dec.namespace_root, dec.to)
+        if volume_gate(s, syscalls, dec.namespace_root, dec.from)?
+            || volume_gate(s, syscalls, dec.namespace_root, dec.to)?
         {
             return Err(ApplyFault::Fenced);
         }
     }
     if op == super::wire::OP_UNBIND {
         let dec = super::wire::decode_unbind(payload).map_err(|_| ApplyFault::Rejected)?;
-        if is_volume_binding(s, syscalls, dec.namespace_root, dec.path) {
+        if volume_gate(s, syscalls, dec.namespace_root, dec.path)? {
             return Err(ApplyFault::Fenced);
         }
         let (cur_rev, live) = match current(s, syscalls, dec.namespace_root, dec.path) {
@@ -1614,6 +2014,7 @@ unsafe fn apply_op(
                 (rec.revision, rec.kind != super::state::KIND_TOMBSTONE)
             }
             Some(Current::Unreadable) => return Err(ApplyFault::Rejected),
+            Some(Current::Pending) => return Err(ApplyFault::Pending),
             None => (0, false),
         };
         if !live {
@@ -1682,17 +2083,35 @@ fn seed_lease(
 
 /// Is `(namespace_root, path)` bound, live, as a volume? The arena is
 /// authoritative for a key it holds, tombstone included; otherwise the
-/// on-disk snapshot answers.
+/// on-disk snapshot answers — or has not answered yet.
 unsafe fn is_volume_binding(
     s: &ModuleState,
     syscalls: &super::SyscallTable,
     namespace_root: &[u8],
     path: &[u8],
-) -> bool {
-    matches!(
-        volume_binding(s, syscalls, namespace_root, path, &[]),
-        Some((_, true, _))
-    )
+) -> super::snapshot::SnapRead<bool> {
+    match volume_binding(s, syscalls, namespace_root, path, &[]) {
+        super::snapshot::SnapRead::Ready(v) => {
+            super::snapshot::SnapRead::Ready(matches!(v, Some((_, true, _))))
+        }
+        super::snapshot::SnapRead::Pending => super::snapshot::SnapRead::Pending,
+        super::snapshot::SnapRead::Failed => super::snapshot::SnapRead::Failed,
+    }
+}
+
+/// `is_volume_binding` for the apply path: a snapshot that cannot be
+/// read refuses the record, and one being fetched defers it.
+unsafe fn volume_gate(
+    s: &ModuleState,
+    syscalls: &super::SyscallTable,
+    namespace_root: &[u8],
+    path: &[u8],
+) -> Result<bool, ApplyFault> {
+    match is_volume_binding(s, syscalls, namespace_root, path) {
+        super::snapshot::SnapRead::Ready(v) => Ok(v),
+        super::snapshot::SnapRead::Pending => Err(ApplyFault::Pending),
+        super::snapshot::SnapRead::Failed => Err(ApplyFault::Rejected),
+    }
 }
 
 /// Remove a binding: the key is tombstoned at `revision`. The tombstone
@@ -1717,40 +2136,51 @@ unsafe fn remove_binding(
 /// Is `(namespace_root, path)` bound, live, and if so at what revision,
 /// as a volume, and to `object_id`? The arena is authoritative for a
 /// key it holds, tombstone included; otherwise the on-disk snapshot
-/// answers.
+/// answers. `Ready(None)` is a decided "not bound"; a snapshot read
+/// being fetched is `Pending`, never an absence.
 unsafe fn volume_binding(
     s: &ModuleState,
     syscalls: &super::SyscallTable,
     namespace_root: &[u8],
     path: &[u8],
     object_id: &[u8],
-) -> Option<(u64, bool, bool)> {
+) -> super::snapshot::SnapRead<Option<(u64, bool, bool)>> {
+    use super::snapshot::SnapRead;
     let (ns_h, p_h) = super::state::key_hash(namespace_root, path);
     if let Some(slot) = s.bindings.lookup_hashed(ns_h, p_h, namespace_root, path) {
         if slot.kind == super::state::KIND_TOMBSTONE {
-            return None;
+            return SnapRead::Ready(None);
         }
         let volume = slot.kind == super::wire::KIND_VOLUME;
-        return Some((
+        return SnapRead::Ready(Some((
             slot.revision,
             volume,
             volume && slot.object_id() == object_id,
-        ));
+        )));
     }
     if s.snap_active == 0 {
-        return None;
+        return SnapRead::Ready(None);
     }
     let snap = super::snapshot::OpenSnapshot {
         fd: s.snap_fd,
         count: s.snap_count,
         generation: s.snap_gen,
     };
-    let rec = super::snapshot::snap_search(syscalls, &snap, namespace_root, path)?;
+    let rec = match super::snapshot::snap_search(syscalls, &snap, namespace_root, path) {
+        SnapRead::Ready(Some(rec)) => rec,
+        SnapRead::Ready(None) => return SnapRead::Ready(None),
+        SnapRead::Pending => return SnapRead::Pending,
+        SnapRead::Failed => return SnapRead::Failed,
+    };
     if rec.kind == super::state::KIND_TOMBSTONE {
-        return None;
+        return SnapRead::Ready(None);
     }
     let volume = rec.kind == super::wire::KIND_VOLUME;
-    Some((rec.revision, volume, volume && rec.oid() == object_id))
+    SnapRead::Ready(Some((
+        rec.revision,
+        volume,
+        volume && rec.oid() == object_id,
+    )))
 }
 
 /// Decide one volume record. Everything it reads is in the record, the
@@ -1761,14 +2191,34 @@ unsafe fn volume_binding(
 /// a redelivered duplicate and changes nothing (answered as a lost
 /// lease: a live request always carries a fresh stamp, so only a
 /// duplicate lands here).
+///
+/// The binding is read first, before anything is judged or touched, so
+/// a snapshot read still being fetched (`Pending`) leaves the record
+/// undecided with nothing changed; an unreadable snapshot refuses it
+/// rather than judging the volume unbound.
 unsafe fn judge_volume(
     s: &mut ModuleState,
     syscalls: &super::SyscallTable,
     req: &super::wire::DecodedVolumeReq<'_>,
+) -> Result<(u8, u64), ApplyFault> {
+    let root = req.namespace_root;
+    let path = req.path;
+    let current = match volume_binding(s, syscalls, root, path, req.object_id) {
+        super::snapshot::SnapRead::Ready(c) => c,
+        super::snapshot::SnapRead::Pending => return Err(ApplyFault::Pending),
+        super::snapshot::SnapRead::Failed => return Err(ApplyFault::Rejected),
+    };
+    Ok(judge_volume_at(s, req, current))
+}
+
+/// `judge_volume` against the binding already read.
+unsafe fn judge_volume_at(
+    s: &mut ModuleState,
+    req: &super::wire::DecodedVolumeReq<'_>,
+    current: Option<(u64, bool, bool)>,
 ) -> (u8, u64) {
     let root = req.namespace_root;
     let path = req.path;
-    let current = volume_binding(s, syscalls, root, path, req.object_id);
     let cur_rev = current.map_or(0, |c| c.0);
     if req.now_ms == 0 || path.is_empty() {
         return (super::wire::VOLUME_BAD_REQ, cur_rev);
@@ -1927,14 +2377,18 @@ fn hex_nibble(c: u8) -> Option<u8> {
 /// arena cannot hold the lane. A snapshot record for a key the arena
 /// has since superseded is still offered: walking a root no longer
 /// current keeps more than it must, never less.
-unsafe fn handle_volume_roots(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) {
+unsafe fn handle_volume_roots(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    bytes: &[u8],
+) -> bool {
     const ROOTS_SCAN_PER_CALL: u32 = 128;
     let cursor = match super::wire::decode_volume_roots_req(bytes) {
         Ok(c) => c,
         Err(_) => {
             s.apply_errors = s.apply_errors.wrapping_add(1);
             respond(s, syscalls, 0xFF);
-            return;
+            return true;
         }
     };
     let arena_cap = s.bindings.capacity() as u32;
@@ -1961,19 +2415,21 @@ unsafe fn handle_volume_roots(s: &mut ModuleState, syscalls: &super::SyscallTabl
             }
         } else {
             match super::snapshot::snap_read_at(syscalls, &snap, idx - arena_cap) {
-                Some(rec) if rec.kind == super::wire::KIND_VOLUME => {
+                super::snapshot::SnapRead::Ready(rec) if rec.kind == super::wire::KIND_VOLUME => {
                     let oid = &rec.oid[..(rec.oid_len as usize).min(rec.oid.len())];
                     if let Some(d) = digest_of_object_id(oid) {
                         found[count] = d;
                         count += 1;
                     }
                 }
-                Some(_) => {}
-                None => {
+                super::snapshot::SnapRead::Ready(_) => {}
+                // Being fetched: the page is asked again on a later step.
+                super::snapshot::SnapRead::Pending => return false,
+                super::snapshot::SnapRead::Failed => {
                     // An unreadable snapshot cannot be walked, and a walk
                     // that skipped part of it would prove too much.
                     respond(s, syscalls, 0xFF);
-                    return;
+                    return true;
                 }
             }
         }
@@ -1992,6 +2448,7 @@ unsafe fn handle_volume_roots(s: &mut ModuleState, syscalls: &super::SyscallTabl
             respond(s, syscalls, 0xFF);
         }
     }
+    true
 }
 
 /// Build a snapshot record from an arena slot (field widths align
@@ -2027,128 +2484,79 @@ fn set_merge_cursor(s: &mut ModuleState, root: &[u8], path: &[u8]) {
     s.cmp_last_key_valid = 1;
 }
 
+/// Give up the compaction in flight. The half-written generation keeps
+/// its invalid placeholder header, so nothing durable is claimed for it
+/// and its file needs no fence before the close.
 unsafe fn compaction_abort(s: &mut ModuleState, syscalls: &super::SyscallTable) {
-    if s.cmp_writer_fd >= 0 {
-        let _ = (syscalls.provider_call)(
-            s.cmp_writer_fd,
-            0x0903, /* FS_CLOSE */
-            core::ptr::null_mut(),
-            0,
-        );
-    }
-    s.cmp_writer_fd = -1;
+    s.cmp_writer.abandon(syscalls);
+    s.cmp_reopen.abandon(syscalls);
+    s.cmp_phase = CMP_IDLE;
     s.cmp_running = 0;
 }
 
 /// One bounded slice of the merge compaction. Trigger, merge, and
 /// finalize all live here; called once per step.
+///
+/// Every stage is resumable, because none of the `fs` calls it makes
+/// decides on the device inside the call: a stage the provider has not
+/// decided returns and is asked again on the next step, from where it
+/// stopped, and only a decided failure abandons the generation.
+///
+///   OPEN    unlink + create the target slot, placeholder header
+///   MERGE   bounded records per step, each staged in the writer until
+///           the provider takes it whole
+///   FINISH  fsync, real header, fsync, name fence, close
+///   REOPEN  open and validate the generation just written, switch to it
+///   ROTATE  rotate the WAL, seeded with the lease table; intake of
+///           mutating records waits while it runs
 unsafe fn compaction_step(s: &mut ModuleState, syscalls: &super::SyscallTable) {
-    if s.cmp_running == 0 {
-        if s.wal_path_len == 0 {
-            return;
-        }
-        let occupied = s.bindings.occupied_count();
-        let cap = s.bindings.capacity();
-        if occupied * CMP_TRIGGER_DEN < cap * CMP_TRIGGER_NUM {
-            return;
-        }
-        // HYSTERESIS: under pressure, only re-compact when enough
-        // NEW data has accumulated (or the arena is wedged full of
-        // dirt). Without this, occupancy stays above the trigger
-        // after a snapshot, compaction re-runs continuously, and
-        // eviction — gated off mid-merge — never gets to relieve
-        // the pressure: a livelock into OutOfCapacity.
-        let dirty = s.bindings.dirty_count();
-        let meaningful_dirt = dirty * 8 >= cap;
-        let wedged = occupied == cap && dirty > 0;
-        if s.snap_active != 0 && !meaningful_dirt && !wedged {
-            return;
-        }
-        let target = if s.snap_active != 0 {
-            s.snap_slot ^ 1
-        } else {
-            0
-        };
-        let gen = if s.snap_active != 0 {
-            s.snap_gen + 1
-        } else {
-            1
-        };
-        let mut path = [0u8; 300];
-        let n =
-            super::snapshot::snap_path(&s.wal_path[..s.wal_path_len as usize], target, &mut path);
-        if n == 0 {
-            return;
-        }
-        let writer = match super::snapshot::snap_writer_start(syscalls, &path[..n], gen) {
-            Some(w) => w,
-            None => return,
-        };
-        s.cmp_running = 1;
-        s.cmp_target_slot = target;
-        s.cmp_writer_fd = writer.fd;
-        s.cmp_writer_count = 0;
-        s.cmp_writer_gen = gen;
-        s.cmp_snap_idx = 0;
-        s.cmp_last_key_valid = 0;
-        return;
-    }
-
-    let old_snap = super::snapshot::OpenSnapshot {
-        fd: s.snap_fd,
-        count: s.snap_count,
-        generation: s.snap_gen,
-    };
-    let mut writer = super::snapshot::SnapWriter {
-        fd: s.cmp_writer_fd,
-        count: s.cmp_writer_count,
-        generation: s.cmp_writer_gen,
-    };
-    for _ in 0..CMP_RECORDS_PER_STEP {
-        let arena_next = {
-            let last = if s.cmp_last_key_valid != 0 {
-                Some((
-                    &s.cmp_last_root[..s.cmp_last_root_len as usize],
-                    &s.cmp_last_path[..s.cmp_last_path_len as usize],
-                ))
-            } else {
-                None
-            };
-            s.bindings.min_key_above(last)
-        };
-        let old_next = if s.snap_active != 0 && s.cmp_snap_idx < s.snap_count {
-            match super::snapshot::snap_read_at(syscalls, &old_snap, s.cmp_snap_idx) {
-                Some(r) => Some(r),
-                None => {
-                    compaction_abort(s, syscalls);
+    loop {
+        match s.cmp_phase {
+            CMP_IDLE => {
+                if !compaction_start(s) {
                     return;
                 }
             }
-        } else {
-            None
-        };
-        match (arena_next, old_next) {
-            (None, None) => {
-                // Merge complete: make the new generation durable,
-                // switch to it, rotate the WAL.
-                if !super::snapshot::snap_writer_finish(syscalls, &mut writer) {
+            CMP_OPEN => match s.cmp_writer.poll_open(syscalls) {
+                super::snapshot::WritePoll::Pending => return,
+                super::snapshot::WritePoll::Failed => {
                     compaction_abort(s, syscalls);
                     return;
                 }
-                let mut path = [0u8; 300];
+                super::snapshot::WritePoll::Ready => s.cmp_phase = CMP_MERGE,
+            },
+            CMP_MERGE => {
+                if !merge_slice(s, syscalls) {
+                    return;
+                }
+            }
+            CMP_FINISH => match s.cmp_writer.poll_finish(syscalls) {
+                super::snapshot::WritePoll::Pending => return,
+                super::snapshot::WritePoll::Failed => {
+                    compaction_abort(s, syscalls);
+                    return;
+                }
+                // Durable under its name, and closed.
+                super::snapshot::WritePoll::Ready => s.cmp_phase = CMP_REOPEN,
+            },
+            CMP_REOPEN => {
+                let mut path = [0u8; super::snapshot::SNAP_PATH_MAX];
+                let wal_len = (s.wal_path_len as usize).min(WAL_PATH_BUF);
                 let n = super::snapshot::snap_path(
-                    &s.wal_path[..s.wal_path_len as usize],
+                    s.wal_path.get(..wal_len).unwrap_or(&[]),
                     s.cmp_target_slot,
                     &mut path,
                 );
-                let reopened = super::snapshot::snap_open_one(syscalls, &path[..n]);
-                let new_snap = match reopened {
-                    Some(v) => v,
-                    None => {
+                let new_snap = match s.cmp_reopen.poll(syscalls, path.get(..n).unwrap_or(&[])) {
+                    super::snapshot::SnapOpenPoll::Pending => return,
+                    super::snapshot::SnapOpenPoll::Invalid => {
                         compaction_abort(s, syscalls);
                         return;
                     }
+                    super::snapshot::SnapOpenPoll::Opened(v) => v,
                 };
+                // The old generation's descriptor is read-only: it owes
+                // no fence.
                 if s.snap_fd >= 0 {
                     let _ = (syscalls.provider_call)(
                         s.snap_fd,
@@ -2162,51 +2570,175 @@ unsafe fn compaction_step(s: &mut ModuleState, syscalls: &super::SyscallTable) {
                 s.snap_fd = new_snap.fd;
                 s.snap_count = new_snap.count;
                 s.snap_gen = new_snap.generation;
-                if s.wal_fd >= 0 {
-                    // The snapshot holds bindings only. The lease table
-                    // lives in the log, so the new log opens with it.
-                    let leases = &s.leases;
-                    let wal_path = &s.wal_path[..s.wal_path_len as usize];
-                    let scratch = &mut s.append_scratch;
-                    match super::wal::wal_rotate_seeded(
-                        syscalls,
-                        s.wal_fd,
-                        wal_path,
-                        leases.capacity(),
-                        scratch,
-                        |i, buf| seed_lease(leases, i, buf),
-                    ) {
-                        Ok(super::wal::RotateOutcome::Rotated(new_fd)) => {
-                            s.wal_fd = new_fd;
-                            s.appender.reset();
-                        }
-                        // The log was left intact: boot replays the
-                        // snapshot plus a longer tail, which costs time
-                        // and nothing else.
-                        Ok(super::wal::RotateOutcome::Skipped) => {}
-                        // Replaced but not reopenable. `wal_path_len`
-                        // still says a log was configured, which is
-                        // what lets the write path refuse rather than
-                        // silently drop to no durability.
-                        Err(_) => {
-                            s.wal_fd = -1;
-                            s.appender.reset();
-                        }
+                // The generation is durable, so what it holds is covered
+                // from here: the emitted slots may be evicted.
+                let tag = (s.cmp_writer.generation % 251 + 1) as u8;
+                s.bindings.finalize_emitted(tag);
+                s.snapshots_written = s.snapshots_written.wrapping_add(1);
+                if s.wal_fd < 0 {
+                    s.cmp_phase = CMP_IDLE;
+                    s.cmp_running = 0;
+                    return;
+                }
+                s.cmp_phase = CMP_ROTATE;
+            }
+            CMP_ROTATE => {
+                // The snapshot holds bindings only. The lease table
+                // lives in the log, so the new log opens with it. The
+                // seed is read record by record across the rotation's
+                // steps; the table holds still meanwhile because nothing
+                // is applied while `rotator.busy()` holds back intake.
+                let wal_len = (s.wal_path_len as usize).min(WAL_PATH_BUF);
+                let wal_path = s.wal_path.get(..wal_len).unwrap_or(&[]);
+                let leases = &s.leases;
+                let outcome = s.rotator.rotate_seeded(
+                    syscalls,
+                    s.wal_fd,
+                    wal_path,
+                    leases.capacity(),
+                    &mut s.append_scratch,
+                    |i, buf| seed_lease(leases, i, buf),
+                );
+                match outcome {
+                    super::wal::RotateOutcome::Pending => return,
+                    super::wal::RotateOutcome::Rotated(new_fd) => {
+                        s.wal_fd = new_fd;
+                        s.appender.reset();
+                    }
+                    // The log was left intact: boot replays the
+                    // snapshot plus a longer tail, which costs time
+                    // and nothing else.
+                    super::wal::RotateOutcome::Skipped => {}
+                    // Replaced but not reopenable. `wal_path_len`
+                    // still says a log was configured, which is
+                    // what lets the write path refuse rather than
+                    // silently drop to no durability.
+                    super::wal::RotateOutcome::Lost => {
+                        s.wal_fd = -1;
+                        s.appender.reset();
                     }
                 }
-                let tag = (s.cmp_writer_gen % 251 + 1) as u8;
-                s.bindings.finalize_emitted(tag);
-                s.cmp_writer_fd = -1;
+                s.cmp_phase = CMP_IDLE;
                 s.cmp_running = 0;
-                s.snapshots_written = s.snapshots_written.wrapping_add(1);
                 return;
+            }
+            _ => {
+                compaction_abort(s, syscalls);
+                return;
+            }
+        }
+    }
+}
+
+/// Decide whether a compaction should start, and arm its writer. True
+/// when one was armed.
+fn compaction_start(s: &mut ModuleState) -> bool {
+    if s.wal_path_len == 0 {
+        return false;
+    }
+    let occupied = s.bindings.occupied_count();
+    let cap = s.bindings.capacity();
+    if occupied * CMP_TRIGGER_DEN < cap * CMP_TRIGGER_NUM {
+        return false;
+    }
+    // HYSTERESIS: under pressure, only re-compact when enough
+    // NEW data has accumulated (or the arena is wedged full of
+    // dirt). Without this, occupancy stays above the trigger
+    // after a snapshot, compaction re-runs continuously, and
+    // eviction — gated off mid-merge — never gets to relieve
+    // the pressure: a livelock into OutOfCapacity.
+    let dirty = s.bindings.dirty_count();
+    let meaningful_dirt = dirty * 8 >= cap;
+    let wedged = occupied == cap && dirty > 0;
+    if s.snap_active != 0 && !meaningful_dirt && !wedged {
+        return false;
+    }
+    let target = if s.snap_active != 0 {
+        s.snap_slot ^ 1
+    } else {
+        0
+    };
+    let gen = if s.snap_active != 0 {
+        s.snap_gen + 1
+    } else {
+        1
+    };
+    let mut path = [0u8; super::snapshot::SNAP_PATH_MAX];
+    let wal_len = (s.wal_path_len as usize).min(WAL_PATH_BUF);
+    let n = super::snapshot::snap_path(s.wal_path.get(..wal_len).unwrap_or(&[]), target, &mut path);
+    if n == 0 || !s.cmp_writer.start(path.get(..n).unwrap_or(&[]), gen) {
+        return false;
+    }
+    s.cmp_running = 1;
+    s.cmp_phase = CMP_OPEN;
+    s.cmp_target_slot = target;
+    s.cmp_snap_idx = 0;
+    s.cmp_last_key_valid = 0;
+    true
+}
+
+/// Up to `CMP_RECORDS_PER_STEP` records of the merge. True when the
+/// merge is complete and the generation is ready to finish; false when
+/// this step's share is done, or the provider has not taken a record or
+/// fetched one yet — the merge resumes where it stopped.
+///
+/// A record is decided when it is staged: the cursor moves and the slot
+/// is tagged then, so a key rebound while its bytes are still owed to the
+/// file is dirty again, not taken for written.
+unsafe fn merge_slice(s: &mut ModuleState, syscalls: &super::SyscallTable) -> bool {
+    let old_snap = super::snapshot::OpenSnapshot {
+        fd: s.snap_fd,
+        count: s.snap_count,
+        generation: s.snap_gen,
+    };
+    let tag = (s.cmp_writer.generation % 251 + 1) as u8;
+    for _ in 0..CMP_RECORDS_PER_STEP {
+        // The record staged last is owed before another is decided.
+        match s.cmp_writer.flush(syscalls) {
+            super::snapshot::WritePoll::Ready => {}
+            super::snapshot::WritePoll::Pending => return false,
+            super::snapshot::WritePoll::Failed => {
+                compaction_abort(s, syscalls);
+                return false;
+            }
+        }
+        let arena_next = {
+            let last = if s.cmp_last_key_valid != 0 {
+                Some((
+                    &s.cmp_last_root[..s.cmp_last_root_len as usize],
+                    &s.cmp_last_path[..s.cmp_last_path_len as usize],
+                ))
+            } else {
+                None
+            };
+            s.bindings.min_key_above(last)
+        };
+        let old_next = if s.snap_active != 0 && s.cmp_snap_idx < s.snap_count {
+            match super::snapshot::snap_read_at(syscalls, &old_snap, s.cmp_snap_idx) {
+                super::snapshot::SnapRead::Ready(r) => Some(r),
+                // Being fetched: nothing decided, nothing staged.
+                super::snapshot::SnapRead::Pending => return false,
+                super::snapshot::SnapRead::Failed => {
+                    compaction_abort(s, syscalls);
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
+        match (arena_next, old_next) {
+            (None, None) => {
+                // Merge complete: make the new generation durable,
+                // switch to it, rotate the WAL.
+                s.cmp_phase = CMP_FINISH;
+                return true;
             }
             (Some(idx), old) => {
                 let slot = match s.bindings.slot_ref(idx) {
                     Some(sl) => *sl,
                     None => {
                         compaction_abort(s, syscalls);
-                        return;
+                        return false;
                     }
                 };
                 let order = match &old {
@@ -2220,39 +2752,42 @@ unsafe fn compaction_step(s: &mut ModuleState, syscalls: &super::SyscallTable) {
                     // must outlive the compaction, or a re-created key
                     // would start its revisions again.
                     let rec = snap_record_from_slot(&slot);
-                    if !super::snapshot::snap_writer_append(syscalls, &mut writer, &rec) {
+                    if !s.cmp_writer.stage_record(&rec) {
                         compaction_abort(s, syscalls);
-                        return;
+                        return false;
                     }
                     // Tag the emit; promoted to snapshot-covered
                     // only when this generation is durable.
-                    let tag = (s.cmp_writer_gen % 251 + 1) as u8;
                     s.bindings.mark_emitted(idx, tag);
                     if order == core::cmp::Ordering::Equal {
                         s.cmp_snap_idx += 1; // superseded
                     }
                     set_merge_cursor(s, slot.root(), slot.path());
                 } else if let Some(rec) = old {
-                    if !super::snapshot::snap_writer_append(syscalls, &mut writer, &rec) {
+                    if !s.cmp_writer.stage_record(&rec) {
                         compaction_abort(s, syscalls);
-                        return;
+                        return false;
                     }
                     s.cmp_snap_idx += 1;
                     set_merge_cursor(s, rec.root(), rec.path());
                 }
             }
             (None, Some(rec)) => {
-                if !super::snapshot::snap_writer_append(syscalls, &mut writer, &rec) {
+                if !s.cmp_writer.stage_record(&rec) {
                     compaction_abort(s, syscalls);
-                    return;
+                    return false;
                 }
                 s.cmp_snap_idx += 1;
                 set_merge_cursor(s, rec.root(), rec.path());
             }
         }
     }
-    s.cmp_writer_count = writer.count;
-    s.cmp_writer_fd = writer.fd;
+    // Offer this step's last record now rather than a step later; what
+    // the provider does not take stays staged.
+    if s.cmp_writer.flush(syscalls) == super::snapshot::WritePoll::Failed {
+        compaction_abort(s, syscalls);
+    }
+    false
 }
 
 /// Decode a RENAME record and apply it to the arena. Binds and
@@ -2333,6 +2868,9 @@ const E_MFILE: i32 = -24;
 const E_IO: i32 = -5;
 const E_NOMEM: i32 = -12;
 const E_OVERFLOW: i32 = -75;
+/// Not now: the boot is not done, or a snapshot read is being fetched.
+/// Nothing was done; the caller asks again later.
+const E_AGAIN: i32 = -11;
 
 /// The strongest fence this provider can honestly claim right now.
 ///
@@ -2584,11 +3122,17 @@ unsafe fn live_slot(s: &ModuleState, path: &[u8]) -> Option<(u32, u64)> {
     None
 }
 
-/// Is `path` (in the provider surface's root) bound as a volume?
-unsafe fn live_volume(s: &ModuleState, path: &[u8]) -> bool {
+/// Is `path` (in the provider surface's root) bound as a volume? `Err`
+/// carries the errno a provider call answers when the snapshot cannot
+/// say yet (`EAGAIN`: ask again) or cannot say at all (`EIO`).
+unsafe fn live_volume(s: &ModuleState, path: &[u8]) -> Result<bool, i32> {
     match s.syscalls.as_ref() {
-        Some(sys) => is_volume_binding(s, sys, &[], path),
-        None => false,
+        Some(sys) => match is_volume_binding(s, sys, &[], path) {
+            super::snapshot::SnapRead::Ready(v) => Ok(v),
+            super::snapshot::SnapRead::Pending => Err(E_AGAIN),
+            super::snapshot::SnapRead::Failed => Err(E_IO),
+        },
+        None => Ok(false),
     }
 }
 
@@ -2620,6 +3164,13 @@ pub unsafe fn provider_dispatch_impl(
         return E_INVAL;
     }
     let s = &mut *(state_ptr as *mut ModuleState);
+
+    // Before the boot is done the arena is not the log's state yet, so
+    // every answer but the capability bitmap would be a guess. A refused
+    // boot is a failure, not a wait.
+    if s.boot != BOOT_READY && opcode != NS_OP_CAPS {
+        return if s.boot == BOOT_FAILED { E_IO } else { E_AGAIN };
+    }
 
     if opcode == super::abi::fence::QUERY_OP {
         if arg.is_null() || arg_len < super::abi::fence::WIRE_MAX_LEN {
@@ -2743,8 +3294,13 @@ pub unsafe fn provider_dispatch_impl(
             // which is what makes `flags` mean what the contract says.
             // A volume is bound and replaced only by a VOLUME record,
             // under its lease; this surface has neither.
-            if kind == super::wire::KIND_VOLUME || live_volume(s, path) {
+            if kind == super::wire::KIND_VOLUME {
                 return E_PERM;
+            }
+            match live_volume(s, path) {
+                Ok(true) => return E_PERM,
+                Ok(false) => {}
+                Err(rc) => return rc,
             }
             let existing = live_slot(s, path).map(|(_, rev)| rev);
             let revision = match existing {
@@ -2795,8 +3351,10 @@ pub unsafe fn provider_dispatch_impl(
                 return E_INVAL;
             }
             let path = &a[2..2 + path_len];
-            if live_volume(s, path) {
-                return E_PERM;
+            match live_volume(s, path) {
+                Ok(true) => return E_PERM,
+                Ok(false) => {}
+                Err(rc) => return rc,
             }
             let rev = match live_slot(s, path) {
                 Some((_, rev)) => rev,
@@ -2847,8 +3405,10 @@ pub unsafe fn provider_dispatch_impl(
             let Some((idx, rev)) = live_slot(s, from) else {
                 return E_NOENT;
             };
-            if live_volume(s, from) {
-                return E_PERM;
+            match live_volume(s, from) {
+                Ok(true) => return E_PERM,
+                Ok(false) => {}
+                Err(rc) => return rc,
             }
             if live_slot(s, to).is_some() {
                 return E_EXIST;
@@ -3154,8 +3714,12 @@ pub unsafe fn provider_dispatch_impl(
             if overflow {
                 return E_OVERFLOW;
             }
-            let Some(more) = more else {
-                return E_IO;
+            let more = match more {
+                super::snapshot::SnapRead::Ready(more) => more,
+                // Being fetched: the page is not answered, and asking
+                // again with the same cursor yields it.
+                super::snapshot::SnapRead::Pending => return E_AGAIN,
+                super::snapshot::SnapRead::Failed => return E_IO,
             };
             if more && w.count() == 0 {
                 // Not even one entry fits with its trailer.

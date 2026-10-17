@@ -64,8 +64,9 @@ mod body;
 
 /// TLV parameter schema. `tag = 1` carries `wal_path` as a UTF-8
 /// byte string; the handler copies bytes into the inline buffer on
-/// `ModuleState` and records the length. The PIC mod.rs then drives
-/// `body::open_wal_from_state` to actually open the file.
+/// `ModuleState` and records the length. The PIC mod.rs then arms the
+/// boot with `body::open_wal_from_state`; `module_step` opens and
+/// replays the file.
 ///
 /// Tag 0 is reserved; `0xFF` is the TLV end marker.
 mod params_def {
@@ -134,8 +135,12 @@ pub unsafe extern "C" fn module_new(
         let committed = dev_channel_port(&*sys, 0, 1);
         body::set_replication_channels(state_ptr, metadata_ops, committed);
 
-        // If a wal path was set, open + replay. Returns 0 when no
-        // path is configured, so a channel-only graph profile is fine.
+        // If a wal path was set, arm the boot that opens + replays it.
+        // Nothing is asked of the provider here: no `fs` call waits on
+        // the device, so the open, its name fence, the snapshot open
+        // and the replay run from `module_step`, which serves nothing
+        // until they are done. Returns 0 when no path is configured, so
+        // a channel-only graph profile is fine.
         body::open_wal_from_state(state_ptr)
     }
 }

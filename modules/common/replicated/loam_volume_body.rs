@@ -196,6 +196,8 @@ pub struct ModuleState {
     pub cap_text: [u8; super::admin_client::CAP_FILE_MAX],
     pub cap_text_len: u16,
     pub cap_loaded: u8,
+    /// The capability file's read, resumed across steps.
+    pub cap_load: super::admin_client::ChainFileLoad,
     /// The gate's authority; empty, the module is a link session.
     pub admin: [u8; super::admin_client::AUTHORITY_MAX],
     pub admin_len: u8,
@@ -1874,7 +1876,11 @@ unsafe fn admin_up(s: &mut ModuleState, t: u64) -> bool {
         // Handed over whole: loaded as a file's lines would be.
         let text: &[u8] = &*(&s.cap_text[..s.cap_text_len as usize] as *const [u8]);
         if !super::admin_client::load_chains(&mut s.client, text) {
-            fail(s, EINVAL, b"[loam_volume] capability_chains holds a line that is not a chain, or too many");
+            fail(
+                s,
+                EINVAL,
+                b"[loam_volume] capability_chains holds a line that is not a chain, or too many",
+            );
             return false;
         }
         if s.client.chain_count == 0 {
@@ -1892,12 +1898,39 @@ unsafe fn admin_up(s: &mut ModuleState, t: u64) -> bool {
             );
             return false;
         }
-        let mut file = [0u8; super::admin_client::CAP_FILE_MAX];
+        // `cap_text` holds no chains on this path, so it is the buffer the
+        // read fills: the file arrives over as many steps as the provider
+        // takes, and what has been read must outlive each one.
+        let file: &mut [u8; super::admin_client::CAP_FILE_MAX] = &mut *(&mut s.cap_text as *mut _);
         let path: &[u8] = &*(&s.cap_path[..s.cap_path_len as usize] as *const [u8]);
-        if let Err(why) = super::admin_client::load_chain_file(&mut s.client, sys, path, &mut file)
-        {
-            fail(s, EINVAL, why);
-            return false;
+        let ld: &mut super::admin_client::ChainFileLoad = &mut *(&mut s.cap_load as *mut _);
+        match super::admin_client::load_chain_file(&mut s.client, sys, path, file, ld) {
+            super::admin_client::LoadPoll::Pending => return false,
+            super::admin_client::LoadPoll::Failed(why) => {
+                // One call per arm: a match yielding the message would
+                // lower to a table of absolute pointers.
+                match why {
+                    super::admin_client::LOAD_UNOPENABLE => {
+                        fail(s, EINVAL, b"the capability file cannot be opened")
+                    }
+                    super::admin_client::LOAD_TOO_LARGE => fail(
+                        s,
+                        EINVAL,
+                        b"the capability file is larger than MAX_CHAINS chains",
+                    ),
+                    super::admin_client::LOAD_BAD_LINE => fail(
+                        s,
+                        EINVAL,
+                        b"the capability file holds a line that is not a chain, or too many",
+                    ),
+                    super::admin_client::LOAD_EMPTY => {
+                        fail(s, EINVAL, b"the capability file holds no chain")
+                    }
+                    _ => fail(s, EINVAL, b"the capability file cannot be read"),
+                }
+                return false;
+            }
+            super::admin_client::LoadPoll::Loaded => {}
         }
         s.cap_loaded = 1;
     }

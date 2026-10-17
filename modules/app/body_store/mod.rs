@@ -141,10 +141,12 @@ unsafe fn decode_root_dir_params(state_ptr: *mut u8, params: *const u8, params_l
 pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
     unsafe {
         let rc = body::module_step_impl(state_ptr);
-        if let Some(line) = body::take_tier_report(state_ptr) {
+        let mut line = [0u8; body::TIER_REPORT_LEN];
+        let n = body::take_tier_report(state_ptr, &mut line);
+        if n > 0 {
             let s = &*(state_ptr as *const body::ModuleState);
             if let Some(sys) = s.syscalls.as_ref() {
-                dev_log(sys, 3, line.as_ptr(), line.len());
+                dev_log(sys, 3, line.as_ptr(), n.min(line.len()));
             }
         }
         rc

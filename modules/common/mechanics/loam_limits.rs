@@ -330,6 +330,15 @@ pub const WRITE_SESSIONS: usize = if MINIMAL {
     16
 };
 
+/// Longest WAL path a module takes, and the inline buffer each WAL
+/// module holds it in (`wal_path`). Not profiled: a path is a
+/// deployment's choice, not an arena budget. It is the one home of the
+/// value because the names built FROM a WAL path — the rotation's
+/// staging log, the snapshot generations — and the `RENAME` argument
+/// that carries a pair of them all derive from it, so a WAL path the
+/// module accepts is one it can always rotate and snapshot.
+pub const WAL_PATH_BUF: usize = 256;
+
 /// Proposals in flight in `raft_metadata_client`. One past the table
 /// is REFUSED to the producer, never dropped, so this bounds how
 /// deep a leader-loss window can get before back-pressure reaches

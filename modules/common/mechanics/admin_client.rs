@@ -184,52 +184,154 @@ pub fn load_chains(c: &mut Client, text: &[u8]) -> bool {
 const FS_OPEN: u32 = 0x0900;
 const FS_READ: u32 = 0x0901;
 const FS_CLOSE: u32 = 0x0903;
+/// `EINPROGRESS`: taken, not answered yet — like `EAGAIN`, ask again on
+/// a later step.
+const EINPROGRESS: i32 = -36;
 
-/// Read a capability file through `fs` and load its chains. `Err` names
-/// the cause: the file is missing or unreadable, larger than any file of
-/// `MAX_CHAINS` chains, holds a line that is not a chain, or holds none.
+const LOAD_IDLE: u8 = 0;
+const LOAD_READ: u8 = 1;
+const LOAD_PROBE: u8 = 2;
+
+/// A capability-file read in flight. No `fs` call waits on the device:
+/// `OPEN` answers `EAGAIN` while the mount is not up, and a `READ` over
+/// sectors not yet cached answers `EAGAIN` (or the short count of what
+/// was). So the read resumes across steps where it stopped. Zeroed
+/// memory is a valid idle load.
+#[repr(C)]
+pub struct ChainFileLoad {
+    phase: u8,
+    fd: i32,
+    filled: u32,
+}
+
+impl ChainFileLoad {
+    pub const fn new() -> Self {
+        Self {
+            phase: LOAD_IDLE,
+            fd: -1,
+            filled: 0,
+        }
+    }
+}
+
+/// Outcome of one `load_chain_file` poll.
+pub enum LoadPoll {
+    /// Not read yet. Poll again on a later step, with the same path and
+    /// scratch buffer.
+    Pending,
+    /// The chains are loaded into the client.
+    Loaded,
+    /// Refused; a `LOAD_*` code names the cause. A code, not a message:
+    /// a message chosen among literals here would reach the caller as a
+    /// runtime-selected `&'static [u8]`, which can lower to a `.rodata`
+    /// table of absolute pointers a PIC module never relocates. The
+    /// caller says each cause with its own literal, one call per arm.
+    Failed(u8),
+}
+
+/// The capability file cannot be opened.
+pub const LOAD_UNOPENABLE: u8 = 1;
+/// The capability file cannot be read.
+pub const LOAD_UNREADABLE: u8 = 2;
+/// The capability file is larger than any file of `MAX_CHAINS` chains.
+pub const LOAD_TOO_LARGE: u8 = 3;
+/// The capability file holds a line that is not a chain, or too many.
+pub const LOAD_BAD_LINE: u8 = 4;
+/// The capability file holds no chain.
+pub const LOAD_EMPTY: u8 = 5;
+
+/// Read a capability file through `fs` and load its chains, one step of
+/// it per call. `Failed` carries a `LOAD_*` code for the cause: the file
+/// is missing or unreadable, larger than any file of `MAX_CHAINS`
+/// chains, holds a line that is not a chain, or holds none.
+///
+/// `path` and `scratch` must be the same on every poll of one load:
+/// `scratch` holds what has been read so far.
+///
+/// # Safety
+/// `sys` must point at a live `SyscallTable`.
 pub unsafe fn load_chain_file(
     c: &mut Client,
     sys: &super::SyscallTable,
     path: &[u8],
     scratch: &mut [u8; CAP_FILE_MAX],
-) -> Result<(), &'static [u8]> {
-    let fd = (sys.provider_call)(-1, FS_OPEN, path.as_ptr() as *mut u8, path.len());
-    if fd < 0 {
-        return Err(b"the capability file cannot be opened");
+    ld: &mut ChainFileLoad,
+) -> LoadPoll {
+    if ld.phase == LOAD_IDLE {
+        let fd = (sys.provider_call)(-1, FS_OPEN, path.as_ptr() as *mut u8, path.len());
+        if fd == EAGAIN || fd == EINPROGRESS {
+            return LoadPoll::Pending;
+        }
+        if fd < 0 {
+            return LoadPoll::Failed(LOAD_UNOPENABLE);
+        }
+        ld.fd = fd;
+        ld.filled = 0;
+        ld.phase = LOAD_READ;
     }
-    let mut filled = 0usize;
+    // Read while bytes keep moving; `EAGAIN` defers the rest to a later
+    // step with nothing consumed, and only a `READ` answering 0 is EOF.
     let mut over = false;
     loop {
-        if filled == scratch.len() {
+        let filled = (ld.filled as usize).min(scratch.len());
+        if ld.phase == LOAD_PROBE || filled == scratch.len() {
             // Probe for one byte past the ceiling: a file that has one is
             // refused, not cut short.
+            ld.phase = LOAD_PROBE;
             let mut probe = [0u8; 1];
-            over = (sys.provider_call)(fd, FS_READ, probe.as_mut_ptr(), 1) > 0;
+            let n = (sys.provider_call)(ld.fd, FS_READ, probe.as_mut_ptr(), 1);
+            if n == EAGAIN || n == EINPROGRESS {
+                return LoadPoll::Pending;
+            }
+            if n < 0 {
+                return end_load(sys, ld, LoadPoll::Failed(LOAD_UNREADABLE));
+            }
+            over = n > 0;
             break;
         }
         let n = (sys.provider_call)(
-            fd,
+            ld.fd,
             FS_READ,
             scratch.as_mut_ptr().add(filled),
             scratch.len() - filled,
         );
-        if n <= 0 {
+        if n == EAGAIN || n == EINPROGRESS {
+            return LoadPoll::Pending;
+        }
+        if n < 0 {
+            return end_load(sys, ld, LoadPoll::Failed(LOAD_UNREADABLE));
+        }
+        if n == 0 {
             break;
         }
-        filled += n as usize;
+        ld.filled = (filled + (n as usize).min(scratch.len() - filled)) as u32;
     }
-    (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    let filled = (ld.filled as usize).min(scratch.len());
     if over {
-        return Err(b"the capability file is larger than MAX_CHAINS chains");
+        return end_load(sys, ld, LoadPoll::Failed(LOAD_TOO_LARGE));
     }
-    if !load_chains(c, &scratch[..filled]) {
-        return Err(b"the capability file holds a line that is not a chain, or too many");
+    let text = match scratch.get(..filled) {
+        Some(t) => t,
+        None => return end_load(sys, ld, LoadPoll::Failed(LOAD_UNREADABLE)),
+    };
+    if !load_chains(c, text) {
+        return end_load(sys, ld, LoadPoll::Failed(LOAD_BAD_LINE));
     }
     if c.chain_count == 0 {
-        return Err(b"the capability file holds no chain");
+        return end_load(sys, ld, LoadPoll::Failed(LOAD_EMPTY));
     }
-    Ok(())
+    end_load(sys, ld, LoadPoll::Loaded)
+}
+
+/// Close the load's descriptor and re-arm it, answering `out`.
+unsafe fn end_load(sys: &super::SyscallTable, ld: &mut ChainFileLoad, out: LoadPoll) -> LoadPoll {
+    if ld.fd >= 0 {
+        (sys.provider_call)(ld.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    }
+    ld.fd = -1;
+    ld.filled = 0;
+    ld.phase = LOAD_IDLE;
+    out
 }
 
 /// A client over an in-graph link.

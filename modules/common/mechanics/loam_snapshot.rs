@@ -28,7 +28,10 @@
 // (snapshot, wal-tail) pairing replays to a correct arena.
 //
 // Same include discipline as wal_io.rs: raw fs-contract calls via
-// the module's SyscallTable.
+// the module's SyscallTable, and the same non-blocking rule — no call
+// here waits on the device, so opening, reading and writing a
+// generation are each resumable across steps (see the sections below).
+// `fs_names` is mounted beside this file by every includer.
 
 #![allow(
     dead_code,
@@ -45,7 +48,6 @@ const FS_STAT: u32 = 0x0904;
 const FS_FSYNC: u32 = 0x0905;
 const FS_WRITE: u32 = 0x0906;
 const FS_OPEN_CREATE: u32 = 0x0909;
-const FS_UNLINK: u32 = 0x090A;
 
 pub const SNAP_MAGIC: u32 = u32::from_le_bytes(*b"LSNP");
 pub const SNAP_HDR: usize = 16;
@@ -181,47 +183,99 @@ impl SnapRecord {
     }
 }
 
-/// Build `<wal_path>.snapA` / `.snapB` into `out`; returns len.
+/// A generation file's suffix after its WAL path: `.snapA` / `.snapB`.
+const SNAP_SUFFIX_LEN: usize = 6;
+
+/// Longest generation-file path: the longest WAL path plus its `.snapA`
+/// suffix. Derived, so every WAL path a module accepts has both of its
+/// generation names.
+pub const SNAP_PATH_MAX: usize = super::limits::WAL_PATH_BUF + SNAP_SUFFIX_LEN;
+
+/// Build `<wal_path>.snapA` / `.snapB` into `out`; returns len, or 0
+/// when it does not fit.
+///
+/// The suffix is built a byte at a time rather than chosen between two
+/// literals: a selection of `&'static [u8]` literals can land in
+/// `.rodata` as a table of pointers the PIC loader never relocates.
 pub fn snap_path(wal_path: &[u8], which: u8, out: &mut [u8]) -> usize {
-    let suffix: &[u8] = if which == 0 { b".snapA" } else { b".snapB" };
-    let n = wal_path.len() + suffix.len();
+    let n = wal_path.len() + SNAP_SUFFIX_LEN;
     if out.len() < n {
         return 0;
     }
-    out[..wal_path.len()].copy_from_slice(wal_path);
-    out[wal_path.len()..n].copy_from_slice(suffix);
+    for (d, b) in out.iter_mut().zip(wal_path.iter()) {
+        *d = *b;
+    }
+    let tag = if which == 0 { b'A' } else { b'B' };
+    let suffix: [u8; SNAP_SUFFIX_LEN] = [b'.', b's', b'n', b'a', b'p', tag];
+    if let Some(tail) = out.get_mut(wal_path.len()..n) {
+        for (d, b) in tail.iter_mut().zip(suffix.iter()) {
+            *d = *b;
+        }
+    }
     n
 }
 
+// ── Non-blocking reads ─────────────────────────────────────────────
+//
+// No `fs` call waits on the device. A `READ` over sectors the provider
+// has not cached starts fetching them and answers `EAGAIN` (or the
+// short count of what it had), and `SEEK` / `STAT` / `OPEN` answer
+// `EAGAIN` while what they need is being fetched. So every read here is
+// tri-state: a result, `Pending` (ask again on a later step — the
+// provider is fetching meanwhile), or `Failed`. `Pending` is never an
+// absence and never a failure: a lookup that met it is deferred by its
+// caller, not answered.
+//
+// Reads keep no state across steps. A record read that stops short is
+// started again from its seek on the next ask, which costs a re-read
+// of bytes the provider now has cached and nothing else.
+
+/// Outcome of one snapshot read.
+#[derive(Clone, Copy)]
+pub enum SnapRead<T> {
+    Ready(T),
+    /// Not decided yet: the provider is fetching. Ask again on a later
+    /// step. Nothing may be concluded from it.
+    Pending,
+    /// The read failed, or the file no longer matches its header.
+    Failed,
+}
+
 /// SAFETY: `syscalls` must be a valid provider table.
-unsafe fn stat_size(syscalls: &super::SyscallTable, fd: i32) -> Option<u64> {
-    let mut stat = [0u8; 8];
-    if (syscalls.provider_call)(fd, FS_STAT, stat.as_mut_ptr(), stat.len()) < 0 {
-        return None;
-    }
-    Some(u32::from_le_bytes([stat[0], stat[1], stat[2], stat[3]]) as u64)
-}
-
-unsafe fn seek(syscalls: &super::SyscallTable, fd: i32, off: u32) {
+unsafe fn seek(syscalls: &super::SyscallTable, fd: i32, off: u32) -> SnapRead<()> {
     let b = off.to_le_bytes();
-    let _ = (syscalls.provider_call)(fd, FS_SEEK, b.as_ptr() as *mut u8, 4);
+    let rc = (syscalls.provider_call)(fd, FS_SEEK, b.as_ptr() as *mut u8, 4);
+    if super::fs_names::pending(rc) {
+        return SnapRead::Pending;
+    }
+    if rc < 0 {
+        return SnapRead::Failed;
+    }
+    SnapRead::Ready(())
 }
 
-unsafe fn read_exact(syscalls: &super::SyscallTable, fd: i32, buf: &mut [u8]) -> bool {
+/// Fill `buf` from the descriptor's offset, while bytes keep moving.
+/// Bounded: every further call has moved at least one byte. A `READ`
+/// answering 0 before `buf` is full is the end of a file that its own
+/// header says is longer — a torn or replaced file, so a failure.
+///
+/// SAFETY: `syscalls` must be a valid provider table.
+unsafe fn read_exact(syscalls: &super::SyscallTable, fd: i32, buf: &mut [u8]) -> SnapRead<()> {
     let mut filled = 0usize;
     while filled < buf.len() {
-        let n = (syscalls.provider_call)(
-            fd,
-            FS_READ,
-            buf.as_mut_ptr().add(filled),
-            buf.len() - filled,
-        );
-        if n <= 0 {
-            return false;
+        let want = buf.len() - filled;
+        let n = (syscalls.provider_call)(fd, FS_READ, buf.as_mut_ptr().add(filled), want);
+        if super::fs_names::pending(n) {
+            return SnapRead::Pending;
         }
-        filled += n as usize;
+        if n <= 0 {
+            return SnapRead::Failed;
+        }
+        // Clamped: a provider reporting more than it was offered must
+        // not walk the cursor past the buffer.
+        filled += (n as usize).min(want);
     }
-    true
+    SnapRead::Ready(())
 }
 
 /// An open, validated snapshot: fd + record count + generation.
@@ -232,88 +286,274 @@ pub struct OpenSnapshot {
     pub generation: u64,
 }
 
-/// Open ONE generation file and validate header vs size. Returns
-/// None (fd closed) if missing or torn.
-///
-/// SAFETY: valid syscalls table; path is a live byte slice.
-pub unsafe fn snap_open_one(syscalls: &super::SyscallTable, path: &[u8]) -> Option<OpenSnapshot> {
-    let fd = (syscalls.provider_call)(-1, FS_OPEN, path.as_ptr() as *mut u8, path.len());
-    if fd < 0 {
-        return None;
+impl OpenSnapshot {
+    pub const fn none() -> Self {
+        Self {
+            fd: -1,
+            count: 0,
+            generation: 0,
+        }
     }
-    let mut hdr = [0u8; SNAP_HDR];
-    seek(syscalls, fd, 0);
-    if !read_exact(syscalls, fd, &mut hdr) {
-        let _ = (syscalls.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        return None;
-    }
-    let magic = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
-    let count = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
-    let generation = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
-    let expect = SNAP_HDR as u64 + count as u64 * REC_SIZE as u64;
-    if magic != SNAP_MAGIC || stat_size(syscalls, fd) != Some(expect) {
-        let _ = (syscalls.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        return None;
-    }
-    Some(OpenSnapshot {
-        fd,
-        count,
-        generation,
-    })
 }
 
-/// Open the best (highest-generation valid) snapshot for
-/// `wal_path`, returning it plus which slot (0/1) it lives in.
+/// Outcome of one `SnapOpener::poll`.
+#[derive(Clone, Copy)]
+pub enum SnapOpenPoll {
+    /// Not decided yet. Poll again on a later step, with the same path.
+    Pending,
+    /// Open and validated.
+    Opened(OpenSnapshot),
+    /// Missing, torn, of another capacity profile, or unreadable. Any
+    /// fd the opener held is closed.
+    Invalid,
+}
+
+const SO_OPEN: u8 = 0;
+const SO_SEEK: u8 = 1;
+const SO_HDR: u8 = 2;
+const SO_STAT: u8 = 3;
+
+/// One generation file being opened and validated. Zeroed memory is a
+/// valid opener that has not started.
 ///
-/// SAFETY: valid syscalls table.
-pub unsafe fn snap_open_best(
-    syscalls: &super::SyscallTable,
-    wal_path: &[u8],
-) -> Option<(OpenSnapshot, u8)> {
-    let mut path = [0u8; 300];
-    let mut best: Option<(OpenSnapshot, u8)> = None;
-    for which in 0..2u8 {
-        let n = snap_path(wal_path, which, &mut path);
-        if n == 0 {
-            continue;
+/// `OPEN`, `SEEK`, `READ` and `STAT` may each answer `EAGAIN`; the
+/// opener stops there with its place kept and resumes on the next poll.
+/// Only a decided answer moves it on, so a provider still fetching is
+/// never read as a missing file.
+#[repr(C)]
+pub struct SnapOpener {
+    phase: u8,
+    /// The descriptor, biased by one so zeroed memory holds none.
+    fd_plus1: i32,
+    /// The header, once read whole; validated against the size.
+    hdr: [u8; SNAP_HDR],
+}
+
+impl SnapOpener {
+    pub const fn new() -> Self {
+        Self {
+            phase: SO_OPEN,
+            fd_plus1: 0,
+            hdr: [0u8; SNAP_HDR],
         }
-        if let Some(s) = snap_open_one(syscalls, &path[..n]) {
-            match best {
-                Some((b, _)) if b.generation >= s.generation => {
-                    let _ = (syscalls.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    }
+
+    /// Drive the open of `path` one step further.
+    ///
+    /// SAFETY: valid syscalls table; `path` is the same on every poll of
+    /// one open.
+    pub unsafe fn poll(&mut self, syscalls: &super::SyscallTable, path: &[u8]) -> SnapOpenPoll {
+        loop {
+            match self.phase {
+                SO_OPEN => {
+                    let fd =
+                        (syscalls.provider_call)(-1, FS_OPEN, path.as_ptr() as *mut u8, path.len());
+                    if super::fs_names::pending(fd) {
+                        return SnapOpenPoll::Pending;
+                    }
+                    if fd < 0 {
+                        // A decided refusal: the generation is absent.
+                        *self = Self::new();
+                        return SnapOpenPoll::Invalid;
+                    }
+                    self.fd_plus1 = fd + 1;
+                    self.phase = SO_SEEK;
                 }
-                Some((b, _)) => {
-                    let _ = (syscalls.provider_call)(b.fd, FS_CLOSE, core::ptr::null_mut(), 0);
-                    best = Some((s, which));
+                SO_SEEK => match seek(syscalls, self.fd_plus1 - 1, 0) {
+                    SnapRead::Ready(()) => self.phase = SO_HDR,
+                    SnapRead::Pending => return SnapOpenPoll::Pending,
+                    SnapRead::Failed => return self.invalid(syscalls),
+                },
+                SO_HDR => {
+                    // An `EAGAIN` consumed nothing, but a short count
+                    // before it moved the offset, so a re-ask starts
+                    // again from the seek.
+                    let mut hdr = [0u8; SNAP_HDR];
+                    match read_exact(syscalls, self.fd_plus1 - 1, &mut hdr) {
+                        SnapRead::Ready(()) => {}
+                        SnapRead::Pending => {
+                            self.phase = SO_SEEK;
+                            return SnapOpenPoll::Pending;
+                        }
+                        SnapRead::Failed => return self.invalid(syscalls),
+                    }
+                    self.hdr = hdr;
+                    self.phase = SO_STAT;
                 }
-                None => best = Some((s, which)),
+                _ => {
+                    let h = self.hdr;
+                    let magic = u32::from_le_bytes([h[0], h[1], h[2], h[3]]);
+                    let count = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
+                    let generation =
+                        u64::from_le_bytes([h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]]);
+                    if magic != SNAP_MAGIC {
+                        return self.invalid(syscalls);
+                    }
+                    let mut stat = [0u8; 8];
+                    let rc = (syscalls.provider_call)(
+                        self.fd_plus1 - 1,
+                        FS_STAT,
+                        stat.as_mut_ptr(),
+                        stat.len(),
+                    );
+                    if super::fs_names::pending(rc) {
+                        return SnapOpenPoll::Pending;
+                    }
+                    if rc < 0 {
+                        return self.invalid(syscalls);
+                    }
+                    let size = u32::from_le_bytes([stat[0], stat[1], stat[2], stat[3]]) as u64;
+                    let expect = SNAP_HDR as u64 + count as u64 * REC_SIZE as u64;
+                    if size != expect {
+                        return self.invalid(syscalls);
+                    }
+                    let snap = OpenSnapshot {
+                        fd: self.fd_plus1 - 1,
+                        count,
+                        generation,
+                    };
+                    *self = Self::new();
+                    return SnapOpenPoll::Opened(snap);
+                }
             }
         }
     }
-    best
+
+    unsafe fn invalid(&mut self, syscalls: &super::SyscallTable) -> SnapOpenPoll {
+        self.abandon(syscalls);
+        SnapOpenPoll::Invalid
+    }
+
+    /// Give up an open in flight, closing any fd it holds. A read-only
+    /// descriptor owes no fence.
+    ///
+    /// SAFETY: valid syscalls table.
+    pub unsafe fn abandon(&mut self, syscalls: &super::SyscallTable) {
+        if self.fd_plus1 > 0 {
+            let _ = (syscalls.provider_call)(self.fd_plus1 - 1, FS_CLOSE, core::ptr::null_mut(), 0);
+        }
+        *self = Self::new();
+    }
 }
 
-/// Read record `idx`.
+/// Outcome of one `SnapBestOpener::poll`.
+#[derive(Clone, Copy)]
+pub enum BestPoll {
+    Pending,
+    /// Both generations decided: the best valid one and its slot, or
+    /// none.
+    Done(Option<(OpenSnapshot, u8)>),
+}
+
+/// Opens the best (highest-generation valid) snapshot for a WAL path,
+/// one generation after the other, across as many steps as the provider
+/// needs. Zeroed memory is a valid opener that has not started.
+#[repr(C)]
+pub struct SnapBestOpener {
+    which: u8,
+    has_best: u8,
+    best_slot: u8,
+    best: OpenSnapshot,
+    one: SnapOpener,
+}
+
+impl SnapBestOpener {
+    pub const fn new() -> Self {
+        Self {
+            which: 0,
+            has_best: 0,
+            best_slot: 0,
+            best: OpenSnapshot::none(),
+            one: SnapOpener::new(),
+        }
+    }
+
+    /// SAFETY: valid syscalls table; `wal_path` is the same on every
+    /// poll of one open.
+    pub unsafe fn poll(&mut self, syscalls: &super::SyscallTable, wal_path: &[u8]) -> BestPoll {
+        let mut path = [0u8; SNAP_PATH_MAX];
+        while self.which < 2 {
+            let n = snap_path(wal_path, self.which, &mut path);
+            let Some(p) = path.get(..n).filter(|p| !p.is_empty()) else {
+                self.which += 1;
+                continue;
+            };
+            match self.one.poll(syscalls, p) {
+                SnapOpenPoll::Pending => return BestPoll::Pending,
+                SnapOpenPoll::Invalid => {}
+                SnapOpenPoll::Opened(s) => {
+                    if self.has_best != 0 && self.best.generation >= s.generation {
+                        let _ = (syscalls.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+                    } else {
+                        if self.has_best != 0 {
+                            let _ = (syscalls.provider_call)(
+                                self.best.fd,
+                                FS_CLOSE,
+                                core::ptr::null_mut(),
+                                0,
+                            );
+                        }
+                        self.best = s;
+                        self.best_slot = self.which;
+                        self.has_best = 1;
+                    }
+                }
+            }
+            self.which += 1;
+        }
+        let out = if self.has_best != 0 {
+            Some((self.best, self.best_slot))
+        } else {
+            None
+        };
+        *self = Self::new();
+        BestPoll::Done(out)
+    }
+
+    /// Give up, closing everything held.
+    ///
+    /// SAFETY: valid syscalls table.
+    pub unsafe fn abandon(&mut self, syscalls: &super::SyscallTable) {
+        self.one.abandon(syscalls);
+        if self.has_best != 0 {
+            let _ = (syscalls.provider_call)(self.best.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        }
+        *self = Self::new();
+    }
+}
+
+/// Read record `idx`. `Failed` for an index past the end.
 ///
 /// SAFETY: valid syscalls table; `snap.fd` open.
 pub unsafe fn snap_read_at(
     syscalls: &super::SyscallTable,
     snap: &OpenSnapshot,
     idx: u32,
-) -> Option<SnapRecord> {
+) -> SnapRead<SnapRecord> {
     if idx >= snap.count {
-        return None;
+        return SnapRead::Failed;
     }
-    seek(syscalls, snap.fd, SNAP_HDR as u32 + idx * REC_SIZE as u32);
+    match seek(syscalls, snap.fd, SNAP_HDR as u32 + idx * REC_SIZE as u32) {
+        SnapRead::Ready(()) => {}
+        SnapRead::Pending => return SnapRead::Pending,
+        SnapRead::Failed => return SnapRead::Failed,
+    }
     let mut buf = [0u8; REC_SIZE];
-    if !read_exact(syscalls, snap.fd, &mut buf) {
-        return None;
+    match read_exact(syscalls, snap.fd, &mut buf) {
+        SnapRead::Ready(()) => {}
+        SnapRead::Pending => return SnapRead::Pending,
+        SnapRead::Failed => return SnapRead::Failed,
     }
-    SnapRecord::decode(&buf)
+    match SnapRecord::decode(&buf) {
+        Some(r) => SnapRead::Ready(r),
+        None => SnapRead::Failed,
+    }
 }
 
 /// Binary-search for the record keyed `(root, path)`: ~log2(count)
-/// seeks.
+/// seeks. `Ready(None)` is a decided absence; a probe still being
+/// fetched answers `Pending` for the whole search, which the caller
+/// asks again — the probes before it are cached by then.
 ///
 /// SAFETY: valid syscalls table; `snap.fd` open.
 pub unsafe fn snap_search(
@@ -321,23 +561,26 @@ pub unsafe fn snap_search(
     snap: &OpenSnapshot,
     root: &[u8],
     path: &[u8],
-) -> Option<SnapRecord> {
+) -> SnapRead<Option<SnapRecord>> {
     let (mut lo, mut hi) = (0u32, snap.count);
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let rec = snap_read_at(syscalls, snap, mid)?;
+        let rec = match snap_read_at(syscalls, snap, mid) {
+            SnapRead::Ready(r) => r,
+            SnapRead::Pending => return SnapRead::Pending,
+            SnapRead::Failed => return SnapRead::Failed,
+        };
         match rec.cmp_key(root, path) {
-            core::cmp::Ordering::Equal => return Some(rec),
+            core::cmp::Ordering::Equal => return SnapRead::Ready(Some(rec)),
             core::cmp::Ordering::Less => lo = mid + 1,
             core::cmp::Ordering::Greater => hi = mid,
         }
     }
-    None
+    SnapRead::Ready(None)
 }
 
 /// Index of the first record whose key sorts strictly after
-/// `(root, after)`: where a name-ordered listing resumes. `None` when a
-/// probe cannot be read.
+/// `(root, after)`: where a name-ordered listing resumes.
 ///
 /// SAFETY: valid syscalls table; `snap.fd` open.
 pub unsafe fn snap_seek_after(
@@ -345,98 +588,365 @@ pub unsafe fn snap_seek_after(
     snap: &OpenSnapshot,
     root: &[u8],
     after: &[u8],
-) -> Option<u32> {
+) -> SnapRead<u32> {
     let (mut lo, mut hi) = (0u32, snap.count);
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let rec = snap_read_at(syscalls, snap, mid)?;
+        let rec = match snap_read_at(syscalls, snap, mid) {
+            SnapRead::Ready(r) => r,
+            SnapRead::Pending => return SnapRead::Pending,
+            SnapRead::Failed => return SnapRead::Failed,
+        };
         if rec.cmp_key(root, after) == core::cmp::Ordering::Greater {
             hi = mid;
         } else {
             lo = mid + 1;
         }
     }
-    Some(lo)
+    SnapRead::Ready(lo)
 }
+
+// ── Resumable writer ───────────────────────────────────────────────
+//
+// Writing a generation is a sequence of calls none of which decides on
+// the device inside the call: `UNLINK`, `OPEN_CREATE`, `FSYNC` and
+// `FSYNC_NAME` may answer `EINPROGRESS` (re-asked byte-identically on a
+// later step until they decide), `WRITE` moves a short count or answers
+// `EAGAIN`, and `SEEK` may answer `EAGAIN`. So the writer is a step
+// machine held in the caller's state, and it owns the bytes it has
+// staged: a record handed to `WRITE` is the provider's only for the
+// prefix it accepted, so the rest stays here until it is taken.
+//
+//   open    UNLINK → OPEN_CREATE → placeholder header
+//   append  one record staged at a time, written across steps
+//   finish  FSYNC → SEEK 0 → real header → FSYNC → FSYNC_NAME → CLOSE
+//
+// `CLOSE` reports no writeback failure, so the generation is durable
+// only on the fences before it. `FSYNC` covers the file's bytes and
+// size; `FSYNC_NAME` covers the directory entry `OPEN_CREATE` minted,
+// without which a power cut could leave the generation's name absent
+// after the WAL that held its records has been rotated away.
+
+/// Outcome of one writer poll.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WritePoll {
+    /// Not decided yet. Poll again on a later step.
+    Pending,
+    /// This stage is done.
+    Ready,
+    /// The generation cannot be written. Abandon it.
+    Failed,
+}
+
+const W_IDLE: u8 = 0;
+const W_UNLINK: u8 = 1;
+const W_CREATE: u8 = 2;
+const W_PLACEHOLDER: u8 = 3;
+const W_RECORDS: u8 = 4;
+const W_FSYNC_RECORDS: u8 = 5;
+const W_SEEK: u8 = 6;
+const W_HEADER: u8 = 7;
+const W_FSYNC_HEADER: u8 = 8;
+const W_NAME: u8 = 9;
+const W_DONE: u8 = 10;
 
 /// Streaming snapshot writer (used by the incremental compactor).
-#[derive(Clone, Copy)]
+/// Zeroed memory is a valid idle writer.
+#[repr(C)]
 pub struct SnapWriter {
-    pub fd: i32,
+    /// The generation file's descriptor, biased by one so zeroed memory
+    /// holds none.
+    fd_plus1: i32,
+    /// Records staged so far, the one in `stage` included.
     pub count: u32,
     pub generation: u64,
+    phase: u8,
+    path_len: u16,
+    path: [u8; SNAP_PATH_MAX],
+    /// Bytes owed to the file: `stage[written..len]` is not yet taken.
+    stage_len: u32,
+    stage_written: u32,
+    stage: [u8; REC_SIZE],
 }
 
-/// Create/truncate the target generation file and write a
-/// placeholder header (finalized by `snap_writer_finish`).
-///
-/// SAFETY: valid syscalls table.
-pub unsafe fn snap_writer_start(
-    syscalls: &super::SyscallTable,
-    path: &[u8],
-    generation: u64,
-) -> Option<SnapWriter> {
-    // Truncate-by-recreate: a stale longer file would fail the
-    // size validation later, but start clean anyway.
-    let _ = (syscalls.provider_call)(-1, FS_UNLINK, path.as_ptr() as *mut u8, path.len());
-    let fd = (syscalls.provider_call)(-1, FS_OPEN_CREATE, path.as_ptr() as *mut u8, path.len());
-    if fd < 0 {
-        return None;
+impl SnapWriter {
+    pub const fn new() -> Self {
+        Self {
+            fd_plus1: 0,
+            count: 0,
+            generation: 0,
+            phase: W_IDLE,
+            path_len: 0,
+            path: [0u8; SNAP_PATH_MAX],
+            stage_len: 0,
+            stage_written: 0,
+            stage: [0u8; REC_SIZE],
+        }
     }
-    // Placeholder header with an INVALID magic: an unfinished
-    // generation must never be openable — a crash right after
-    // start would otherwise leave a byte-valid EMPTY snapshot
-    // whose higher generation outranks the real one. The true
-    // header (magic + count + generation) lands only in
-    // `snap_writer_finish`, after the records are fsynced.
-    let mut hdr = [0u8; SNAP_HDR];
-    let w = (syscalls.provider_call)(fd, FS_WRITE, hdr.as_mut_ptr(), SNAP_HDR);
-    if w != SNAP_HDR as i32 {
-        let _ = (syscalls.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        return None;
-    }
-    Some(SnapWriter {
-        fd,
-        count: 0,
-        generation,
-    })
-}
 
-/// SAFETY: valid syscalls table; writer started.
-pub unsafe fn snap_writer_append(
-    syscalls: &super::SyscallTable,
-    w: &mut SnapWriter,
-    rec: &SnapRecord,
-) -> bool {
-    let mut buf = [0u8; REC_SIZE];
-    if !rec.encode(&mut buf) {
-        return false;
+    /// True from `start` until the writer finishes or is abandoned.
+    pub fn busy(&self) -> bool {
+        self.phase != W_IDLE
     }
-    let n = (syscalls.provider_call)(w.fd, FS_WRITE, buf.as_mut_ptr(), REC_SIZE);
-    if n != REC_SIZE as i32 {
-        return false;
-    }
-    w.count += 1;
-    true
-}
 
-/// Finalize: fsync records, write the real header (count), fsync,
-/// close. After this returns true the generation is durable.
-///
-/// SAFETY: valid syscalls table; writer started.
-pub unsafe fn snap_writer_finish(syscalls: &super::SyscallTable, w: &mut SnapWriter) -> bool {
-    if (syscalls.provider_call)(w.fd, FS_FSYNC, core::ptr::null_mut(), 0) < 0 {
-        let _ = (syscalls.provider_call)(w.fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        return false;
+    /// Arm a new generation at `path`. Nothing is asked of the
+    /// provider until `poll_open`. False when `path` does not fit or a
+    /// generation is already in flight.
+    pub fn start(&mut self, path: &[u8], generation: u64) -> bool {
+        if self.phase != W_IDLE || path.is_empty() || path.len() > SNAP_PATH_MAX {
+            return false;
+        }
+        for (d, b) in self.path.iter_mut().zip(path.iter()) {
+            *d = *b;
+        }
+        self.path_len = path.len() as u16;
+        self.fd_plus1 = 0;
+        self.count = 0;
+        self.generation = generation;
+        self.stage_len = 0;
+        self.stage_written = 0;
+        self.phase = W_UNLINK;
+        true
     }
-    seek(syscalls, w.fd, 0);
-    let mut hdr = [0u8; SNAP_HDR];
-    hdr[0..4].copy_from_slice(&SNAP_MAGIC.to_le_bytes());
-    hdr[4..8].copy_from_slice(&w.count.to_le_bytes());
-    hdr[8..16].copy_from_slice(&w.generation.to_le_bytes());
-    let ok = (syscalls.provider_call)(w.fd, FS_WRITE, hdr.as_mut_ptr(), SNAP_HDR)
-        == SNAP_HDR as i32
-        && (syscalls.provider_call)(w.fd, FS_FSYNC, core::ptr::null_mut(), 0) >= 0;
-    let _ = (syscalls.provider_call)(w.fd, FS_CLOSE, core::ptr::null_mut(), 0);
-    ok
+
+    fn path(&self) -> &[u8] {
+        let n = (self.path_len as usize).min(SNAP_PATH_MAX);
+        self.path.get(..n).unwrap_or(&[])
+    }
+
+    /// Stage `bytes` (at most `REC_SIZE`) as the next bytes owed.
+    fn stage_bytes(&mut self, bytes: &[u8]) {
+        let n = bytes.len().min(REC_SIZE);
+        for (d, b) in self.stage.iter_mut().zip(bytes.iter()) {
+            *d = *b;
+        }
+        self.stage_len = n as u32;
+        self.stage_written = 0;
+    }
+
+    /// Hand the provider what it has not taken of the staged bytes,
+    /// while bytes keep moving. `Ready` once all of them are taken.
+    unsafe fn drain_stage(&mut self, syscalls: &super::SyscallTable) -> WritePoll {
+        let len = (self.stage_len as usize).min(REC_SIZE);
+        while (self.stage_written as usize) < len {
+            let off = self.stage_written as usize;
+            let want = len - off;
+            let rc = (syscalls.provider_call)(
+                self.fd_plus1 - 1,
+                FS_WRITE,
+                self.stage.as_mut_ptr().add(off),
+                want,
+            );
+            // `EAGAIN` only when nothing moved: offer the same tail on a
+            // later step.
+            if super::fs_names::pending(rc) {
+                return WritePoll::Pending;
+            }
+            if rc <= 0 {
+                // An error, or a provider refusing without saying why:
+                // nothing to wait for either way.
+                return WritePoll::Failed;
+            }
+            // Clamped: a provider reporting more than it was offered
+            // must not walk the cursor past the stage.
+            self.stage_written += (rc as usize).min(want) as u32;
+        }
+        self.stage_len = 0;
+        self.stage_written = 0;
+        WritePoll::Ready
+    }
+
+    /// Create (or recreate) the generation file and write its
+    /// placeholder header. `Ready` once records may be appended.
+    ///
+    /// SAFETY: valid syscalls table.
+    pub unsafe fn poll_open(&mut self, syscalls: &super::SyscallTable) -> WritePoll {
+        loop {
+            match self.phase {
+                W_UNLINK => {
+                    // Truncate-by-recreate: `OPEN_CREATE` does not
+                    // truncate, and a stale longer file would fail the
+                    // size validation later. A decided refusal — gone
+                    // already, or a provider that cannot unlink — is
+                    // not fatal: validation catches a stale tail.
+                    let rc = super::fs_names::unlink(syscalls.provider_call, self.path());
+                    if super::fs_names::pending(rc) {
+                        return WritePoll::Pending;
+                    }
+                    self.phase = W_CREATE;
+                }
+                W_CREATE => {
+                    let p = self.path();
+                    let fd = (syscalls.provider_call)(
+                        -1,
+                        FS_OPEN_CREATE,
+                        p.as_ptr() as *mut u8,
+                        p.len(),
+                    );
+                    if super::fs_names::pending(fd) {
+                        return WritePoll::Pending;
+                    }
+                    if fd < 0 {
+                        self.phase = W_IDLE;
+                        return WritePoll::Failed;
+                    }
+                    self.fd_plus1 = fd + 1;
+                    // Placeholder header with an INVALID magic: an
+                    // unfinished generation must never be openable — a
+                    // crash right after start would otherwise leave a
+                    // byte-valid EMPTY snapshot whose higher generation
+                    // outranks the real one. The true header (magic +
+                    // count + generation) lands only in `poll_finish`,
+                    // after the records are fsynced.
+                    self.stage_bytes(&[0u8; SNAP_HDR]);
+                    self.phase = W_PLACEHOLDER;
+                }
+                W_PLACEHOLDER => match self.drain_stage(syscalls) {
+                    WritePoll::Ready => {
+                        self.phase = W_RECORDS;
+                        return WritePoll::Ready;
+                    }
+                    other => return other,
+                },
+                W_RECORDS => return WritePoll::Ready,
+                _ => return WritePoll::Failed,
+            }
+        }
+    }
+
+    /// Whether a record can be staged now: the file is open and the
+    /// previous record has been taken whole.
+    pub fn can_stage(&self) -> bool {
+        self.phase == W_RECORDS && self.stage_len == 0
+    }
+
+    /// Stage one record. The bytes are the writer's until the provider
+    /// takes them; `flush` hands them over. False when `can_stage` is
+    /// not true or the record does not encode.
+    pub fn stage_record(&mut self, rec: &SnapRecord) -> bool {
+        if !self.can_stage() {
+            return false;
+        }
+        if !rec.encode(&mut self.stage) {
+            return false;
+        }
+        self.stage_len = REC_SIZE as u32;
+        self.stage_written = 0;
+        self.count += 1;
+        true
+    }
+
+    /// Drive a staged record into the file. `Ready` when nothing is
+    /// owed.
+    ///
+    /// SAFETY: valid syscalls table.
+    pub unsafe fn flush(&mut self, syscalls: &super::SyscallTable) -> WritePoll {
+        if self.phase != W_RECORDS {
+            return WritePoll::Failed;
+        }
+        self.drain_stage(syscalls)
+    }
+
+    /// Finalize: fsync records, write the real header (count), fsync,
+    /// fence the name, close. `Ready` means the generation is durable
+    /// under its name and the file is closed.
+    ///
+    /// SAFETY: valid syscalls table.
+    pub unsafe fn poll_finish(&mut self, syscalls: &super::SyscallTable) -> WritePoll {
+        loop {
+            match self.phase {
+                W_RECORDS => {
+                    match self.drain_stage(syscalls) {
+                        WritePoll::Ready => {}
+                        other => return other,
+                    }
+                    self.phase = W_FSYNC_RECORDS;
+                }
+                W_FSYNC_RECORDS | W_FSYNC_HEADER => {
+                    // Re-asked byte-identically (same fd, no arg) until
+                    // it decides.
+                    let rc = (syscalls.provider_call)(
+                        self.fd_plus1 - 1,
+                        FS_FSYNC,
+                        core::ptr::null_mut(),
+                        0,
+                    );
+                    if super::fs_names::pending(rc) {
+                        return WritePoll::Pending;
+                    }
+                    if rc < 0 {
+                        return WritePoll::Failed;
+                    }
+                    self.phase = if self.phase == W_FSYNC_RECORDS {
+                        W_SEEK
+                    } else {
+                        W_NAME
+                    };
+                }
+                W_SEEK => {
+                    match seek(syscalls, self.fd_plus1 - 1, 0) {
+                        SnapRead::Ready(()) => {}
+                        SnapRead::Pending => return WritePoll::Pending,
+                        SnapRead::Failed => return WritePoll::Failed,
+                    }
+                    let mut hdr = [0u8; SNAP_HDR];
+                    let magic = SNAP_MAGIC.to_le_bytes();
+                    let count = self.count.to_le_bytes();
+                    let generation = self.generation.to_le_bytes();
+                    for (d, b) in hdr
+                        .iter_mut()
+                        .zip(magic.iter().chain(count.iter()).chain(generation.iter()))
+                    {
+                        *d = *b;
+                    }
+                    self.stage_bytes(&hdr);
+                    self.phase = W_HEADER;
+                }
+                W_HEADER => {
+                    match self.drain_stage(syscalls) {
+                        WritePoll::Ready => {}
+                        other => return other,
+                    }
+                    self.phase = W_FSYNC_HEADER;
+                }
+                W_NAME => {
+                    let rc = super::fs_names::fsync_name(syscalls.provider_call, self.path());
+                    if super::fs_names::pending(rc) {
+                        return WritePoll::Pending;
+                    }
+                    if rc < 0 {
+                        return WritePoll::Failed;
+                    }
+                    // Every fence is down; closing owes nothing now.
+                    let _ = (syscalls.provider_call)(
+                        self.fd_plus1 - 1,
+                        FS_CLOSE,
+                        core::ptr::null_mut(),
+                        0,
+                    );
+                    self.fd_plus1 = 0;
+                    self.phase = W_DONE;
+                }
+                W_DONE => {
+                    self.phase = W_IDLE;
+                    return WritePoll::Ready;
+                }
+                _ => return WritePoll::Failed,
+            }
+        }
+    }
+
+    /// Give up on the generation, closing its file. Nothing durable is
+    /// claimed for it: its placeholder header keeps it unopenable.
+    ///
+    /// SAFETY: valid syscalls table.
+    pub unsafe fn abandon(&mut self, syscalls: &super::SyscallTable) {
+        if self.fd_plus1 > 0 {
+            let _ = (syscalls.provider_call)(self.fd_plus1 - 1, FS_CLOSE, core::ptr::null_mut(), 0);
+        }
+        self.fd_plus1 = 0;
+        self.stage_len = 0;
+        self.stage_written = 0;
+        self.phase = W_IDLE;
+    }
 }

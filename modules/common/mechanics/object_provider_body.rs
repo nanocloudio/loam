@@ -38,6 +38,19 @@
 // again is a second look at the same request, never a second request.
 // `PUT_STREAMED_OPEN` and `PUT_STREAMED_WRITE` decide inside the call.
 //
+// The spool is fs work, and no fs call waits: each answers now, `EAGAIN`
+// (ask again), or `EINPROGRESS` (taken; ask again, byte-identical). A
+// spool's sequence — clear a stale file of its name, create it, write it,
+// rewind it, read it back, remove it — is therefore a state held with it
+// (`Spool`) that the step resumes where it stopped. `PUT_STREAMED_OPEN`
+// answers its handle while the file is still being made; the bytes a
+// write hands over before the file can take them wait in the module's
+// spill, in order. A write the file and the spill both cannot take now
+// answers `EAGAIN` with nothing taken. `PUT_STREAMED_COMMIT` answers
+// `EINPROGRESS` meanwhile, as it does for the gate. The spool is scratch
+// the upload reads back on this node; nothing relies on it surviving a
+// crash, so it is never fenced.
+//
 // A write reports the fence the namespace achieved for its bind, which
 // the admin plane's answer carries: `ReplicatedDurable` with the commit's
 // proof, `LocalDurable` behind a WAL. This module claims nothing of its
@@ -76,6 +89,9 @@ const ETAG_LEN: usize = 32;
 /// to it: `/loam-`, a tag, the slot and generation in hex, `.spool`.
 pub const SPOOL_DIR_MAX: usize = 192;
 const SPOOL_NAME_MAX: usize = SPOOL_DIR_MAX + 24;
+/// The spill: bytes streams handed over that their spool files have not
+/// taken yet. One body's worth, held by one spool at a time.
+const SPILL_MAX: usize = MAX_BODY;
 /// Entries one listing page holds: the admin wire's page.
 const PAGE_KEYS: usize = aw::LIST_PAGE_MAX;
 /// A listing page as this module holds it: the contract's layout,
@@ -89,6 +105,7 @@ const RX_MAX: usize = 4 + aw::RESPONSE_MAX;
 const FENCE_LEN: usize = super::abi::fence::WIRE_MAX_LEN;
 
 // errno
+const E_NOENT: i32 = -2;
 const E_IO: i32 = -5;
 const E_NXIO: i32 = -6;
 const E_AGAIN: i32 = -11;
@@ -103,8 +120,8 @@ const E_NOSYS: i32 = -38;
 const E_OVERFLOW: i32 = -75;
 
 // fs
-const FS_OPEN: u32 = 0x0900;
 const FS_READ: u32 = 0x0901;
+const FS_SEEK: u32 = 0x0902;
 const FS_CLOSE: u32 = 0x0903;
 const FS_WRITE: u32 = 0x0906;
 const FS_OPEN_CREATE: u32 = 0x0909;
@@ -205,6 +222,57 @@ const U_COMMIT: u8 = 3;
 /// digest names no object here.
 const MODE_NEVER: u8 = 0xFF;
 
+/// No spool file, and nothing of one left to remove.
+const SP_NONE: u8 = 0;
+/// Clearing a stale file of its name: `UNLINK`, asked until decided.
+const SP_UNLINK: u8 = 1;
+/// `OPEN_CREATE`, asked until decided.
+const SP_CREATE: u8 = 2;
+/// Open for writing; the spill it holds drains into it first.
+const SP_READY: u8 = 3;
+/// Sealed, drained and rewound: the upload reads it from the start.
+const SP_READING: u8 = 4;
+/// Its fs work failed: what it holds is not what was written. Its file
+/// is still removed once it is released.
+const SP_FAILED: u8 = 5;
+/// Released: its file is closed and being removed (`UNLINK`, asked
+/// until decided). The slot holding it is not reused until it is gone.
+const SP_REMOVE: u8 = 6;
+
+/// A spool file and how far its fs work has got. Each state is where its
+/// sequence resumes: a call that answered "not yet" is asked again, with
+/// the same request, on a later step, never started over.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct Spool {
+    pub st: u8,
+    /// Its bytes are all written: once the spill has drained, it is
+    /// rewound for the upload to read back.
+    pub sealed: u8,
+    /// Released while its `OPEN_CREATE` was undecided. That create was
+    /// taken and completes anyway, so it is asked to its decision, and
+    /// the file it made is then closed and removed.
+    pub doomed: u8,
+    /// Holds the module's spill.
+    pub spill: u8,
+    pub fd: i32,
+    pub name: [u8; SPOOL_NAME_MAX],
+    pub len: u16,
+}
+
+/// Bytes a stream took that its spool file has not yet: written while
+/// the file was still being made, or the tail of a short `WRITE`. The
+/// step drains it into the file ahead of anything written after.
+#[repr(C)]
+pub struct Spill {
+    /// A spool holds it.
+    pub busy: u8,
+    /// `buf[off..len]` is still owed to the file.
+    pub off: u32,
+    pub len: u32,
+    pub buf: [u8; SPILL_MAX],
+}
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct Op {
@@ -243,9 +311,8 @@ pub struct Op {
     pub total: u64,
     pub sent: u64,
     pub digest: [u8; 32],
-    pub fd: i32,
-    pub spool: [u8; SPOOL_NAME_MAX],
-    pub spool_len: u16,
+    /// A streamed write's spool, which the upload reads back.
+    pub spool: Spool,
     // What a lookup answered.
     pub size: u64,
     pub stamp_ms: u64,
@@ -298,9 +365,8 @@ pub struct Stream {
     pub mode: u8,
     pub expect: [u8; OID_LEN],
     pub expect_len: u8,
-    pub fd: i32,
-    pub spool: [u8; SPOOL_NAME_MAX],
-    pub spool_len: u16,
+    pub spool: Spool,
+    /// Bytes taken: in the spool file, or in the spill on their way.
     pub written: u64,
     pub hash: super::Sha256,
 }
@@ -333,6 +399,15 @@ pub struct ModuleState {
     pub rx: [u8; RX_MAX],
     /// A body read from a spool, on its way into `out`.
     pub chunk: [u8; MAX_BODY],
+    /// The upload `chunk` is being read for (its index + 1), or 0. A read
+    /// the file answers short or "not yet" resumes into it next step, so
+    /// one upload holds it until its body is whole.
+    pub chunk_holder: u16,
+    /// Bytes of the held body read so far.
+    pub chunk_len: u32,
+    pub spill: Spill,
+    /// Spool files whose removal failed: left behind in `spool_dir`.
+    pub spool_faults: u32,
     pub sent_records: u32,
     pub answers: u32,
     pub stray_answers: u32,
@@ -434,12 +509,12 @@ pub unsafe fn module_new_impl(
     s.spool_dir_len = spool_dir.len() as u16;
     let mut i = 0;
     while i < STREAMS {
-        s.streams[i].fd = -1;
+        s.streams[i].spool.fd = -1;
         i += 1;
     }
     let mut i = 0;
     while i < PENDING {
-        s.ops[i].fd = -1;
+        s.ops[i].spool.fd = -1;
         i += 1;
     }
     0
@@ -795,7 +870,8 @@ fn alloc_op(
     ask: [u8; 32],
 ) -> Option<usize> {
     let mut i = 0;
-    while i < PENDING && s.ops[i].state != O_FREE {
+    // A free slot whose spool is still being removed is not free yet.
+    while i < PENDING && (s.ops[i].state != O_FREE || s.ops[i].spool.st != SP_NONE) {
         i += 1;
     }
     if i == PENDING {
@@ -826,8 +902,7 @@ fn alloc_op(
     o.mem = 0;
     o.total = 0;
     o.sent = 0;
-    o.fd = -1;
-    o.spool_len = 0;
+    o.spool = spool_none();
     o.size = 0;
     o.stamp_ms = 0;
     o.etag_len = 0;
@@ -835,18 +910,9 @@ fn alloc_op(
 }
 
 unsafe fn free_op(s: &mut ModuleState, i: usize) {
-    if s.ops[i].fd >= 0 {
-        let fd = s.ops[i].fd;
-        let _ = (sys(s).provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        s.ops[i].fd = -1;
-    }
-    if s.ops[i].spool_len != 0 {
-        let n = s.ops[i].spool_len as usize;
-        let mut name = [0u8; SPOOL_NAME_MAX];
-        put(&mut name, &s.ops[i].spool[..n]);
-        let _ = (sys(s).provider_call)(-1, FS_UNLINK, name.as_mut_ptr(), n);
-        s.ops[i].spool_len = 0;
-    }
+    release_chunk(s, i);
+    let sys = s.syscalls;
+    spool_release(sys, &mut s.ops[i].spool, &mut s.spill, &mut s.spool_faults);
     if s.ops[i].list != 0xFF {
         let l = s.ops[i].list as usize;
         s.lists[l].in_use = 0;
@@ -856,6 +922,8 @@ unsafe fn free_op(s: &mut ModuleState, i: usize) {
 }
 
 fn decide(s: &mut ModuleState, i: usize, result: i32) {
+    // A decided upload reads no more of its spool.
+    release_chunk(s, i);
     s.ops[i].state = O_DECIDED;
     s.ops[i].result = result;
     s.ops[i].decided_ms = s.now_ms;
@@ -1431,19 +1499,33 @@ unsafe fn stream_open(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) 
     let Some((mode, elen)) = condition(pre, etag, &mut expect) else {
         return E_INVAL;
     };
+    // A free slot whose old spool is still being removed is not free yet:
+    // "not now" while one is, "no room" when every slot is open.
     let mut i = 0;
-    while i < STREAMS && s.streams[i].in_use != 0 {
+    let mut removing = false;
+    while i < STREAMS && (s.streams[i].in_use != 0 || s.streams[i].spool.st != SP_NONE) {
+        removing |= s.streams[i].in_use == 0;
         i += 1;
     }
     if i == STREAMS {
-        return E_NOMEM;
+        return if removing { E_AGAIN } else { E_NOMEM };
     }
     let gen = next_gen(s);
     let mut name = [0u8; SPOOL_NAME_MAX];
     let n = spool_name(s, b's', i, gen, &mut name);
-    let _ = (sys(s).provider_call)(-1, FS_UNLINK, name.as_mut_ptr(), n);
-    let fd = (sys(s).provider_call)(-1, FS_OPEN_CREATE, name.as_mut_ptr(), n);
-    if fd < 0 {
+    // The spool's file is made now if the fs can decide it now, and by
+    // the step otherwise: the handle is the caller's either way.
+    let sys = s.syscalls;
+    let sp = &mut s.streams[i].spool;
+    *sp = spool_none();
+    sp.name = name;
+    sp.len = n as u16;
+    sp.st = SP_UNLINK;
+    spool_poll(sys, sp, &mut s.spill, &mut s.spool_faults);
+    if sp.st == SP_FAILED {
+        // Decided now: the file cannot be made. A failed create holds no
+        // fd and leaves no file to remove.
+        *sp = spool_none();
         return E_IO;
     }
     let st = &mut s.streams[i];
@@ -1461,9 +1543,6 @@ unsafe fn stream_open(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) 
     st.mode = mode;
     put(&mut st.expect, &expect[..elen]);
     st.expect_len = elen as u8;
-    st.fd = fd;
-    put(&mut st.spool, &name[..n]);
-    st.spool_len = n as u16;
     st.written = 0;
     st.hash = super::Sha256::new();
     handle_of(KIND_STREAM, gen, i)
@@ -1506,6 +1585,238 @@ fn spool_name(
     n
 }
 
+// ── Spools ─────────────────────────────────────────────────────────────────
+
+fn spool_none() -> Spool {
+    Spool {
+        st: SP_NONE,
+        sealed: 0,
+        doomed: 0,
+        spill: 0,
+        fd: -1,
+        name: [0; SPOOL_NAME_MAX],
+        len: 0,
+    }
+}
+
+/// An fs answer that is not a decision: `EAGAIN` (ask again) or
+/// `EINPROGRESS` (taken; ask again with the same request).
+fn fs_pending(rc: i32) -> bool {
+    rc == E_AGAIN || rc == E_INPROGRESS
+}
+
+unsafe fn fs_call(
+    sys: *const super::SyscallTable,
+    handle: i32,
+    op: u32,
+    arg: *mut u8,
+    len: usize,
+) -> i32 {
+    ((*sys).provider_call)(handle, op, arg, len)
+}
+
+fn spill_release(sp: &mut Spool, spill: &mut Spill) {
+    if sp.spill != 0 {
+        sp.spill = 0;
+        spill.busy = 0;
+        spill.off = 0;
+        spill.len = 0;
+    }
+}
+
+/// Hold `bytes` in the spill for `sp`, behind what it already holds
+/// there. False, with nothing taken, when the spill is another spool's
+/// or has no room for all of them.
+fn spill_take(sp: &mut Spool, spill: &mut Spill, bytes: &[u8]) -> bool {
+    let at = if sp.spill != 0 {
+        spill.len as usize
+    } else if spill.busy == 0 {
+        0
+    } else {
+        return false;
+    };
+    let Some(dst) = spill.buf.get_mut(at..at + bytes.len()) else {
+        return false;
+    };
+    put(dst, bytes);
+    if sp.spill == 0 {
+        sp.spill = 1;
+        spill.busy = 1;
+        spill.off = 0;
+    }
+    spill.len = (at + bytes.len()) as u32;
+    true
+}
+
+/// The spool's file no longer holds what was written to it.
+fn spool_fail(sp: &mut Spool, spill: &mut Spill) {
+    spill_release(sp, spill);
+    sp.st = SP_FAILED;
+}
+
+/// The spool has fs work the step must drive.
+fn spool_busy(sp: &Spool) -> bool {
+    match sp.st {
+        SP_UNLINK | SP_CREATE | SP_REMOVE => true,
+        SP_READY => sp.spill != 0 || sp.sealed != 0,
+        _ => false,
+    }
+}
+
+/// Advance the spool's fs work as far as the fs decides now. Every call
+/// that answers "not yet" leaves the state where it is, so the next poll
+/// asks it again with the same request; nothing here waits.
+unsafe fn spool_poll(
+    sys: *const super::SyscallTable,
+    sp: &mut Spool,
+    spill: &mut Spill,
+    faults: &mut u32,
+) {
+    let n = sp.len as usize;
+    if sp.st == SP_UNLINK {
+        let rc = fs_call(sys, -1, FS_UNLINK, sp.name.as_mut_ptr(), n);
+        if fs_pending(rc) {
+            return;
+        }
+        // Removed, never there, or not removable: the create answers for
+        // the file either way.
+        sp.st = SP_CREATE;
+    }
+    if sp.st == SP_CREATE {
+        let rc = fs_call(sys, -1, FS_OPEN_CREATE, sp.name.as_mut_ptr(), n);
+        if fs_pending(rc) {
+            return;
+        }
+        if rc >= 0 {
+            sp.fd = rc;
+            sp.st = SP_READY;
+        } else {
+            sp.st = SP_FAILED;
+        }
+        if sp.doomed != 0 {
+            spool_close(sys, sp);
+            sp.st = SP_REMOVE;
+        }
+    }
+    if sp.st == SP_READY {
+        if sp.spill != 0 {
+            let (off, len) = (spill.off as usize, spill.len as usize);
+            let Some(rest) = spill.buf.get_mut(off..len) else {
+                spool_fail(sp, spill);
+                return;
+            };
+            let want = rest.len();
+            let rc = fs_call(sys, sp.fd, FS_WRITE, rest.as_mut_ptr(), want);
+            if rc > 0 {
+                // A short count moved that much: the rest waits.
+                let moved = if (rc as usize) < want {
+                    rc as usize
+                } else {
+                    want
+                };
+                spill.off = (off + moved) as u32;
+                if off + moved >= len {
+                    spill_release(sp, spill);
+                }
+            } else if rc != 0 && !fs_pending(rc) {
+                spool_fail(sp, spill);
+                return;
+            }
+            if sp.spill != 0 {
+                return;
+            }
+        }
+        if sp.sealed != 0 {
+            // Back to the start for the read-back: the file was opened
+            // read-write, so the fd that wrote it reads it.
+            let mut at = [0u8; 8];
+            let rc = fs_call(sys, sp.fd, FS_SEEK, at.as_mut_ptr(), at.len());
+            if fs_pending(rc) {
+                return;
+            }
+            sp.st = if rc < 0 { SP_FAILED } else { SP_READING };
+        }
+        return;
+    }
+    if sp.st == SP_REMOVE {
+        let rc = fs_call(sys, -1, FS_UNLINK, sp.name.as_mut_ptr(), n);
+        if fs_pending(rc) {
+            return;
+        }
+        if rc < 0 && rc != E_NOENT {
+            *faults = faults.wrapping_add(1);
+        }
+        *sp = spool_none();
+    }
+}
+
+/// Close the spool's fd, if it holds one. `CLOSE` never waits and always
+/// releases it; nothing here needs the bytes to have reached the device.
+unsafe fn spool_close(sys: *const super::SyscallTable, sp: &mut Spool) {
+    if sp.fd >= 0 {
+        let _ = fs_call(sys, sp.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        sp.fd = -1;
+    }
+}
+
+/// Let the spool go: drop what the spill holds for it, close its file and
+/// remove it, as far as the fs decides now; the step finishes the rest.
+/// A create still undecided is asked to its decision first.
+unsafe fn spool_release(
+    sys: *const super::SyscallTable,
+    sp: &mut Spool,
+    spill: &mut Spill,
+    faults: &mut u32,
+) {
+    spill_release(sp, spill);
+    match sp.st {
+        SP_NONE | SP_REMOVE => {}
+        SP_CREATE => sp.doomed = 1,
+        // The removal asks the same `UNLINK` the clearing had asked.
+        SP_UNLINK => sp.st = SP_REMOVE,
+        _ => {
+            spool_close(sys, sp);
+            sp.st = SP_REMOVE;
+        }
+    }
+    if sp.st != SP_NONE {
+        spool_poll(sys, sp, spill, faults);
+    }
+}
+
+/// Drive every spool with fs work owed, held by a stream or an upload,
+/// or left by a slot already freed.
+unsafe fn drive_spools(s: &mut ModuleState) {
+    let sys = s.syscalls;
+    let mut i = 0;
+    while i < STREAMS {
+        if spool_busy(&s.streams[i].spool) {
+            spool_poll(
+                sys,
+                &mut s.streams[i].spool,
+                &mut s.spill,
+                &mut s.spool_faults,
+            );
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < PENDING {
+        if spool_busy(&s.ops[i].spool) {
+            spool_poll(sys, &mut s.ops[i].spool, &mut s.spill, &mut s.spool_faults);
+        }
+        i += 1;
+    }
+}
+
+/// Upload `i` no longer reads into `chunk`.
+fn release_chunk(s: &mut ModuleState, i: usize) {
+    if s.chunk_holder as usize == i + 1 {
+        s.chunk_holder = 0;
+        s.chunk_len = 0;
+    }
+}
+
 unsafe fn stream_of(s: &ModuleState, handle: i32, owner: Owner) -> Result<usize, i32> {
     let (kind, gen, i) = handle_parts(handle);
     if kind != KIND_STREAM || i >= STREAMS || s.streams[i].in_use == 0 || s.streams[i].gen != gen {
@@ -1526,8 +1837,9 @@ unsafe fn stream_write(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8])
         Ok(i) => i,
         Err(e) => return e,
     };
+    let sys = s.syscalls;
     let st = &mut s.streams[i];
-    if st.op != 0xFF || st.decided != 0 || st.fd < 0 {
+    if st.op != 0xFF || st.decided != 0 {
         return E_INVAL;
     }
     if a.is_empty() {
@@ -1536,12 +1848,48 @@ unsafe fn stream_write(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8])
     if st.written + a.len() as u64 > super::body_wire::MAX_STREAM_TOTAL {
         return E_INVAL;
     }
-    let fd = st.fd;
-    let wrote = (sys(s).provider_call)(fd, FS_WRITE, a.as_ptr() as *mut u8, a.len());
-    if wrote < 0 || wrote as usize != a.len() {
-        return E_IO;
+    let spill = &mut s.spill;
+    // What the file still owes goes in first: bytes taken earlier stay
+    // ahead of these.
+    spool_poll(sys, &mut st.spool, spill, &mut s.spool_faults);
+    let sp = &mut st.spool;
+    match sp.st {
+        SP_FAILED => return E_IO,
+        SP_UNLINK | SP_CREATE | SP_READY => {}
+        _ => return E_INVAL,
     }
-    let st = &mut s.streams[i];
+    if sp.st == SP_READY && sp.spill == 0 {
+        let rc = fs_call(sys, sp.fd, FS_WRITE, a.as_ptr() as *mut u8, a.len());
+        let moved = if rc > 0 {
+            if (rc as usize) < a.len() {
+                rc as usize
+            } else {
+                a.len()
+            }
+        } else if rc == 0 || fs_pending(rc) {
+            0
+        } else {
+            spool_fail(sp, spill);
+            return E_IO;
+        };
+        // The prefix the file took is the file's; the rest waits in the
+        // spill, or nothing was taken and the caller asks again.
+        if let Some(rest) = a.get(moved..) {
+            if !rest.is_empty() && !spill_take(sp, spill, rest) {
+                if moved == 0 {
+                    return E_AGAIN;
+                }
+                // Part of the chunk is in the file and the rest has
+                // nowhere to wait: the spool can no longer hold what was
+                // written, so it is not committed.
+                spool_fail(sp, spill);
+                return E_IO;
+            }
+        }
+    } else if !spill_take(sp, spill, a) {
+        // The file cannot take them yet and the spill has no room.
+        return E_AGAIN;
+    }
     st.hash.update(a);
     st.written += a.len() as u64;
     0
@@ -1591,15 +1939,7 @@ unsafe fn stream_commit(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]
         s.streams[i].result = E_AGAIN;
         return E_AGAIN;
     }
-    // Seal the spool and hand it to an upload, which reads it back.
-    let fd = s.streams[i].fd;
-    let _ = (sys(s).provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-    s.streams[i].fd = -1;
-    let n = s.streams[i].spool_len as usize;
-    let mut name = [0u8; SPOOL_NAME_MAX];
-    put(&mut name, &s.streams[i].spool[..n]);
-    let rfd = (sys(s).provider_call)(-1, FS_OPEN, name.as_mut_ptr(), n);
-    if rfd < 0 {
+    if s.streams[i].spool.st == SP_FAILED {
         s.streams[i].decided = 1;
         s.streams[i].result = E_IO;
         return E_IO;
@@ -1607,9 +1947,8 @@ unsafe fn stream_commit(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]
     let ask = [0u8; 32];
     let g = s.streams[i].grant as usize;
     let Some(o) = alloc_op(s, K_COMMIT, g, owner, ask) else {
-        // Sealed and not taken: the write is refused, and the caller
-        // backs off and writes it again.
-        let _ = (sys(s).provider_call)(rfd, FS_CLOSE, core::ptr::null_mut(), 0);
+        // Not taken: the write is refused, and the caller backs off and
+        // writes it again.
         s.streams[i].decided = 1;
         s.streams[i].result = E_BUSY;
         return E_BUSY;
@@ -1621,15 +1960,16 @@ unsafe fn stream_commit(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]
     let (mode, expect, el) = (st.mode, st.expect, st.expect_len as usize);
     let total = st.written;
     st.op = o as u8;
-    // The spool now belongs to the upload, which removes it when done.
-    st.spool_len = 0;
+    // The spool, sealed, now belongs to the upload, which drains it,
+    // reads it back and removes it when done. The bytes it still owes
+    // the file, in the spill, go with it.
+    let mut spool = core::mem::replace(&mut st.spool, spool_none());
+    spool.sealed = 1;
     let op = &mut s.ops[o];
     set_write(op, &key[..kl], &ctype[..cl], mode, &expect[..el]);
     op.stream = i as u8;
     op.src = SRC_SPOOL;
-    op.fd = rfd;
-    put(&mut op.spool, &name[..n]);
-    op.spool_len = n as u16;
+    op.spool = spool;
     op.total = total;
     op.digest = digest;
     op.stage = if total as usize <= MAX_BODY {
@@ -1637,6 +1977,8 @@ unsafe fn stream_commit(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]
     } else {
         U_OPEN
     };
+    let sys = s.syscalls;
+    spool_poll(sys, &mut s.ops[o].spool, &mut s.spill, &mut s.spool_faults);
     E_INPROGRESS
 }
 
@@ -1662,18 +2004,13 @@ unsafe fn free_stream(s: &mut ModuleState, i: usize) {
             free_op(s, o);
         }
     }
-    if s.streams[i].fd >= 0 {
-        let fd = s.streams[i].fd;
-        let _ = (sys(s).provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        s.streams[i].fd = -1;
-    }
-    if s.streams[i].spool_len != 0 {
-        let n = s.streams[i].spool_len as usize;
-        let mut name = [0u8; SPOOL_NAME_MAX];
-        put(&mut name, &s.streams[i].spool[..n]);
-        let _ = (sys(s).provider_call)(-1, FS_UNLINK, name.as_mut_ptr(), n);
-        s.streams[i].spool_len = 0;
-    }
+    let sys = s.syscalls;
+    spool_release(
+        sys,
+        &mut s.streams[i].spool,
+        &mut s.spill,
+        &mut s.spool_faults,
+    );
     s.streams[i].in_use = 0;
     s.streams[i].op = 0xFF;
 }
@@ -1693,6 +2030,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     s.now_ms = now_ms(s);
     read_answers(s);
     expire(s);
+    drive_spools(s);
     let mut sent = 0;
     while sent < super::limits::OPS_PER_STEP {
         if s.out_len == 0 && !stage_next(s) {
@@ -1806,7 +2144,8 @@ unsafe fn stage_next(s: &mut ModuleState) -> bool {
 }
 
 /// Build op `i`'s next request into `out`. False when it has none to
-/// send (it was decided instead).
+/// send: it was decided instead, or the spool has not yet given up the
+/// bytes it needs, and it is staged again on a later step.
 unsafe fn stage_op(s: &mut ModuleState, i: usize) -> bool {
     let g = s.ops[i].grant as usize;
     if s.grants[g].state != G_GRANTED {
@@ -1833,10 +2172,11 @@ unsafe fn stage_op(s: &mut ModuleState, i: usize) -> bool {
             };
             match o.stage {
                 U_SINGLE => match upload_bytes(s, i, o.total as usize) {
-                    Some(body) => aw::encode_admin_put_file(
+                    Bytes::Ready(body) => aw::encode_admin_put_file(
                         out, cid, root, path, KIND_FILE, &cond, ctype, body,
                     ),
-                    None => {
+                    Bytes::NotYet => return false,
+                    Bytes::Failed => {
                         decide(s, i, E_IO);
                         return false;
                     }
@@ -1852,8 +2192,9 @@ unsafe fn stage_op(s: &mut ModuleState, i: usize) -> bool {
                         MAX_BODY
                     };
                     match upload_bytes(s, i, n) {
-                        Some(bytes) => aw::encode_put_file_chunk(out, cid, o.pfid, bytes),
-                        None => {
+                        Bytes::Ready(bytes) => aw::encode_put_file_chunk(out, cid, o.pfid, bytes),
+                        Bytes::NotYet => return false,
+                        Bytes::Failed => {
                             decide(s, i, E_IO);
                             return false;
                         }
@@ -1918,27 +2259,71 @@ unsafe fn stage_op(s: &mut ModuleState, i: usize) -> bool {
     }
 }
 
+/// What an upload's next body is.
+enum Bytes {
+    Ready(&'static [u8]),
+    /// The spool is not ready to give it up, or the read has not finished:
+    /// staged again on a later step, resuming where it stopped.
+    NotYet,
+    /// The spool cannot give back what was written.
+    Failed,
+}
+
 /// The next `n` bytes of op `i`'s upload: from the caller's buffer, or
-/// read from the spool into `chunk`.
-unsafe fn upload_bytes(s: &mut ModuleState, i: usize, n: usize) -> Option<&'static [u8]> {
+/// read from the spool into `chunk`. A spool read moves what the fs has
+/// now — a short count or "not yet" keeps what moved in `chunk` for the
+/// next step — and only `0` is the end of the file.
+unsafe fn upload_bytes(s: &mut ModuleState, i: usize, n: usize) -> Bytes {
     let o = &s.ops[i];
     if n == 0 {
-        return Some(&[]);
+        return Bytes::Ready(&[]);
     }
     if o.src == SRC_MEM {
         let p = (o.mem as usize).wrapping_add(o.sent as usize) as *const u8;
-        return Some(core::slice::from_raw_parts(p, n));
+        return Bytes::Ready(core::slice::from_raw_parts(p, n));
     }
-    let fd = o.fd;
-    let mut got = 0usize;
-    while got < n {
-        let rc = (sys(s).provider_call)(fd, FS_READ, s.chunk.as_mut_ptr().add(got), n - got);
-        if rc <= 0 {
-            return None;
+    match o.spool.st {
+        SP_READING => {}
+        SP_UNLINK | SP_CREATE | SP_READY => return Bytes::NotYet,
+        _ => return Bytes::Failed,
+    }
+    let me = (i + 1) as u16;
+    if s.chunk_holder != 0 && s.chunk_holder != me {
+        return Bytes::NotYet;
+    }
+    s.chunk_holder = me;
+    let fd = o.spool.fd;
+    let got = s.chunk_len as usize;
+    if got < n {
+        let Some(dst) = s.chunk.get_mut(got..n) else {
+            return Bytes::Failed;
+        };
+        let want = dst.len();
+        let rc = fs_call(s.syscalls, fd, FS_READ, dst.as_mut_ptr(), want);
+        if fs_pending(rc) {
+            return Bytes::NotYet;
         }
-        got += rc as usize;
+        if rc <= 0 {
+            // A failed read, or the file ended short of what was written.
+            return Bytes::Failed;
+        }
+        let moved = if (rc as usize) < want {
+            rc as usize
+        } else {
+            want
+        };
+        s.chunk_len = (got + moved) as u32;
+        if got + moved < n {
+            return Bytes::NotYet;
+        }
     }
-    Some(&*(&s.chunk[..n] as *const [u8]))
+    // Whole: it goes into `out` now, so the next upload may read.
+    s.chunk_holder = 0;
+    s.chunk_len = 0;
+    match s.chunk.get(..n) {
+        Some(b) => Bytes::Ready(&*(b as *const [u8])),
+        None => Bytes::Failed,
+    }
 }
 
 // ── Answers ────────────────────────────────────────────────────────────────

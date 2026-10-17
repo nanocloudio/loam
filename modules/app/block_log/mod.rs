@@ -28,6 +28,9 @@ mod limits;
 #[path = "../../common/mechanics/loam_log_wire.rs"]
 mod wire;
 
+#[path = "../../common/mechanics/fs_names.rs"]
+mod fs_names;
+
 #[allow(
     dead_code,
     reason = "shared PIC body; each module shim drives a subset"

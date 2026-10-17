@@ -20,7 +20,7 @@ const READ_BUF: usize = super::wire::PUT_RECORD_MAX;
 const REQ_ASM: usize = READ_BUF * (super::limits::OPS_PER_STEP as usize + 1);
 
 /// Inline WAL-path buffer size; see `namespace_pic_body.rs`.
-pub const WAL_PATH_BUF: usize = 256;
+pub const WAL_PATH_BUF: usize = super::limits::WAL_PATH_BUF;
 
 /// The object PIC answers with a 1-byte ack or an encoded get
 /// response; both sit well inside a read buffer.
@@ -59,7 +59,41 @@ pub struct ModuleState {
     pub wal_staged: u8,
     pub wal_path: [u8; WAL_PATH_BUF],
     pub wal_path_len: u16,
+    /// Where the WAL's boot stands (`BOOT_*`). No `fs` call waits on the
+    /// device, so opening and replaying the WAL may each take the
+    /// provider several steps; the module's steps drive them, and no
+    /// request is read until they are done.
+    pub boot: u8,
+    /// A failed boot has been reported as this module's step error.
+    pub boot_reported: u8,
+    /// The WAL's open (create + name fence), resumed across steps.
+    pub opener: super::wal::WalOpener,
+    /// The WAL's replay into the arena, resumed across steps. Its
+    /// partial record lives in the appender's idle frame buffer, which
+    /// no append needs until boot is done.
+    pub replay: super::wal::WalReplay,
+    /// Replayed records the arena refused.
+    pub replay_errors: u32,
 }
+
+/// No WAL boot in progress: one is done, or none is configured.
+pub const BOOT_READY: u8 = 0;
+/// The WAL is being opened (created on first boot, its name fenced).
+pub const BOOT_OPEN: u8 = 1;
+/// The WAL is open and being replayed into the arena.
+pub const BOOT_REPLAY: u8 = 2;
+/// The WAL could not be opened or replayed. The step reports it once
+/// as an error, then refuses every mutation: the arena carries no
+/// durable backing, and an ack would claim one.
+pub const BOOT_FAILED: u8 = 3;
+
+/// Replayed records handed to the arena per step. Bounds a boot step's
+/// work; a long log spans more steps rather than one long one.
+const WAL_REPLAY_PER_STEP: u32 = 64;
+
+/// What a failed WAL boot reports from the step, as `module_new` used
+/// to when it opened the WAL itself.
+const BOOT_FAILED_RC: i32 = -3;
 
 /// Channel-only init. No WAL — arena is the sole state and is lost
 /// across module re-creation.
@@ -73,9 +107,10 @@ pub unsafe fn module_new_impl(
     init_state(in_chan, out_chan, state_ptr, state_size, syscalls)
 }
 
-/// WAL-backed init. Opens a pre-existing WAL via the fluxor `fs`
-/// contract, replays its records into the arena, then leaves the
-/// step body in durable-log mode.
+/// WAL-backed init. Arms the WAL's boot: the steps that follow open it
+/// via the fluxor `fs` contract (creating it on first boot), replay its
+/// records into the arena, then leave the step body in durable-log
+/// mode.
 pub unsafe fn module_new_with_wal_impl(
     in_chan: i32,
     out_chan: i32,
@@ -88,43 +123,26 @@ pub unsafe fn module_new_with_wal_impl(
     if rc != 0 {
         return rc;
     }
-    open_and_replay_wal(state_ptr, wal_path)
+    begin_wal_boot(state_ptr, wal_path)
 }
 
-/// See `namespace_pic_body::open_and_replay_wal`.
-pub unsafe fn open_and_replay_wal(state_ptr: *mut u8, wal_path: &[u8]) -> i32 {
+/// Record `wal_path` as this module's WAL and arm its boot. Nothing is
+/// opened here: the open and the replay run from `module_step_impl`,
+/// which reads no request until both are done. A path that does not
+/// fit is refused now, since no later step could open it.
+pub unsafe fn begin_wal_boot(state_ptr: *mut u8, wal_path: &[u8]) -> i32 {
     if state_ptr.is_null() {
         return -1;
     }
-    let s = &mut *(state_ptr as *mut ModuleState);
-    let sys = match s.syscalls.as_ref() {
-        Some(t) => t,
-        None => return -1,
-    };
-    let fd = match super::wal::wal_open_or_create(sys, wal_path) {
-        Ok(fd) => fd,
-        Err(_) => return -3,
-    };
-    s.wal_fd = fd;
-    // The appender's tail knowledge belongs to the previous fd.
-    s.appender.reset();
-    s.wal_staged = 0;
-
-    let mut scratch = [0u8; super::wal::MAX_WAL_REC];
-    let objects_ptr: *mut super::state::PicObjectState<ARENA_CAPACITY> = &mut s.objects;
-    let mut replay_errors: u32 = 0;
-    let replay_rc = super::wal::wal_replay(sys, fd, &mut scratch, |payload| {
-        let objects = &mut *objects_ptr;
-        if apply_to_arena(objects, payload).is_err() {
-            replay_errors = replay_errors.wrapping_add(1);
-        }
-        true
-    });
-    if let Ok(applied) = replay_rc {
-        s.ops_applied = applied;
-        s.apply_errors = replay_errors;
+    if wal_path.is_empty() || wal_path.len() > WAL_PATH_BUF {
+        return BOOT_FAILED_RC;
     }
-    0
+    let s = &mut *(state_ptr as *mut ModuleState);
+    for (d, b) in s.wal_path.iter_mut().zip(wal_path.iter()) {
+        *d = *b;
+    }
+    s.wal_path_len = wal_path.len() as u16;
+    begin_wal_boot_from_state(state_ptr)
 }
 
 /// See `namespace_pic_body::decode_wal_path_params`.
@@ -146,19 +164,91 @@ pub unsafe fn decode_wal_path_params(
     }
 }
 
-/// See `namespace_pic_body::open_wal_from_state`.
-pub unsafe fn open_wal_from_state(state_ptr: *mut u8) -> i32 {
+/// Arm the boot of the WAL named in `wal_path` (decoded from params);
+/// a module with no `wal_path` runs channel-only and boots at once.
+/// The open and the replay run from `module_step_impl`.
+pub unsafe fn begin_wal_boot_from_state(state_ptr: *mut u8) -> i32 {
     if state_ptr.is_null() {
         return -1;
     }
-    let s = &*(state_ptr as *const ModuleState);
+    let s = &mut *(state_ptr as *mut ModuleState);
     let len = s.wal_path_len as usize;
     if len == 0 || len > WAL_PATH_BUF {
         return 0;
     }
-    let path_ptr = s.wal_path.as_ptr();
-    let path = core::slice::from_raw_parts(path_ptr, len);
-    open_and_replay_wal(state_ptr, path)
+    if let Some(sys) = s.syscalls.as_ref() {
+        // A boot re-armed mid-open must not leak the descriptor the
+        // abandoned open holds.
+        s.opener.abandon(sys);
+    }
+    s.wal_fd = -1;
+    // The appender's tail knowledge belongs to the previous fd.
+    s.appender.reset();
+    s.wal_staged = 0;
+    s.replay.reset();
+    s.replay_errors = 0;
+    s.boot_reported = 0;
+    s.boot = BOOT_OPEN;
+    0
+}
+
+/// Drive the WAL's open and replay one step further. True once the
+/// module may take requests: the WAL is open and replayed, none is
+/// configured, or the boot failed (requests are then refused, not
+/// held).
+unsafe fn boot(s: &mut ModuleState, sys: &super::SyscallTable) -> bool {
+    if s.boot == BOOT_OPEN {
+        let len = (s.wal_path_len as usize).min(WAL_PATH_BUF);
+        // The same bytes on every poll: an undecided open is collected
+        // only by re-asking the byte-identical request.
+        let path = core::slice::from_raw_parts(s.wal_path.as_ptr(), len);
+        match s.opener.poll(sys, path, true) {
+            super::wal::OpenPoll::Pending => return false,
+            super::wal::OpenPoll::Ready(fd) => {
+                s.wal_fd = fd;
+                s.replay.reset();
+                s.replay_errors = 0;
+                s.boot = BOOT_REPLAY;
+            }
+            // `NameUnfenceable` lands here too: a WAL whose name a power
+            // cut can erase carries no durability claim.
+            super::wal::OpenPoll::Failed(_) => {
+                s.boot = BOOT_FAILED;
+                return true;
+            }
+        }
+    }
+    if s.boot == BOOT_REPLAY {
+        let fd = s.wal_fd;
+        let scratch = s.appender.idle_buffer();
+        let objects = &mut s.objects;
+        let replay_errors = &mut s.replay_errors;
+        let polled = s
+            .replay
+            .poll(sys, fd, scratch, WAL_REPLAY_PER_STEP, |payload| {
+                if apply_to_arena(objects, payload).is_err() {
+                    *replay_errors = replay_errors.wrapping_add(1);
+                }
+                true
+            });
+        match polled {
+            super::wal::ReplayPoll::Pending => return false,
+            super::wal::ReplayPoll::Done(applied) => {
+                s.ops_applied = applied;
+                s.apply_errors = s.replay_errors;
+                s.boot = BOOT_READY;
+            }
+            // A log that could not be read back holds records the arena
+            // lacks; mutating on top of it would ack against a state the
+            // next boot does not reproduce.
+            super::wal::ReplayPoll::Failed(_) => {
+                let _ = super::wal::wal_close(sys, fd);
+                s.wal_fd = -1;
+                s.boot = BOOT_FAILED;
+            }
+        }
+    }
+    true
 }
 
 unsafe fn init_state(
@@ -197,6 +287,20 @@ unsafe fn init_state(
         core::mem::size_of::<super::wal::WalAppender>(),
     );
     s.wal_path_len = 0;
+    s.boot = BOOT_READY;
+    s.boot_reported = 0;
+    s.replay_errors = 0;
+    // Zeroed is a valid idle opener and an unstarted replay.
+    core::ptr::write_bytes(
+        core::ptr::addr_of_mut!(s.opener) as *mut u8,
+        0,
+        core::mem::size_of::<super::wal::WalOpener>(),
+    );
+    core::ptr::write_bytes(
+        core::ptr::addr_of_mut!(s.replay) as *mut u8,
+        0,
+        core::mem::size_of::<super::wal::WalReplay>(),
+    );
     0
 }
 
@@ -266,6 +370,17 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         Some(t) => t,
         None => return -1,
     };
+
+    // The WAL's boot owns the step until it is done: a request taken
+    // before the replay finishes would be applied against an arena
+    // still missing the log's state. Nothing is read meanwhile.
+    if !boot(s, syscalls) {
+        return 0;
+    }
+    if s.boot == BOOT_FAILED && s.boot_reported == 0 {
+        s.boot_reported = 1;
+        return BOOT_FAILED_RC;
+    }
 
     // An owed answer owns the step until the channel takes it. The
     // record it answers has already left `requests` and changed the

@@ -103,7 +103,9 @@ pub unsafe extern "C" fn module_new(
         if rc != 0 {
             return rc;
         }
-        body::open_wal_from_state(state_ptr)
+        // Arms the WAL's open and replay; the steps run them, since no
+        // `fs` call may wait on the device inside this constructor.
+        body::begin_wal_boot_from_state(state_ptr)
     }
 }
 

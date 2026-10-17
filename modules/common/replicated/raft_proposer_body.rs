@@ -36,7 +36,8 @@ pub const MODE_REPLICATED: u8 = 1;
 /// generously past any election + group-commit latency).
 pub const FORWARD_RETRY_TICKS: u16 = 200;
 
-pub const WAL_PATH_BUF: usize = 256;
+/// Inline WAL-path buffer size: the register's `WAL_PATH_BUF`.
+pub const WAL_PATH_BUF: usize = super::limits::WAL_PATH_BUF;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -103,11 +104,28 @@ pub struct ModuleState {
     /// The provider's return code from the last WAL open attempt. The
     /// code is what distinguishes "no such path" from "the provider
     /// refused the name" from "the device errored", and none of those
-    /// are guessable from the outside.
+    /// are guessable from the outside. `EAGAIN` (-11) while the open is
+    /// still undecided, so the heartbeat tells a slow device from a
+    /// refusal.
     pub wal_open_rc: i32,
-    /// The WAL open should be attempted again on a later step; see
-    /// `WalOpenError::Again`.
-    pub wal_retry: u8,
+    /// Where the WAL's boot stands (`BOOT_*`). No `fs` call waits on the
+    /// device, so opening the WAL (create + name fence) and replaying it
+    /// may each take the provider several steps; the module's steps
+    /// drive them, and no proposal is read until they are done.
+    pub boot: u8,
+    /// The WAL's open, resumed across steps.
+    pub opener: super::wal::WalOpener,
+    /// The WAL's replay into the pending table, resumed across steps.
+    /// Its partial record lives in the appender's idle frame buffer,
+    /// which no append needs until boot is done.
+    pub replay: super::wal::WalReplay,
+    /// Replayed records that did not decode or found no pending slot.
+    pub replay_errors: u32,
+    /// The WAL's rotation (see `wal_rotated`), resumed across steps.
+    /// While it is busy nothing is appended: the rename discards the
+    /// old file, and a proposal logged to it meanwhile would be lost
+    /// with it.
+    pub rotator: super::wal::WalRotator,
     /// Resumable WAL append. Owns the staged frame, so a device that
     /// answers `E_AGAIN` costs a later step rather than a refused
     /// proposal.
@@ -148,6 +166,24 @@ pub struct ModuleState {
     pub apply_errors: u32,
     pub pending: [PendingEntry; super::limits::PROPOSER_PENDING],
 }
+
+/// No WAL boot in progress: one is done (or failed, which
+/// `wal_unavailable` then records), or none is configured.
+pub const BOOT_READY: u8 = 0;
+/// The WAL is being opened (created on first boot, its name fenced).
+pub const BOOT_OPEN: u8 = 1;
+/// The WAL is open and being replayed into the pending table.
+pub const BOOT_REPLAY: u8 = 2;
+
+/// Replayed records handed to the pending table per step. Bounds a boot
+/// step's work; a long log spans more steps rather than one long one.
+const WAL_REPLAY_PER_STEP: u32 = 64;
+
+/// `EAGAIN`, reported in `wal_open_rc` while the open is undecided.
+const E_AGAIN: i32 = -11;
+/// `EIO`, reported in `wal_open_rc` when a rotation replaced the log
+/// but could not reopen it.
+const E_IO: i32 = -5;
 
 /// Channel-only init (no WAL, no Clustor commits channel). The
 /// PIC mod.rs is responsible for wiring `mode`, `wal_path`, and
@@ -234,6 +270,9 @@ unsafe fn init_state(
     s.replay_outstanding = 0;
     s.replay_marker_sent = 0;
     s.wal_rotated = 0;
+    // Zeroed (above) is a valid idle opener, unstarted replay and idle
+    // rotator; a channel-only boot has nothing to open.
+    s.boot = BOOT_READY;
     s.cin_asm_len = 0;
     s.ops_asm_len = 0;
     0
@@ -258,91 +297,193 @@ pub unsafe fn decode_wal_path_params(
     }
 }
 
-pub unsafe fn open_wal_from_state(state_ptr: *mut u8) -> i32 {
-    if state_ptr.is_null() {
-        return -1;
-    }
-    let s = &*(state_ptr as *const ModuleState);
-    let len = s.wal_path_len as usize;
-    if len == 0 || len > WAL_PATH_BUF {
-        return 0;
-    }
-    let path_ptr = s.wal_path.as_ptr();
-    let path = core::slice::from_raw_parts(path_ptr, len);
-    open_and_replay_wal(state_ptr, path)
-}
-
-pub unsafe fn open_and_replay_wal(state_ptr: *mut u8, wal_path: &[u8]) -> i32 {
+/// Arm the boot of the WAL named in `wal_path` (decoded from params);
+/// a proposer with no `wal_path` runs against no log and boots at once.
+/// Nothing is opened here: the open and the replay run from
+/// `module_step_impl`, which reads no proposal until both are done.
+pub unsafe fn begin_wal_boot_from_state(state_ptr: *mut u8) -> i32 {
     if state_ptr.is_null() {
         return -1;
     }
     let s = &mut *(state_ptr as *mut ModuleState);
-    let sys = match s.syscalls.as_ref() {
-        Some(t) => t,
-        None => return -1,
-    };
-    let fd = match super::wal::wal_open_or_create(sys, wal_path) {
-        Ok(fd) => fd,
-        Err(e) => {
-            s.wal_unavailable = 1;
-            s.wal_open_rc = match e {
-                super::wal::WalOpenError::NotFound => -19,
-                super::wal::WalOpenError::Again => -11,
-                super::wal::WalOpenError::OpenFailed(rc) => rc,
-                // No durable name for the log: EROFS, because the
-                // artefact cannot be published on this provider and
-                // retrying will not change that.
-                super::wal::WalOpenError::NameUnfenceable => -30,
-            };
-            // "Again" is the provider saying it has not finished, not
-            // that it refused: on a profile where the filesystem sits
-            // over a real device, creating a file needs I/O that does
-            // not fit in one bounded step. Retry it on later steps
-            // instead of spending the whole run without a WAL.
-            s.wal_retry = u8::from(matches!(e, super::wal::WalOpenError::Again));
-            return -3;
-        }
-    };
-    s.wal_fd = fd;
+    let len = s.wal_path_len as usize;
+    if len == 0 || len > WAL_PATH_BUF {
+        return 0;
+    }
+    if let Some(sys) = s.syscalls.as_ref() {
+        // A boot re-armed mid-open must not leak the descriptor the
+        // abandoned open holds.
+        s.opener.abandon(sys);
+    }
+    s.wal_fd = -1;
+    s.wal_unavailable = 0;
+    s.wal_open_rc = E_AGAIN;
     // The appender's tail knowledge belongs to the previous fd.
     s.appender.reset();
     s.wal_staged = 0;
-
-    // Replay every Propose record back into the pending table so
-    // a restart-after-crash retries downstream emission for any
-    // proposal that didn't make it to its consumer.
-    let mut scratch = [0u8; super::wal::MAX_WAL_REC];
-    let state_for_cb: *mut u8 = state_ptr;
-    let mut replay_errors: u32 = 0;
-    let replay_rc = super::wal::wal_replay(sys, fd, &mut scratch, |payload| {
-        let s_cb = &mut *(state_for_cb as *mut ModuleState);
-        if let Ok(p) = super::wire::decode_propose(payload) {
-            // The WAL holds the Propose verbatim, so a replayed entry
-            // still carries the correlation id its producer chose and
-            // its eventual result stays addressable.
-            if reserve_pending(s_cb, p.plane, p.correlation_id, p.inner).is_err() {
-                replay_errors = replay_errors.wrapping_add(1);
-            }
-        } else {
-            replay_errors = replay_errors.wrapping_add(1);
-        }
-        true
-    });
-    if replay_rc.is_ok() {
-        // Pending entries now hold the replayed proposals; the
-        // first few steps will drain them downstream.
-        s.apply_errors = replay_errors;
-    }
-    // Everything in the pending table right now came from replay.
-    let mut n: u32 = 0;
-    for slot in s.pending.iter() {
-        if slot.in_use != 0 {
-            n += 1;
-        }
-    }
-    s.replay_outstanding = n;
-    s.replay_marker_sent = 0;
+    s.replay.reset();
+    s.replay_errors = 0;
+    s.boot = BOOT_OPEN;
     0
+}
+
+/// Record `wal_path` as this proposer's WAL and arm its boot; see
+/// `begin_wal_boot_from_state`. A path that does not fit is refused now,
+/// since no later step could open it.
+pub unsafe fn begin_wal_boot(state_ptr: *mut u8, wal_path: &[u8]) -> i32 {
+    if state_ptr.is_null() {
+        return -1;
+    }
+    if wal_path.is_empty() || wal_path.len() > WAL_PATH_BUF {
+        return -3;
+    }
+    let s = &mut *(state_ptr as *mut ModuleState);
+    for (d, b) in s.wal_path.iter_mut().zip(wal_path.iter()) {
+        *d = *b;
+    }
+    s.wal_path_len = wal_path.len() as u16;
+    begin_wal_boot_from_state(state_ptr)
+}
+
+/// A WAL that would not open, or could not be read back, leaves this
+/// proposer without a durable backing. It still steps — a module that
+/// refuses to start is simply absent, which is the least diagnosable
+/// failure there is — but `wal_unavailable` refuses every proposal, and
+/// `wal_open_rc` carries the provider's code to the heartbeat.
+fn wal_failed(s: &mut ModuleState, rc: i32) {
+    s.wal_fd = -1;
+    s.wal_unavailable = 1;
+    s.wal_open_rc = rc;
+    s.boot = BOOT_READY;
+}
+
+/// Drive the WAL's open and replay one step further. True once the
+/// proposer may take proposals: the WAL is open and replayed, none is
+/// configured, or the boot failed (proposals are then refused, not
+/// held).
+unsafe fn boot(state_ptr: *mut u8, sys: &super::SyscallTable) -> bool {
+    let s = &mut *(state_ptr as *mut ModuleState);
+    if s.boot == BOOT_OPEN {
+        let len = (s.wal_path_len as usize).min(WAL_PATH_BUF);
+        // The same bytes on every poll: an undecided open is collected
+        // only by re-asking the byte-identical request.
+        let path = core::slice::from_raw_parts(s.wal_path.as_ptr(), len);
+        match s.opener.poll(sys, path, true) {
+            // The provider has not finished — on a profile where the
+            // filesystem sits over a real device, creating a file and
+            // fencing its name need I/O that does not fit in one step.
+            super::wal::OpenPoll::Pending => return false,
+            super::wal::OpenPoll::Ready(fd) => {
+                s.wal_fd = fd;
+                s.wal_open_rc = 0;
+                s.replay.reset();
+                s.replay_errors = 0;
+                s.boot = BOOT_REPLAY;
+            }
+            super::wal::OpenPoll::Failed(e) => {
+                let rc = match e {
+                    super::wal::WalOpenError::NotFound => -19,
+                    super::wal::WalOpenError::OpenFailed(rc) => rc,
+                    // No durable name for the log: EROFS, because the
+                    // artefact cannot be published on this provider and
+                    // retrying will not change that.
+                    super::wal::WalOpenError::NameUnfenceable => -30,
+                };
+                wal_failed(s, rc);
+                return true;
+            }
+        }
+    }
+    if s.boot == BOOT_REPLAY {
+        // Replay every Propose record back into the pending table so a
+        // restart-after-crash retries downstream emission for any
+        // proposal that didn't make it to its consumer.
+        let fd = s.wal_fd;
+        // The idle frame outlives the step, as a replay's buffer must;
+        // the callback reaches the rest of the state through the
+        // pointer, never the appender.
+        let scratch: &mut [u8] = &mut *(s.appender.idle_buffer() as *mut [u8]);
+        let replay: &mut super::wal::WalReplay = &mut *(&mut s.replay as *mut _);
+        let polled = replay.poll(sys, fd, scratch, WAL_REPLAY_PER_STEP, |payload| {
+            let s_cb = &mut *(state_ptr as *mut ModuleState);
+            if let Ok(p) = super::wire::decode_propose(payload) {
+                // The WAL holds the Propose verbatim, so a replayed entry
+                // still carries the correlation id its producer chose and
+                // its eventual result stays addressable.
+                if reserve_pending(s_cb, p.plane, p.correlation_id, p.inner).is_err() {
+                    s_cb.replay_errors = s_cb.replay_errors.wrapping_add(1);
+                }
+            } else {
+                s_cb.replay_errors = s_cb.replay_errors.wrapping_add(1);
+            }
+            true
+        });
+        let s = &mut *(state_ptr as *mut ModuleState);
+        match polled {
+            super::wal::ReplayPoll::Pending => return false,
+            super::wal::ReplayPoll::Done(_) => {
+                // Pending entries now hold the replayed proposals; the
+                // first few steps will drain them downstream.
+                s.apply_errors = s.replay_errors;
+                s.boot = BOOT_READY;
+            }
+            // A log that could not be read back may hold proposals the
+            // table lacks, so it is no log to propose against. What did
+            // replay is still real and still drains downstream.
+            super::wal::ReplayPoll::Failed(e) => {
+                let rc = match e {
+                    super::wal::WalReplayError::SeekFailed(rc)
+                    | super::wal::WalReplayError::ReadFailed(rc)
+                    | super::wal::WalReplayError::StatFailed(rc) => rc,
+                };
+                let _ = super::wal::wal_close(sys, fd);
+                s.apply_errors = s.replay_errors;
+                wal_failed(s, rc);
+            }
+        }
+        // Everything in the pending table right now came from replay.
+        let mut n: u32 = 0;
+        for slot in s.pending.iter() {
+            if slot.in_use != 0 {
+                n += 1;
+            }
+        }
+        s.replay_outstanding = n;
+        s.replay_marker_sent = 0;
+    }
+    true
+}
+
+/// Drive the WAL's rotation one step further, starting one when idle.
+unsafe fn poll_rotation(s: &mut ModuleState, sys: &super::SyscallTable) {
+    let len = (s.wal_path_len as usize).min(WAL_PATH_BUF);
+    // The same path on every poll of one rotation.
+    let path = core::slice::from_raw_parts(s.wal_path.as_ptr(), len);
+    match s.rotator.rotate(sys, s.wal_fd, path) {
+        // Undecided: intake stays gated on `rotator.busy()`.
+        super::wal::RotateOutcome::Pending => {}
+        super::wal::RotateOutcome::Rotated(fd) => {
+            s.wal_fd = fd;
+            // Fresh, empty file: the appender's tail knowledge belongs
+            // to the rotated-away fd.
+            s.appender.reset();
+            s.wal_rotated = 1;
+        }
+        // Left intact, and still the right log to propose against — the
+        // next boot just replays more of it.
+        super::wal::RotateOutcome::Skipped => {
+            s.wal_rotated = 1;
+        }
+        super::wal::RotateOutcome::Lost => {
+            // Replaced but not reopenable, so there is no log to propose
+            // against. Refusing is the honest answer: `wal_unavailable`
+            // gates intake until a later open succeeds. Marked rotated so
+            // the attempt does not thrash.
+            s.appender.reset();
+            s.wal_rotated = 1;
+            wal_failed(s, E_IO);
+        }
+    }
 }
 
 /// Reserve a pending slot, copy the inner bytes, and assign a
@@ -655,20 +796,25 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     let s = &mut *(state_ptr as *mut ModuleState);
     s.ticks = s.ticks.wrapping_add(1);
 
-    // One retry per step while the provider is still working on the
-    // open. Proposals are refused meanwhile — see `wal_unavailable` —
-    // so nothing is acked without a durable backing in the interim.
-    if s.wal_retry != 0 {
-        s.wal_retry = 0;
-        s.wal_unavailable = 0;
-        open_wal_from_state(state_ptr);
-    }
-
-    let s = &mut *(state_ptr as *mut ModuleState);
     let syscalls = match s.syscalls.as_ref() {
         Some(t) => t,
         None => return -1,
     };
+
+    // The WAL's boot owns the step until it is done. A proposal taken
+    // before the open decides would have no log to land in, and one
+    // taken before the replay finishes would race the replayed ones for
+    // pending slots and correlation ids. Nothing is read meanwhile.
+    if !boot(state_ptr, syscalls) {
+        return 0;
+    }
+    let s = &mut *(state_ptr as *mut ModuleState);
+
+    // A rotation in flight is resumed before any intake, and gates it:
+    // nothing may be appended to a log the rename is about to discard.
+    if s.rotator.busy() {
+        poll_rotation(s, syscalls);
+    }
 
     // A Propose still owed to the Clustor channel owns the step. It
     // has already been logged and reserved, so re-encoding it later
@@ -700,7 +846,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     // both are normal. Refill a reassembly buffer, then take whole
     // records off the front of it — up to the step budget, leaving the
     // rest for the next step rather than dropping it.
-    if s.ops_in_chan >= 0 {
+    if s.ops_in_chan >= 0 && !s.rotator.busy() {
         loop {
             let space = OPS_ASM - s.ops_asm_len;
             if space < READ_BUF {
@@ -720,7 +866,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
 
     let mut handled: u32 = 0;
     let mut ops_off: usize = 0;
-    while handled < super::limits::OPS_PER_STEP {
+    while handled < super::limits::OPS_PER_STEP && !s.rotator.busy() {
         let rec_len = match super::wire::record_len(&s.ops_asm[ops_off..s.ops_asm_len]) {
             // A whole record is present.
             Ok(Some(len)) => len,
@@ -895,7 +1041,12 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     // WAL rotation: once replay has drained AND no pending proposal
     // is in flight, every logged record is committed downstream —
     // rotate so the next boot replays only its own tail.
-    if s.wal_rotated == 0 && s.replay_marker_sent == 1 && s.wal_fd >= 0 && s.wal_staged == 0 {
+    if s.wal_rotated == 0
+        && s.replay_marker_sent == 1
+        && s.wal_fd >= 0
+        && s.wal_staged == 0
+        && !s.rotator.busy()
+    {
         let mut any_pending = false;
         for slot in s.pending.iter() {
             if slot.in_use != 0 {
@@ -904,34 +1055,9 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
             }
         }
         if !any_pending && s.wal_path_len > 0 {
-            let plen = s.wal_path_len as usize;
-            let mut path = [0u8; WAL_PATH_BUF];
-            path[..plen].copy_from_slice(&s.wal_path[..plen]);
-            match super::wal::wal_rotate(syscalls, s.wal_fd, &path[..plen]) {
-                Ok(super::wal::RotateOutcome::Rotated(fd)) => {
-                    s.wal_fd = fd;
-                    // Fresh, empty file: the appender's tail knowledge
-                    // belongs to the rotated-away fd.
-                    s.appender.reset();
-                    s.wal_rotated = 1;
-                }
-                // Left intact, and still the right log to propose
-                // against — the next boot just replays more of it.
-                Ok(super::wal::RotateOutcome::Skipped) => {
-                    s.wal_rotated = 1;
-                }
-                Err(_) => {
-                    // Replaced but not reopenable, so there is no log
-                    // to propose against. Refusing is the honest
-                    // answer: `wal_unavailable` gates intake until a
-                    // later open succeeds. Marked rotated so the
-                    // attempt does not thrash.
-                    s.wal_fd = -1;
-                    s.wal_unavailable = 1;
-                    s.wal_rotated = 1;
-                    s.appender.reset();
-                }
-            }
+            // Started here, resumed at the top of later steps until it
+            // decides; intake waits for it.
+            poll_rotation(s, syscalls);
         }
     }
 
