@@ -1,0 +1,24 @@
+# loam-body: a body node. One `body_store` holding content-addressed
+# bodies in a directory, served to the body routers of other nodes over
+# one mutually authenticated TLS session.
+#
+#   fluxor run loam-body --param ca=ca.pem --param cert=node.der --param key=node.key.der \
+#     --param <name>=<value> …
+#
+# Its params are the graph's (linux.yaml). Its TLS identity — the CA,
+# certificate and key — is `file` params: files the caller supplies, read
+# when the run builds the graph. The bundle carries none of them.
+#
+# A router graph reaches it with one member per body node: a
+# `body_fanout_router` member port wired to a `remote_channel` that dials
+# this node through a client-mode `tls` (tools/e2e/graphs/fleet_s3.yaml).
+# The session carries one channel, the body plane's frames, record for
+# record.
+[workload]
+name = "loam-body"
+version = "0.1.0"
+role = "service"
+
+[[implementation]]
+target = "linux"
+graph = "linux.yaml"

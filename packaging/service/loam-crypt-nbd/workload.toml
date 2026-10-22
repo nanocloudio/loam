@@ -1,0 +1,26 @@
+# loam-crypt-nbd: a loam volume exported as an encrypted NBD block
+# device: fluxor's `crypt_block` between the export and the volume, so
+# the node holding the volume stores only ciphertext.
+#
+#   fluxor run loam-crypt-nbd --param cert=node.der --param key=node.key.der \
+#     --param <name>=<value> …
+#
+# Its params are the graph's (linux.yaml). Its TLS identity — the
+# certificate and key — is `file` params: files the caller supplies, read
+# when the run builds the graph. The bundle carries none of them.
+#
+# The device is `loam_volume`: the volume's writer, holding its lease,
+# staging writes and committing them at a flush as one revision. It
+# reaches the volume's node over mutual TLS — `cert` and `key` are this
+# node's identity; the node's certificate is checked against the host's
+# trusted CAs (`FLUXOR_CA_BUNDLE` names another bundle) — and works under
+# the capabilities in `capability`. The volume must exist (`loam volume
+# create`).
+[workload]
+name = "loam-crypt-nbd"
+version = "0.1.0"
+role = "service"
+
+[[implementation]]
+target = "linux"
+graph = "linux.yaml"

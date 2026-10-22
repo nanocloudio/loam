@@ -1,4 +1,4 @@
-# The `loam` operator applet. `fluxor install packaging/cli/workload.toml`
+# The `loam` operator applet. `fluxor install loam`
 # registers it; `fluxor exec loam -- <command>` runs it.
 #
 # The graph (linux.yaml, beside this file): cli_in → loam_cli → cli_out,

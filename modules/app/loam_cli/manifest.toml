@@ -10,7 +10,7 @@ timer_class      = "agnostic"
 # one PIC module dispatching loam's commands over the cli host surface,
 # speaking the admin wire to a node's admin plane over mutual TLS.
 #
-#   fluxor install packaging/cli/workload.toml
+#   fluxor install packaging/applet/loam/workload.toml
 #   fluxor exec loam -- --admin node:7443 --capability ops.cap ls tenant
 #
 # Every command runs the admin, map and manifest wires the node's own

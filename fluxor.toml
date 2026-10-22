@@ -78,7 +78,8 @@ same multi-consumer cause as modules/common/, on the test side."""
 # plane over mutual TLS, driven by the `loam` applet), `nbd.sh` (a volume
 # as an NBD device: durability across kill -9, the writer lease) and
 # `fleet.sh` (bodies on two nodes over remote_channel, one node lost and
-# regained).
+# regained). `storage_front.sh` drives the `loam-node` fragment's
+# exchange front in-graph (examples/linux/storage_front.yaml).
 scripts = [
   "tools/ci/shadow_guard.sh",
   "tools/ci/shipping_surface.sh",
@@ -92,4 +93,5 @@ scripts = [
   "tools/e2e/admin_tls.sh",
   "tools/e2e/nbd.sh",
   "tools/e2e/fleet.sh",
+  "tools/e2e/storage_front.sh",
 ]

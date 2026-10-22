@@ -1,8 +1,7 @@
-# The loam-crypt-nbd template: an encrypted block device over a remote
-# Loam volume. Fluxor's
-# `crypt_block` encrypts on the node, and the node reaches Loam through
-# Fluxor's own `tls` module under the node's certificate — so Loam holds
-# only ciphertext.
+# The loam-crypt-nbd service graph: an encrypted block device over a
+# remote Loam volume. Fluxor's `crypt_block` encrypts on the node, and the
+# node reaches Loam through Fluxor's own `tls` module under the node's
+# certificate — so Loam holds only ciphertext.
 #
 #   nbd-client → nbd_serve → crypt_block → loam_volume
 #                                            ⇅ admin wire (net_proto)
@@ -33,6 +32,55 @@ scheduler:
 
 platform:
   net: {}
+
+params:
+  port:
+    type: integer
+    default: 10809
+    min: 1
+    max: 65535
+    description: TCP port the NBD export listens on
+  admin:
+    type: string
+    required: true
+    example: "storage.example:7443"
+    description: "The volume's node: its admin plane, host:port"
+  capability:
+    type: string
+    required: true
+    example: /etc/loam/volume.cap
+    description: "Capability file: one fxcap1. chain per line, covering the volume's key and the body plane"
+  root:
+    type: string
+    required: true
+    example: tenant
+    description: "The volume's namespace root"
+  path:
+    type: string
+    required: true
+    example: /vols/db0
+    description: "The volume's path under its root"
+  lease_ttl_ms:
+    type: integer
+    default: 30000
+    min: 1000
+    max: 300000
+    description: "The writer lease's time to live, milliseconds"
+  cert:
+    type: file
+    required: true
+    example: ../../samples/node.der
+    description: "This node's certificate, DER"
+  key:
+    type: file
+    required: true
+    example: ../../samples/node.key.der
+    description: "This node's private key, DER"
+  crypt_key:
+    type: string
+    required: true
+    example: loam-db0
+    description: The key vault entry crypt_block encrypts the volume under
 
 modules:
   - name: tls

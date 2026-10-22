@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # The admin plane over mutual TLS, driven by the `loam` operator applet:
 #
-#   the loam-admin template (packaging/mtls/loam-admin), rendered with a
-#   CA, a server identity and a mesh root, and run with `fluxor run`;
+#   the loam-admin service (packaging/service/loam-admin), run with
+#   `fluxor run loam-admin` and a CA, a server identity and a mesh root as
+#   its params;
 #
-#   the applet installed from packaging/cli/workload.toml into a private
+#   the applet installed from packaging/applet/loam/workload.toml into a private
 #   HOME (its client identity under ~/.config/loam/) and run with
 #   `fluxor exec loam -- …`.
 #
@@ -39,11 +40,10 @@ mint "$W" --scope other/ read_state,send_command >"$W/other.cap"
 
 node() { # <name> <port> — a loam-admin node with its own state
   mkdir -p "$W/$1/bodies"
-  python3 "$ROOT/tools/e2e/render_service.py" "$ROOT/packaging/mtls/loam-admin/linux.yaml" \
-    "$W/$1.yaml" port="$2" mesh_roots="$MESH" ns_wal="$W/$1/ns.wal" obj_wal="$W/$1/obj.wal" \
-    body_dir="$W/$1/bodies" gc_interval=0 \
-    ca="$W/pki/ca.pem" cert="$W/pki/server.der" key="$W/pki/server.key.der"
-  graph_start "$W/$1.log" "$W/$1.yaml"
+  graph_start "$W/$1.log" loam-admin --param port="$2" --param mesh_roots="$MESH" \
+    --param ns_wal="$W/$1/ns.wal" --param obj_wal="$W/$1/obj.wal" \
+    --param body_dir="$W/$1/bodies" --param gc_interval=0 \
+    --param ca="$W/pki/ca.pem" --param cert="$W/pki/server.der" --param key="$W/pki/server.key.der"
   wait_log "$W/$1.log" "listening on port $2"
 }
 PORT=$(free_port)
@@ -59,7 +59,7 @@ install_applet() { # <home> <identity dir>
   cp "$2/client.key.der" "$1/.config/loam/client.key.der"
   (
     applet_env "$1"
-    cd "$ROOT" && fluxor install packaging/cli/workload.toml
+    cd "$ROOT" && fluxor install packaging/applet/loam/workload.toml
   ) >"$1/install.log" 2>&1 || {
     cat "$1/install.log" >&2
     fail "installing the applet"

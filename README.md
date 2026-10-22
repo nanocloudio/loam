@@ -69,7 +69,7 @@ declared parameter schema. Each is run with its parameters, from
 the store once published or from its manifest in this checkout:
 
 ```sh
-fluxor run packaging/service/loam-s3/workload.toml \
+fluxor run loam-s3 \
   --param port=9000 --param credentials=/etc/loam/s3.credentials \
   --param mesh_roots=$(cat /etc/loam/mesh_root) \
   --param ns_wal=/var/lib/loam/ns.wal --param obj_wal=/var/lib/loam/obj.wal \
@@ -78,16 +78,20 @@ fluxor run packaging/service/loam-s3/workload.toml \
 
 | Service | What it is |
 |---|---|
-| [`loam-s3`](packaging/service/loam-s3/) | An S3 endpoint: wave's `http` and `s3_serve` in front of loam's `storage.object` provider, the admin plane and one body store. Every request is SigV4-signed; the credentials file maps an access key to its secret, its bucket scope and the capability it acts under |
-| [`loam-admin`](packaging/mtls/loam-admin/) | A node's admin plane over mutual TLS: the session layer (`admin_gate`) in front of `admin_router`, the namespace, the object index and a body store. Clients present capabilities before anything else; the mesh root they chain to is configuration |
-| [`loam-nbd`](packaging/mtls/loam-nbd/) | A loam volume as an NBD block device: `nbd_serve` over `loam_volume`, which reaches its node over mutual TLS and holds the volume's writer lease |
-| [`loam-body`](packaging/mtls/loam-body/) | A body store behind one mutually authenticated `remote_channel` session: a node of another graph's body fleet |
-| [`loam-crypt-nbd`](packaging/mtls/loam-crypt-nbd/) | loam-nbd with fluxor's `crypt_block` between the export and the volume: the node holding the volume stores only ciphertext |
+| [`loam-s3`](packaging/service/loam-s3/) | An S3 endpoint: wave's `http` and `s3_serve` over the `loam-node` stack (loam's `storage.object` provider, the admin plane and one body store). Every request is SigV4-signed; the credentials file maps an access key to its secret, its bucket scope and the capability it acts under |
+| [`loam-admin`](packaging/service/loam-admin/) | A node's admin plane over mutual TLS: the session layer (`admin_gate`) in front of `admin_router`, the namespace, the object index and a body store. Clients present capabilities before anything else; the mesh root they chain to is configuration |
+| [`loam-nbd`](packaging/service/loam-nbd/) | A loam volume as an NBD block device: `nbd_serve` over `loam_volume`, which reaches its node over mutual TLS and holds the volume's writer lease |
+| [`loam-body`](packaging/service/loam-body/) | A body store behind one mutually authenticated `remote_channel` session: a node of another graph's body fleet |
+| [`loam-crypt-nbd`](packaging/service/loam-crypt-nbd/) | loam-nbd with fluxor's `crypt_block` between the export and the volume: the node holding the volume stores only ciphertext |
 
-The mutual-TLS services are templates under `packaging/mtls/`
-rendered with their values (`tools/e2e/render_service.py`): their
-CA, certificate and key are files the build reads, which a bundle
-cannot yet take as run-time parameters.
+The mutual-TLS services take their CA, certificate and key as `file`
+params: files the caller supplies, read when the run builds the graph
+(`--param ca=ca.pem --param cert=node.der --param key=node.key.der`).
+The bundles carry none of them.
+
+| Stack | What it is |
+|---|---|
+| [`loam-node`](packaging/stack/loam-node.yaml) | One storage node for another graph to include: the `storage.object` provider, the admin plane, the namespace, the object index and a body store, with fluxor's `object_exchange` as its exchange front (`request_in`/`response_out`). The front presents the capability `front_scope`/`front_capability` give it, and the node's gate checks each request against that grant; see [running.md](docs/running.md#a-storage-node-in-your-own-graph) |
 
 ## The operator applet
 
@@ -99,7 +103,7 @@ applet holds no credential; the node's certificate is checked against the host's
 trusted CAs, or the bundle `FLUXOR_CA_BUNDLE` names.
 
 ```sh
-fluxor install packaging/cli/workload.toml
+fluxor install loam
 fluxor exec loam -- --admin node:7443 --capability ops.cap put tenant /docs/r.pdf r.pdf
 fluxor exec loam -- --admin node:7443 --capability ops.cap ls tenant /docs/
 fluxor exec loam -- --admin node:7443 --capability ops.cap volume create tenant /vols/db0 1073741824 32768
@@ -117,7 +121,7 @@ holds one `fxcap1.` chain per line (`fluxor modules cap mint`).
 |---|---|
 | `modules/app/` | One directory per PIC module: `mod.rs` + `manifest.toml`. |
 | `modules/common/` | Shared `no_std` source, split by storage tier: `mechanics/` (single-node) and `replicated/` (quorum; may reach clustor). |
-| `packaging/` | The service bundles and templates, and the applet's bundle. |
+| `packaging/` | What loam ships: the `loam-node` stack, the service bundles and the applet's bundle. |
 | `examples/` | Reference graphs: the metadata plane, composed nodes, the body plane smoke. |
 | `tests/harness/` | The module harness: every unit test, over the same sources the modules build. |
 | `tools/` | CI gates, graph and service gates, diagnostics — see [`tools/README.md`](tools/README.md). |
@@ -184,11 +188,13 @@ deployment shapes.
 ## Consuming loam
 
 Siblings consume loam through the store, never through its checkout:
-`fluxor publish` puts loam's modules and bundles into the store,
-`fluxor store pin` records them in the consumer's `fluxor.lock`, and
-`fluxor sync` materialises them. A consumer either runs a loam
-service with its parameters or composes loam's modules into its own
-graph.
+`fluxor publish` puts loam's modules, its `loam-node` stack and its
+bundles into the store. A consumer lists `loam` under `[dependencies]`,
+names each bundle it runs under `[uses] bundles` and includes the stack
+by name; `fluxor update` pins exactly those references in its
+`fluxor.lock`, and `fluxor sync` materialises them. A consumer either
+runs a loam service with its params (`fluxor run loam-s3 --param …`)
+or composes loam's stack and modules into its own graph.
 
 ## Project family
 

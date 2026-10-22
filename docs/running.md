@@ -110,7 +110,7 @@ loam's `storage.object` provider, the admin plane and one body store:
 mkdir -p /var/lib/loam/bodies /var/lib/loam/spool
 echo "AKTENANT000000000001 tenant-secret tenant/ $(mint --scope tenant/ --perms read_state,send_command)" \
   > /etc/loam/s3.credentials
-fluxor run packaging/service/loam-s3/workload.toml \
+fluxor run loam-s3 \
   --param port=9000 --param credentials=/etc/loam/s3.credentials \
   --param mesh_roots=$(cat /etc/loam/mesh_root) \
   --param ns_wal=/var/lib/loam/ns.wal --param obj_wal=/var/lib/loam/obj.wal \
@@ -118,7 +118,10 @@ fluxor run packaging/service/loam-s3/workload.toml \
 ```
 
 Each credentials line is an access key, its secret, the bucket scope
-it may sign for, and the capability it acts under. Every request is
+it may sign for, and the capability it acts under. The bundle's graph
+is wave's `http` and `s3_serve` over an include of the `loam-node`
+stack (below), whose exchange front it leaves unwired and without a
+capability: `s3_serve` is its only door. Every request is
 SigV4-signed; an unsigned one is refused. Smoke checks:
 
 ```sh
@@ -134,21 +137,124 @@ larger than one record streams: `object_provider` spools it under
 `spool_dir` and writes it as one `PUT_FILE` stream, and reads come
 back in ranges pinned to the object they started on. State is in the
 WALs and the body directory, so a restart replays to the same
-contents. `gc_interval` (ticks; 0 is off) sweeps orphaned bodies and
-unbound object descriptors — see [durability.md](durability.md).
+contents. The service leaves the node's orphan sweep off; a graph that
+includes the `loam-node` stack turns it on with `gc_interval`
+(steps; 0 is off), which sweeps orphaned bodies and unbound object
+descriptors — see [durability.md](durability.md).
+
+## A storage node in your own graph
+
+`packaging/stack/loam-node.yaml` is the `loam-node` published stack
+([fluxor's stacks](../../fluxor/docs/architecture/stacks.md)): one
+storage node, which an application includes and reaches through
+exchange edges. It holds `object_provider` (loam's `storage.object`),
+`admin_gate` and `admin_router` (the capability-gated admin plane),
+`namespace_router`, `object_index`, `body_store`, and fluxor's
+`object_exchange` as the node's exchange front. A graph that includes
+it by name and lists `loam` under `[dependencies]` has it pinned by
+`fluxor update`; the values its caller has are the graph's own params,
+forwarded.
+
+```yaml
+include:
+  - stack: loam-node               # by name, or a path to its file
+    as: store
+    params:
+      ns_wal: /var/lib/loam/ns.wal
+      obj_wal: /var/lib/loam/obj.wal
+      body_dir: /var/lib/loam/bodies
+      spool_dir: /var/lib/loam/spool
+      mesh_roots: "${param:mesh_roots}"
+      front_scope: tenant/
+      front_capability: "${param:capability}"
+wiring:
+  - { from: app.request_out, to: store.request_in }
+  - { from: store.response_out, to: app.response_in }
+```
+
+**Params**
+
+| Param | Type | Default | Meaning |
+|---|---|---|---|
+| `ns_wal` | string | required | The namespace's write-ahead log; its snapshots live beside it |
+| `obj_wal` | string | required | The object index's write-ahead log |
+| `body_dir` | string | required | The bodies, one file per content digest |
+| `spool_dir` | string | required | Where streamed writes spool until they commit; at most 192 bytes |
+| `mesh_roots` | string | required | One or two 64-hex Ed25519 mesh roots every capability verifies against |
+| `gc_interval` | integer | 0 | Steps between orphan-sweep pages; 0 is off |
+| `front_scope` | string | `""` | The key prefix the front's capability grants and the root every request names objects under, ending `/`; at most 255 bytes |
+| `front_capability` | string | `""` | The chain the front presents, in text form (`fxcap1.…`), naming `front_scope`; at most 1375 bytes, 1 to 8 links |
+
+**Exports**
+
+| Export | Port | Content type |
+|---|---|---|
+| `request_in` | `front.request_in` | `ExchangeRequest` |
+| `response_out` | `front.response_out` | `ExchangeResponse` |
+
+The front is the exchange contract's provider, and its scope is its root:
+a request's target `/<rest>` names the object `<scope><rest>`, so under the
+scope `tenant/`, `PUT /docs/a` writes path `docs/a` under root `tenant`. No
+target names anything outside the scope, and a listing names what is below
+it.
+`GET` (200, or 206 for one range), `HEAD` (length, `etag`), `PUT` (200;
+streamed when its body runs past the first record) and `DELETE` (204)
+act on it, and `GET /?list&prefix=…&after=…&max=…` lists a page of
+names. Each success carries a `fence` header. An absent name is 404, a
+failed `if-match`/`if-none-match` 412, a request the capability does not
+admit 403. fluxor's `object_exchange` README is the full surface.
+
+The modules take the instance's name as a prefix (`store_provider`,
+`store_gate`, …).
+
+**Authorisation.** `object_provider` admits nothing on its say-so. A
+caller of `storage.object` presents a capability for a scope and works
+under the grant the gate gives it: `s3_serve` presents one per access
+key, and each S3 request runs under its key's grant. The front is such
+a caller. Given `front_scope` and `front_capability`, it presents them
+to the node's provider once, and every call it makes for every request
+names the grant it was given. The gate decides each of those requests
+against that grant: its keys lie inside the scope, writes and
+deletes need `send_command`, reads and listings `read_state`, and the
+chain's window must be open by the node's trusted clock; whatever the
+grant does not admit is 403. Until the gate has answered the
+presentation, requests wait; a presentation it refuses is logged by
+the front, and every request is then 403. With no capability given,
+the front presents none and every request through it is 403.
+
+The front authenticates nobody: whatever is wired to `request_in` acts
+with the front's capability. Inside a graph the wiring is the trust
+boundary — the includer decides what reaches the front, and gives it
+the narrowest capability that requester needs. A requester that needs
+per-caller authority (foreign S3 clients) goes through `s3_serve`,
+which presents per access key; the two can share one node, each under
+its own grant.
+
+```sh
+mkdir -p /tmp/front/bodies /tmp/front/spool
+fluxor run examples/linux/storage_front.yaml --param dir=/tmp/front \
+  --param mesh_roots=$(cat /etc/loam/mesh_root) --param scope=tenant/ \
+  --param capability=$(mint --scope tenant/ --perms read_state,send_command)
+curl -T report.txt http://127.0.0.1:9100/docs/report.txt
+curl http://127.0.0.1:9100/docs/report.txt
+```
+
+`examples/linux/storage_front.yaml` includes the stack by path and
+puts wave's `http` in front of its exports, so a plain HTTP request is
+an exchange the front answers. `tools/e2e/storage_front.sh` gates it.
 
 ## The admin plane and the applet
 
 The loam-admin service is a node's admin plane over mutual TLS. Its
-CA, certificate and key are read when the graph is built, so it is a
-template under `packaging/mtls/` rendered with its values:
+CA, certificate and key are `file` params, read when the run builds the
+graph:
 
 ```sh
-python3 tools/e2e/render_service.py packaging/mtls/loam-admin/linux.yaml node.yaml \
-  port=7443 mesh_roots=$(cat /etc/loam/mesh_root) gc_interval=0 \
-  ns_wal=/var/lib/loam/ns.wal obj_wal=/var/lib/loam/obj.wal body_dir=/var/lib/loam/bodies \
-  ca=/etc/loam/ca.pem cert=/etc/loam/server.der key=/etc/loam/server.key.der
-fluxor run node.yaml
+fluxor run loam-admin \
+  --param port=7443 --param mesh_roots=$(cat /etc/loam/mesh_root) --param gc_interval=0 \
+  --param ns_wal=/var/lib/loam/ns.wal --param obj_wal=/var/lib/loam/obj.wal \
+  --param body_dir=/var/lib/loam/bodies \
+  --param ca=/etc/loam/ca.pem --param cert=/etc/loam/server.der --param key=/etc/loam/server.key.der
 ```
 
 A client certificate must chain to `ca`. The operator applet is the
@@ -159,7 +265,7 @@ run, or `--identity CERT,KEY` names others — the node's address and a
 capability file:
 
 ```sh
-fluxor install packaging/cli/workload.toml
+fluxor install loam
 L="fluxor exec loam -- --admin storage-node:7443 --capability /etc/loam/ops.cap"
 $L put tenant /docs/report.txt report.txt --type text/plain
 $L ls tenant /docs/
@@ -181,11 +287,10 @@ at most 32 KiB.
 
 ```sh
 $L volume create tenant /vols/db0 1073741824 32768
-python3 tools/e2e/render_service.py packaging/mtls/loam-nbd/linux.yaml nbd.yaml \
-  port=10809 admin=storage-node:7443 capability=/etc/loam/ops.cap \
-  root=tenant path=/vols/db0 block_size=4096 lease_ttl_ms=30000 \
-  cert=/etc/loam/client.der key=/etc/loam/client.key.der
-fluxor run nbd.yaml
+fluxor run loam-nbd \
+  --param port=10809 --param admin=storage-node:7443 --param capability=/etc/loam/ops.cap \
+  --param root=tenant --param path=/vols/db0 --param block_size=4096 --param lease_ttl_ms=30000 \
+  --param cert=/etc/loam/client.der --param key=/etc/loam/client.key.der
 nbd-client 127.0.0.1 10809 /dev/nbd0
 ```
 
@@ -200,11 +305,11 @@ stopped without draining, or killed, holds the volume until its
 lease lapses. `$L volume read tenant /vols/db0 <offset> <length> <file>`
 reads what is committed, from any client.
 
-The loam-crypt-nbd template
-([`packaging/mtls/loam-crypt-nbd/`](../packaging/mtls/loam-crypt-nbd/))
+The loam-crypt-nbd service
+([`packaging/service/loam-crypt-nbd/`](../packaging/service/loam-crypt-nbd/))
 puts fluxor's `crypt_block` between the device and the volume, so the
 node holding the volume stores only ciphertext; it takes loam-nbd's
-values and `crypt_key`, the key vault entry it encrypts under.
+params and `crypt_key`, the key vault entry it encrypts under.
 
 ## Snapshots, clones and export
 
@@ -239,13 +344,11 @@ whatever keys each cluster holds.
 ## Body plane across nodes
 
 A body node is a `body_store` behind one mutually authenticated
-`remote_channel` session — the loam-body template:
+`remote_channel` session — the loam-body service:
 
 ```sh
-python3 tools/e2e/render_service.py packaging/mtls/loam-body/linux.yaml body-b.yaml \
-  port=7101 body_dir=/var/lib/loam/bodies-b \
-  ca=/etc/loam/ca.pem cert=/etc/loam/server.der key=/etc/loam/server.key.der
-fluxor run body-b.yaml
+fluxor run loam-body --param port=7101 --param body_dir=/var/lib/loam/bodies-b \
+  --param ca=/etc/loam/ca.pem --param cert=/etc/loam/server.der --param key=/etc/loam/server.key.der
 ```
 
 The node at the front runs `body_fanout_router`, each member port

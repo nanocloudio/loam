@@ -1,0 +1,22 @@
+# loam-admin: a storage node serving the admin plane over mutual TLS.
+#
+#   fluxor run loam-admin --param ca=ca.pem --param cert=node.der --param key=node.key.der \
+#     --param <name>=<value> …
+#
+# Its params are the graph's (linux.yaml). Its TLS identity — the CA,
+# certificate and key — is `file` params: files the caller supplies, read
+# when the run builds the graph. The bundle carries none of them.
+#
+# Every session presents mesh capability chains before it is admitted to
+# anything; a chain verifies against `mesh_roots`, and its leaf names the
+# scope (a `root/` or deeper `/`-ended prefix) and the permission each
+# operation needs. The client certificate authenticates the session; the
+# capability authorises what it does.
+[workload]
+name = "loam-admin"
+version = "0.1.0"
+role = "service"
+
+[[implementation]]
+target = "linux"
+graph = "linux.yaml"

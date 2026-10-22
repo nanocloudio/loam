@@ -1,4 +1,4 @@
-# The loam-nbd template: an NBD export of one loam volume.
+# The loam-nbd service graph: an NBD export of one loam volume.
 #
 #   nbd client ⇄ linux_net ⇄ nbd_serve ⇄ loam_volume ⇄ tls (client) ⇄ linux_net
 #                                                          ⇅ mutual TLS
@@ -16,6 +16,56 @@ scheduler:
 
 platform:
   net: {}
+
+params:
+  port:
+    type: integer
+    default: 10809
+    min: 1
+    max: 65535
+    description: TCP port the NBD export listens on
+  admin:
+    type: string
+    required: true
+    example: "storage.example:7443"
+    description: "The volume's node: its admin plane, host:port"
+  capability:
+    type: string
+    required: true
+    example: /etc/loam/volume.cap
+    description: "Capability file: one fxcap1. chain per line, covering the volume's key and the body plane"
+  root:
+    type: string
+    required: true
+    example: tenant
+    description: "The volume's namespace root"
+  path:
+    type: string
+    required: true
+    example: /vols/db0
+    description: "The volume's path under its root"
+  block_size:
+    type: integer
+    default: 4096
+    min: 512
+    max: 32768
+    description: "Logical block size of the export, bytes: a power of two"
+  lease_ttl_ms:
+    type: integer
+    default: 30000
+    min: 1000
+    max: 300000
+    description: "The writer lease's time to live, milliseconds"
+  cert:
+    type: file
+    required: true
+    example: ../../samples/node.der
+    description: "This node's certificate, DER"
+  key:
+    type: file
+    required: true
+    example: ../../samples/node.key.der
+    description: "This node's private key, DER"
 
 modules:
   - name: admin_tls

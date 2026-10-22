@@ -3,7 +3,7 @@
 # loam-body nodes, each reached over its own mutually authenticated
 # remote_channel session.
 #
-#   two loam-body graphs (packaging/mtls/loam-body), each a body_store
+#   two loam-body services (packaging/service/loam-body), each a body_store
 #   behind tls (server, client certificate required) and remote_channel
 #
 #   one router graph (tools/e2e/graphs/fleet_s3.yaml): http, s3_serve,
@@ -38,15 +38,10 @@ PORT_B=$(free_port)
 PORT_S3=$(free_port)
 mkdir -p "$W/a" "$W/b" "$W/r/spool"
 
-render() {
-  python3 "$ROOT/tools/e2e/render_service.py" "$@"
-}
-
 start_body() { # <name> <port>
-  render "$ROOT/packaging/mtls/loam-body/linux.yaml" "$W/body_$1.yaml" \
-    ca="$W/pki/ca.pem" cert="$W/pki/server.der" key="$W/pki/server.key.der" \
-    port="$2" body_dir="$W/$1"
-  graph_start "$W/body_$1.log" "$W/body_$1.yaml"
+  graph_start "$W/body_$1.log" loam-body \
+    --param ca="$W/pki/ca.pem" --param cert="$W/pki/server.der" --param key="$W/pki/server.key.der" \
+    --param port="$2" --param body_dir="$W/$1"
   wait_log "$W/body_$1.log" "listening on port $2"
 }
 
@@ -54,12 +49,11 @@ start_body a "$PORT_A"
 BODY_A=$GRAPH_PID
 start_body b "$PORT_B"
 
-render "$ROOT/tools/e2e/graphs/fleet_s3.yaml" "$W/fleet.yaml" \
-  port="$PORT_S3" credentials="$W/credentials" mesh_roots="$MESH" \
-  spool_dir="$W/r/spool" ns_wal="$W/r/ns.wal" obj_wal="$W/r/obj.wal" \
-  ca="$W/pki/ca.pem" cert="$W/pki/client.der" key="$W/pki/client.key.der" \
-  member_a="localhost:$PORT_A" member_b="localhost:$PORT_B"
-graph_start "$W/fleet.log" "$W/fleet.yaml"
+graph_start "$W/fleet.log" tools/e2e/graphs/fleet_s3.yaml \
+  --param port="$PORT_S3" --param credentials="$W/credentials" --param mesh_roots="$MESH" \
+  --param spool_dir="$W/r/spool" --param ns_wal="$W/r/ns.wal" --param obj_wal="$W/r/obj.wal" \
+  --param ca="$W/pki/ca.pem" --param cert="$W/pki/client.der" --param key="$W/pki/client.key.der" \
+  --param member_a="localhost:$PORT_A" --param member_b="localhost:$PORT_B"
 wait_log "$W/fleet.log" "s3_serve\] serving"
 wait_log "$W/fleet.log" "remote_channel\] session open" 2
 pass "both members' sessions open"

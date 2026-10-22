@@ -1,27 +1,88 @@
-# The loam-s3 template: S3 over a single loam storage node.
+# The loam-s3 service graph: S3 over a single loam storage node.
 #
-#   linux_net ⇄ http ⇄ s3_serve ── storage.object ──▶ object_provider
-#                                                         ⇅ link 0
-#                                                     admin_gate
-#                                                         ⇅
-#                                                    admin_router
-#                                  ⇅                     ⇅                ⇅
-#                          namespace_router         object_index      body_store
+#   linux_net ⇄ http ⇄ s3_serve ── storage.object ──▶ node (loam-node)
 #
-# `s3_serve` calls the object surface; `object_provider` answers it,
-# presenting each access key's capability on a session of its own on the
-# gate's link. The link is a channel inside this graph — the wiring is
-# what authenticates it — so the gate needs no network listener here.
+# `node` is loam's storage node, included from its stack
+# (packaging/stack/loam-node.yaml): the `storage.object` provider, the
+# admin plane behind it, the namespace, the object index and the body
+# store. `s3_serve` calls the object surface and the node's provider
+# answers it, presenting each access key's capability to the node's gate
+# on a session of its own. The node's exchange front is left unwired and
+# given no capability, so it answers nothing: S3 is this graph's only door.
 target: linux
 tick_us: 100
 
-# `linux_net` ⇄ `http` ⇄ `s3_serve`, and every admin-plane pair, are
-# request/response cycles by construction.
+# `linux_net` ⇄ `http` ⇄ `s3_serve`, and every admin-plane pair inside
+# the node, are request/response cycles by construction.
 scheduler:
   accept_cycles: true
 
 platform:
   net: {}
+
+params:
+  port:
+    type: integer
+    default: 9000
+    min: 1
+    max: 65535
+    description: TCP port the S3 endpoint listens on
+  credentials:
+    type: string
+    required: true
+    example: /etc/loam/s3-credentials
+    description: "Path of the credentials file: access key, secret, scope and capability per line"
+  mesh_roots:
+    type: string
+    required: true
+    example: "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+    description: "Mesh root keys the capabilities verify against: one or two 64-hex Ed25519 keys, comma-separated"
+  region:
+    type: string
+    default: us-east-1
+    description: Region requests must be signed for
+  max_object_mib:
+    type: integer
+    default: 1024
+    min: 1
+    max: 1024
+    description: "Largest object accepted, MiB; a loam object is at most 1 GiB"
+  part_min_kib:
+    type: integer
+    default: 5120
+    min: 0
+    max: 1048576
+    description: "Smallest multipart part but the last, KiB"
+  ns_wal:
+    type: string
+    required: true
+    example: /var/lib/loam/ns.wal
+    description: "The namespace's write-ahead log; its snapshots live beside it"
+  obj_wal:
+    type: string
+    required: true
+    example: /var/lib/loam/obj.wal
+    description: "The object index's write-ahead log"
+  body_dir:
+    type: string
+    required: true
+    example: /var/lib/loam/bodies
+    description: "Directory holding the bodies, one file per content digest"
+  spool_dir:
+    type: string
+    required: true
+    example: /var/lib/loam/spool
+    description: Directory streamed writes are spooled in until they commit
+
+include:
+  - stack: ../../stack/loam-node.yaml
+    as: node
+    params:
+      mesh_roots: "${param:mesh_roots}"
+      ns_wal: "${param:ns_wal}"
+      obj_wal: "${param:obj_wal}"
+      body_dir: "${param:body_dir}"
+      spool_dir: "${param:spool_dir}"
 
 modules:
   - name: http
@@ -43,30 +104,6 @@ modules:
     max_object_mib: ${param:max_object_mib}
     part_min_kib: ${param:part_min_kib}
 
-  - name: object_provider
-    variant: node
-    spool_dir: "${param:spool_dir}"
-
-  - name: admin_gate
-    variant: node
-    mesh_roots: ${param:mesh_roots}
-
-  - name: admin_router
-    variant: node
-    gc_interval: ${param:gc_interval}
-
-  - name: namespace_router
-    variant: node
-    wal_path: "${param:ns_wal}"
-
-  - name: object_index
-    variant: node
-    wal_path: "${param:obj_wal}"
-
-  - name: body_store
-    variant: node
-    root_dir: "${param:body_dir}"
-
 wiring:
   - from: linux_net.net_out
     to: http.net_in
@@ -77,36 +114,3 @@ wiring:
     to: s3_serve.request_in
   - from: s3_serve.response_out
     to: http.response_in
-
-  # The provider's link: one record per buffer, both ways.
-  - from: object_provider.admin_out
-    to: admin_gate.link0_in
-    buffer_group: 3
-  - from: admin_gate.link0_out
-    to: object_provider.admin_in
-    buffer_group: 4
-
-  # One request, and one answer, per buffer: the router and the gate
-  # each read a record whole. The object index likewise. The namespace
-  # and body edges are byte streams their readers reassemble.
-  - from: admin_gate.admin_req
-    to: admin_router.admin_in
-    buffer_group: 5
-  - from: admin_router.admin_out
-    to: admin_gate.admin_resp
-    buffer_group: 6
-
-  - from: admin_router.ns_req
-    to: namespace_router.requests
-  - from: namespace_router.responses
-    to: admin_router.ns_resp
-  - from: admin_router.obj_req
-    to: object_index.object_requests
-    buffer_group: 7
-  - from: object_index.object_responses
-    to: admin_router.obj_resp
-    buffer_group: 8
-  - from: admin_router.body_req
-    to: body_store.body_requests
-  - from: body_store.body_responses
-    to: admin_router.body_resp

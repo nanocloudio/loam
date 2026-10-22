@@ -1,7 +1,7 @@
 # The loam operator applet as a fluxor cli-applet: one module over the
 # cli stack, dialing a node's admin plane through a client-mode `tls`.
 #
-#   fluxor install packaging/cli/workload.toml
+#   fluxor install loam
 #   fluxor exec loam -- --admin node:7443 --capability ops.cap ls tenant
 #
 # The node's certificate must chain to a CA the host trusts (the bundle

@@ -1,0 +1,140 @@
+# loam-node: one loam storage node, reached through its exchange front.
+#
+#   request_in  ─▶ front (object_exchange) ── storage.object ──▶ provider
+#   response_out ◀─┘                                                ⇅ link 0
+#                                                                  gate
+#                                                                   ⇅
+#                                                                 router
+#                                                  ⇅                ⇅               ⇅
+#                                              namespace          index           bodies
+#
+# `front` is fluxor's `object_exchange`: an exchange provider that answers
+# `GET`/`HEAD`/`PUT`/`DELETE /<key>` and `GET /?list…` by calling the graph's
+# `storage.object` provider, which here is the node's `provider`. A key is
+# `root/path`, and the front's scope is its root: under the scope `photos/`,
+# `PUT /a.jpg` writes path `a.jpg` under root `photos`, and no target names
+# anything outside the scope.
+#
+# Authority: `provider` admits nothing on its say-so. A module that calls
+# the object surface presents a capability for a scope and works under the
+# grant the gate gives it (wave's `s3_serve` does, one per access key).
+# The front is such a caller: given `front_scope` and `front_capability`,
+# it presents them to `provider` once and names the grant it is given on
+# every call it makes, so the gate decides each request against that
+# grant's scope, permissions and window. Left empty, the front presents
+# nothing and every request through it is refused 403. Whoever is wired
+# to `request_in` acts with the front's capability: the graph's wiring is
+# the trust boundary for in-graph callers.
+stack: loam-node
+version: 0.1.0
+description: >-
+  A loam storage node: the storage.object provider, the capability-gated
+  admin plane, the namespace, the object index and the body store, fronted
+  by fluxor's object_exchange.
+
+params:
+  ns_wal:
+    type: string
+    required: true
+    example: /var/lib/loam/ns.wal
+    description: The namespace's write-ahead log; its snapshots live beside it
+  obj_wal:
+    type: string
+    required: true
+    example: /var/lib/loam/obj.wal
+    description: The object index's write-ahead log
+  body_dir:
+    type: string
+    required: true
+    example: /var/lib/loam/bodies
+    description: Directory holding the bodies, one file per content digest
+  spool_dir:
+    type: string
+    required: true
+    example: /var/lib/loam/spool
+    description: Directory streamed writes are spooled in until they commit (at most 192 bytes)
+  mesh_roots:
+    type: string
+    required: true
+    example: "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+    description: Mesh root keys every capability verifies against, one or two 64-hex Ed25519 keys, comma-separated
+  gc_interval:
+    type: integer
+    default: 0
+    min: 0
+    max: 4294967295
+    description: Steps between orphan-sweep pages; 0 leaves the sweep off
+  front_scope:
+    type: string
+    default: ""
+    description: >-
+      The key prefix the front's capability grants and the root every
+      request names objects under, ending `/` (a bucket: `photos/`), at
+      most 255 bytes. Given with front_capability, or both left empty
+  front_capability:
+    type: string
+    default: ""
+    description: >-
+      The front's capability chain, text form (`fxcap1.…`, as `fluxor modules
+      cap mint --scope` prints it), naming front_scope: at most 1375 bytes,
+      1 to 8 links. The front presents it to the node's provider; `read_state`
+      admits reads and listings, `send_command` writes and deletes
+
+exports:
+  # The storage front: the exchange contract's provider ports.
+  request_in: front.request_in
+  response_out: front.response_out
+
+modules:
+  - name: front
+    type: object_exchange
+    scope: "${param:front_scope}"
+    capability: "${param:front_capability}"
+
+  - name: provider
+    type: object_provider
+    variant: node
+    spool_dir: "${param:spool_dir}"
+
+  - name: gate
+    type: admin_gate
+    variant: node
+    mesh_roots: ${param:mesh_roots}
+
+  - name: router
+    type: admin_router
+    variant: node
+    gc_interval: ${param:gc_interval}
+
+  - name: namespace
+    type: namespace_router
+    variant: node
+    wal_path: "${param:ns_wal}"
+
+  - name: index
+    type: object_index
+    variant: node
+    wal_path: "${param:obj_wal}"
+
+  - name: bodies
+    type: body_store
+    variant: node
+    root_dir: "${param:body_dir}"
+
+wiring:
+  # The provider's link to the gate: one record per buffer, both ways. The
+  # link is a channel inside the graph, so the gate needs no listener.
+  - { from: provider.admin_out, to: gate.link0_in, buffer_group: 26 }
+  - { from: gate.link0_out, to: provider.admin_in, buffer_group: 27 }
+
+  # One request, and one answer, per buffer: the router and the gate each
+  # read a record whole, and the object index likewise. The namespace and
+  # body edges are byte streams their readers reassemble.
+  - { from: gate.admin_req, to: router.admin_in, buffer_group: 28 }
+  - { from: router.admin_out, to: gate.admin_resp, buffer_group: 29 }
+  - { from: router.ns_req, to: namespace.requests }
+  - { from: namespace.responses, to: router.ns_resp }
+  - { from: router.obj_req, to: index.object_requests, buffer_group: 30 }
+  - { from: index.object_responses, to: router.obj_resp, buffer_group: 31 }
+  - { from: router.body_req, to: bodies.body_requests }
+  - { from: bodies.body_responses, to: router.body_resp }

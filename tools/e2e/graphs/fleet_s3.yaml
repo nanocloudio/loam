@@ -8,7 +8,8 @@
 #              member 1 ⇄ remote_channel (dial) ⇄ tls ⇄ linux_net ⇄ loam-body B
 #
 # Each member's channel carries body frames record for record over its own
-# mutually authenticated session. Rendered by tools/e2e/fleet.sh.
+# mutually authenticated session. tools/e2e/fleet.sh runs it with its
+# params.
 target: linux
 tick_us: 100
 
@@ -17,6 +18,65 @@ scheduler:
 
 platform:
   net: {}
+
+params:
+  port:
+    type: integer
+    required: true
+    example: 9000
+    min: 1
+    max: 65535
+    description: The S3 port
+  credentials:
+    type: string
+    required: true
+    example: /etc/loam/s3-credentials
+    description: "The credentials file: access key, secret, scope and capability per line"
+  mesh_roots:
+    type: string
+    required: true
+    example: "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+    description: The mesh root the capabilities verify against
+  spool_dir:
+    type: string
+    required: true
+    example: /var/lib/loam/spool
+    description: Directory streamed writes are spooled in until they commit
+  ns_wal:
+    type: string
+    required: true
+    example: /var/lib/loam/ns.wal
+    description: The namespace's write-ahead log
+  obj_wal:
+    type: string
+    required: true
+    example: /var/lib/loam/obj.wal
+    description: The object index's write-ahead log
+  ca:
+    type: file
+    required: true
+    example: ../../../packaging/samples/ca.pem
+    description: CA bundle the body nodes' certificates chain to
+  cert:
+    type: file
+    required: true
+    example: ../../../packaging/samples/node.der
+    description: This router's client certificate, DER
+  key:
+    type: file
+    required: true
+    example: ../../../packaging/samples/node.key.der
+    description: This router's private key, DER
+  member_a:
+    type: string
+    required: true
+    example: "localhost:7444"
+    description: The first body node, host:port
+  member_b:
+    type: string
+    required: true
+    example: "localhost:7445"
+    description: The second body node, host:port
 
 modules:
   - name: http

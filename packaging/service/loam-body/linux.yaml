@@ -1,4 +1,4 @@
-# The loam-body template: a body store behind one mutually
+# The loam-body service graph: a body store behind one mutually
 # authenticated session.
 #
 #   router node                               this node
@@ -22,6 +22,34 @@ scheduler:
 
 platform:
   net: {}
+
+params:
+  port:
+    type: integer
+    default: 7444
+    min: 1
+    max: 65535
+    description: "TCP port the body plane accepts its router's session on"
+  body_dir:
+    type: string
+    required: true
+    example: /var/lib/loam/bodies
+    description: "Directory holding the bodies, one file per content digest"
+  ca:
+    type: file
+    required: true
+    example: ../../samples/ca.pem
+    description: "CA bundle a router's client certificate must chain to (PEM or DER)"
+  cert:
+    type: file
+    required: true
+    example: ../../samples/node.der
+    description: "This node's certificate, DER"
+  key:
+    type: file
+    required: true
+    example: ../../samples/node.key.der
+    description: "This node's private key, DER"
 
 modules:
   - name: body_tls

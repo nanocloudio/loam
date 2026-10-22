@@ -34,7 +34,7 @@ loam/
 │   └── common/               # shared no_std source, split by storage tier
 │       ├── mechanics/        #   single-node fence classes; fluxor-only
 │       └── replicated/       #   quorum fence classes; may reach clustor
-├── packaging/                # service bundles and templates, the applet's bundle
+├── packaging/                # what ships: the stack, service bundles, the applet
 ├── examples/                 # reference graphs
 ├── tests/harness/            # the module harness: every unit test
 ├── tools/                    # CI, graph and service gates; diagnostics
@@ -53,7 +53,7 @@ manifests, so a misnamed port or parameter is refused before
 anything runs. A module's surface is what its `manifest.toml`
 declares and its fence is what its dispatch returns; nothing else
 restates either. A service bundle (`packaging/service/`) is a graph
-plus the modules it pins plus a declared parameter schema, run with
+plus the modules it pins, its graph declaring its params, run with
 `fluxor run <bundle> --param …`.
 
 Fence + storage-handle types come from `fluxor-contracts`.

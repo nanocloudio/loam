@@ -35,9 +35,8 @@ convention shared with wave, spectra and quantum.
 `service_lib.sh` holds the service gates' shared setup (a work
 directory, a CA and identities, a mesh root and capabilities, graphs
 stopped by their own process tree); `graph_run.sh` the graph gates'.
-`render_service.py` fills a template's `${param:…}` values for the
-mTLS templates under `packaging/mtls/`; `nbd_client.py` is the NBD
-client the `nbd` gate drives the device with.
+`nbd_client.py` is the NBD client the `nbd` gate drives the device
+with.
 
 ## `diag/`
 

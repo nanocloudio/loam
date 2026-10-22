@@ -6,7 +6,7 @@
 
 // Loam's operator applet: `fluxor exec loam -- <command> …`. Step body in
 // `modules/common/mechanics/loam_cli_body.rs`; ports in `manifest.toml`;
-// the graph it runs in, `packaging/cli/linux.yaml`.
+// the graph it runs in, `packaging/applet/loam/linux.yaml`.
 
 use core::ffi::c_void;
 

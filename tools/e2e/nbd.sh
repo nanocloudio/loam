@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # A loam volume as an NBD block device:
 #
-#   a loam-admin node (packaging/mtls/loam-admin) holding the volume, made
-#   with the `loam` applet;
+#   a loam-admin node (packaging/service/loam-admin) holding the volume,
+#   made with the `loam` applet;
 #
-#   the loam-nbd template (packaging/mtls/loam-nbd): nbd_serve over
+#   the loam-nbd service (packaging/service/loam-nbd): nbd_serve over
 #   loam_volume, which reaches the node over mutual TLS and holds the
 #   volume's writer lease.
 #
@@ -40,11 +40,10 @@ BODY_PLANE=$(body_plane_object)
 
 ADMIN=$(free_port)
 mkdir -p "$W/node/bodies"
-python3 "$ROOT/tools/e2e/render_service.py" "$ROOT/packaging/mtls/loam-admin/linux.yaml" \
-  "$W/node.yaml" port="$ADMIN" mesh_roots="$MESH" ns_wal="$W/node/ns.wal" \
-  obj_wal="$W/node/obj.wal" body_dir="$W/node/bodies" gc_interval=0 \
-  ca="$W/pki/ca.pem" cert="$W/pki/server.der" key="$W/pki/server.key.der"
-graph_start "$W/node.log" "$W/node.yaml"
+graph_start "$W/node.log" loam-admin --param port="$ADMIN" --param mesh_roots="$MESH" \
+  --param ns_wal="$W/node/ns.wal" --param obj_wal="$W/node/obj.wal" \
+  --param body_dir="$W/node/bodies" --param gc_interval=0 \
+  --param ca="$W/pki/ca.pem" --param cert="$W/pki/server.der" --param key="$W/pki/server.key.der"
 wait_log "$W/node.log" "listening on port $ADMIN"
 
 applet_env() {
@@ -55,7 +54,7 @@ applet_env() {
 }
 mkdir -p "$W/home/.config/loam"
 cp "$W/pki/client.der" "$W/pki/client.key.der" "$W/home/.config/loam/"
-(applet_env && cd "$ROOT" && fluxor install packaging/cli/workload.toml) >"$W/install.log" 2>&1 ||
+(applet_env && cd "$ROOT" && fluxor install packaging/applet/loam/workload.toml) >"$W/install.log" 2>&1 ||
   fail "installing the applet"
 loam() {
   (applet_env && timeout 120 fluxor exec loam -- --admin "localhost:$ADMIN" --capability "$W/ops.cap" "$@") \
@@ -71,11 +70,10 @@ loam volume create tenant /vols/v0 "$SIZE" 32768
 pass "the volume is created"
 
 device() { # <name> <port> <capability> — run a device; its pid in GRAPH_PID
-  python3 "$ROOT/tools/e2e/render_service.py" "$ROOT/packaging/mtls/loam-nbd/linux.yaml" \
-    "$W/$1.yaml" port="$2" admin="localhost:$ADMIN" capability="$3" root=tenant \
-    path=/vols/v0 cert="$W/pki/client.der" key="$W/pki/client.key.der" \
-    block_size=4096 lease_ttl_ms=$LEASE_MS
-  FLUXOR_CA_BUNDLE="$W/pki/ca.pem" graph_start "$W/$1.log" "$W/$1.yaml"
+  FLUXOR_CA_BUNDLE="$W/pki/ca.pem" graph_start "$W/$1.log" loam-nbd --param port="$2" \
+    --param admin="localhost:$ADMIN" --param capability="$3" --param root=tenant \
+    --param path=/vols/v0 --param cert="$W/pki/client.der" --param key="$W/pki/client.key.der" \
+    --param block_size=4096 --param lease_ttl_ms=$LEASE_MS
 }
 
 PORT=$(free_port)

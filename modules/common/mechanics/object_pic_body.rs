@@ -290,12 +290,10 @@ unsafe fn init_state(
     s.boot = BOOT_READY;
     s.boot_reported = 0;
     s.replay_errors = 0;
-    // Zeroed is a valid idle opener and an unstarted replay.
-    core::ptr::write_bytes(
-        core::ptr::addr_of_mut!(s.opener) as *mut u8,
-        0,
-        core::mem::size_of::<super::wal::WalOpener>(),
-    );
+    // An idle opener holds no descriptor (-1): a zeroed one would name
+    // descriptor 0, which re-arming the WAL closes — another module's file.
+    s.opener = super::wal::WalOpener::new();
+    // Zeroed is an unstarted replay.
     core::ptr::write_bytes(
         core::ptr::addr_of_mut!(s.replay) as *mut u8,
         0,
