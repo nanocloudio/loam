@@ -255,6 +255,14 @@ pub const NAMESPACE_SLOTS: usize = if MINIMAL {
     8192
 };
 
+/// Subscriptions one workload owner may hold on a `namespace_router`
+/// instance unless its `sub_quota` param says otherwise, so one owner
+/// cannot take the heap the subscriptions share. The system owner — the
+/// node's own controllers — is bounded by the heap alone. Not profiled:
+/// subscription records come from the module's heap, sized at pack time
+/// from the graph's declared demand, not from a table this file sizes.
+pub const NAMESPACE_SUB_QUOTA: usize = 256;
+
 /// Object descriptor slots per `object_index` instance.
 pub const OBJECT_SLOTS: usize = if MINIMAL {
     64

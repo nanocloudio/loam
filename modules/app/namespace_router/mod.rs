@@ -64,14 +64,15 @@ mod body;
 
 /// TLV parameter schema. `tag = 1` carries `wal_path` as a UTF-8
 /// byte string; the handler copies bytes into the inline buffer on
-/// `ModuleState` and records the length. The PIC mod.rs then arms the
+/// `ModuleState` and records the length. `tag = 2` is `sub_quota`, the
+/// subscriptions one workload owner may hold. The PIC mod.rs then arms the
 /// boot with `body::open_wal_from_state`; `module_step` opens and
 /// replays the file.
 ///
 /// Tag 0 is reserved; `0xFF` is the TLV end marker.
 mod params_def {
     use super::body::{ModuleState, WAL_PATH_BUF};
-    use super::SCHEMA_MAX;
+    use super::{p_u32, SCHEMA_MAX};
 
     define_params! {
         ModuleState;
@@ -85,8 +86,17 @@ mod params_def {
                 }
                 s.wal_path_len = len as u16;
             };
+        // Subscriptions one workload owner may hold; 0 (or absent)
+        // takes the register's default, `NAMESPACE_SUB_QUOTA`.
+        2, sub_quota, u32, 0
+            => |s, d, len| { s.sub_quota = p_u32(d, len, 0, 0); };
     }
 }
+
+// The heap the subscription records come from: the declared figure is
+// the base the manifest's `heap_per_demand` adds the graph's planned
+// subscriptions to (`pack` holds the two equal).
+declare_module_arena_bytes!(body::SUB_ARENA_BASE);
 
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
@@ -164,6 +174,16 @@ pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
 #[link_section = ".text.module_provides_contract"]
 pub extern "C" fn module_provides_contract() -> u32 {
     body::CONTRACT_STORAGE_NAMESPACE
+}
+
+/// Subscribes this provider to `OWNER_RELEASED`: a released owner's
+/// subscriptions and handles are dropped at once (see the body's
+/// `provider_dispatch_impl`). An early reclaim only — a subscription it
+/// misses fails `MODULE_LIVE` before its next signal.
+#[no_mangle]
+#[link_section = ".text.module_observes_owner_release"]
+pub extern "C" fn module_observes_owner_release() -> u32 {
+    1
 }
 
 /// # Safety

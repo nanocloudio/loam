@@ -60,6 +60,8 @@ pub struct NsOpenSlot {
     pub in_use: u8,
     pub slot: u32,
     pub revision: u64,
+    /// The opener's owner record: the handle answers it alone.
+    pub owner: [u8; 8],
 }
 const READ_BUF: usize = 256;
 /// Reassembly capacity for `requests`. Sized to hold a full step's
@@ -257,49 +259,107 @@ pub struct ModuleState {
     pub snapshots_written: u32,
     pub evictions: u32,
     pub snap_misses: u32,
-    /// Live `namespace::SUBSCRIBE` registrations. Each holds the
-    /// prefix it watches and the channel to push `namespace.change`
-    /// onto.
-    pub subs: [SubSlot; NS_SUB_MAX],
-    /// Scratch for one encoded event. Sized from the register.
-    pub event_buf: [u8; super::change_wire::EVENT_MAX],
+    /// Live `namespace::SUBSCRIBE` registrations: each watches a prefix
+    /// and rings its subscriber's own kernel event (see `ring_sub`).
+    /// Records live on the module's heap, a page of `SUB_PAGE_RECORDS`
+    /// at a time, taken as subscriptions arrive and never returned; this
+    /// table indexes the pages, and its length is the handle band's
+    /// (`SUB_INDEX_MAX`), a format bound rather than a capacity. All
+    /// zero is the empty table.
+    pub sub_pages: [*mut SubPage; SUB_PAGES_MAX],
+    /// Pages taken so far: the records `0..sub_page_count × page` exist.
+    pub sub_page_count: u32,
+    /// The first free record, as its index + 1; 0 when none is free.
+    /// Freed records are threaded through `SubSlot::next_free` and
+    /// reused before another page is asked for.
+    pub sub_free: u32,
+    /// Subscriptions one workload owner may hold (`sub_quota` param);
+    /// 0 takes `NAMESPACE_SUB_QUOTA`.
+    pub sub_quota: u32,
+    /// The change-stream position the subscriptions have been rung up
+    /// to: `ring_changes` rings for every slot stamped past it.
+    pub rung_seq: u64,
+    /// Subscriptions dropped because their module occupancy ended or
+    /// their event slot passed to another module (or was freed).
+    pub subs_reaped: u32,
+    /// SUBSCRIBEs refused: past an owner's quota, or the heap spent.
+    pub subs_refused: u32,
+    /// Of those, the ones refused because the heap had no page to give.
+    pub subs_heap_denied: u32,
 }
 
-/// Concurrent change subscriptions. Small on purpose: each slot costs
-/// its prefix inline, and a graph wires a bounded set of consumers.
-pub const NS_SUB_MAX: usize = 8;
-
-/// One `namespace::SUBSCRIBE` registration.
+/// One `namespace::SUBSCRIBE` registration: a doorbell, not a stream.
+/// Nothing is ever written to a subscriber's channel; a change under
+/// the prefix sets `rung` and signals `event`, once until the
+/// subscriber takes it (`TAKE_RUNG`), and the subscriber reads what
+/// changed with `CHANGES`.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct SubSlot {
     pub in_use: u8,
-    /// Set when a push was refused by a full channel. The subscriber's
-    /// view is now incomplete, so it is owed a LOST sentinel and
-    /// nothing else until it has been sent one. Dropping events
-    /// silently is the failure this flag exists to make impossible.
-    pub lost_pending: u8,
-    pub prefix: [u8; super::limits::MAX_PATH],
+    /// Set by a change under the prefix, cleared by `TAKE_RUNG`. While
+    /// set, further changes signal nothing: the take is still to come.
+    pub rung: u8,
+    /// A `CHANGES` naming this subscription was answered `EAGAIN`; the
+    /// next step rings it again, so a consumer woken only by its event
+    /// never stalls on the wait.
+    pub deferred: u8,
+    /// The subscriber's owner record: the handle answers it alone.
+    pub owner: [u8; 8],
+    /// The subscriber's module occupancy (`CALLER_MODULE`): checked
+    /// with `MODULE_LIVE` and against the event's owner before every
+    /// signal.
+    pub module: [u8; 8],
+    /// The subscriber's tagged event fd.
+    pub event: i32,
+    /// While free: the next free record, as its index + 1 (0 = none).
+    pub next_free: u32,
     pub prefix_len: u16,
-    pub sink_chan: i32,
-    pub sequence: u32,
+    pub prefix: [u8; SUB_PREFIX_MAX],
 }
 
 impl SubSlot {
-    pub const fn empty() -> Self {
-        Self {
-            in_use: 0,
-            lost_pending: 0,
-            prefix: [0u8; super::limits::MAX_PATH],
-            prefix_len: 0,
-            sink_chan: -1,
-            sequence: 0,
-        }
-    }
     pub fn prefix(&self) -> &[u8] {
-        &self.prefix[..self.prefix_len as usize]
+        &self.prefix[..(self.prefix_len as usize).min(SUB_PREFIX_MAX)]
     }
 }
+
+/// The longest prefix a subscription holds: the longest key a `CHANGES`
+/// record can name (`STORAGE_KEY_MAX`), so a longer prefix could match
+/// nothing it could report. A format bound, the same on every profile —
+/// which keeps a record's size, and so the heap each one costs, one
+/// figure for the manifest's `heap_per_demand`.
+pub const SUB_PREFIX_MAX: usize = 255;
+const _: () = assert!(SUB_PREFIX_MAX == super::abi::contracts::storage::handle::STORAGE_KEY_MAX);
+/// Records per heap allocation.
+pub const SUB_PAGE_RECORDS: usize = 16;
+/// Subscription handles occupy `SUB_HANDLE_BASE .. SUB_HANDLE_BASE +
+/// SUB_INDEX_MAX`: the band's width is the most records the index can
+/// name — a format bound of the handle field, not a capacity; the heap
+/// binds long before it.
+pub const SUB_INDEX_MAX: usize = 0x4000;
+/// Page pointers the index holds.
+pub const SUB_PAGES_MAX: usize = SUB_INDEX_MAX / SUB_PAGE_RECORDS;
+const _: () = assert!(SUB_INDEX_MAX.is_multiple_of(SUB_PAGE_RECORDS));
+
+/// One heap allocation of subscription records.
+#[repr(C)]
+pub struct SubPage {
+    pub recs: [SubSlot; SUB_PAGE_RECORDS],
+}
+
+/// Heap bytes one page costs: its size on the allocator's 16-byte grain,
+/// plus the block header and a grain of slack.
+pub const SUB_PAGE_HEAP_BYTES: usize = core::mem::size_of::<SubPage>().next_multiple_of(16) + 16;
+/// Heap bytes per subscription — the manifest's `heap_per_demand`
+/// `bytes_each`, which a test holds to this figure.
+pub const SUB_RECORD_HEAP_BYTES: usize = SUB_PAGE_HEAP_BYTES.div_ceil(SUB_PAGE_RECORDS);
+const _: () = assert!(SUB_RECORD_HEAP_BYTES * SUB_PAGE_RECORDS >= SUB_PAGE_HEAP_BYTES);
+/// The module's declared heap with no subscription demand planned: two
+/// pages — the partly used last page a demand-sized heap leaves no room
+/// for, and a spare. The manifest's `heap_per_demand` `base`, which
+/// `pack` holds to this.
+pub const SUB_ARENA_BASE: usize = 2 * SUB_PAGE_HEAP_BYTES;
 
 /// Concurrent deletion reservations. The sweep holds one at a time;
 /// the spare slots absorb a second sweep instance without making the
@@ -783,13 +843,17 @@ unsafe fn init_state(
     s.volume_resp = [0u8; super::wire::VOLUME_RESP_LEN];
     s.snap_fd = -1;
     s.wal_path_len = 0;
-    for sub in s.subs.iter_mut() {
-        sub.in_use = 0;
-        sub.lost_pending = 0;
-        sub.prefix_len = 0;
-        sub.sink_chan = -1;
-        sub.sequence = 0;
-    }
+    // The state is handed over zeroed, and all zero is the empty
+    // subscription index: no page taken, nothing free. Said again here so
+    // a re-init forgets any pages too (their heap goes with the module).
+    s.sub_pages = [core::ptr::null_mut(); SUB_PAGES_MAX];
+    s.sub_page_count = 0;
+    s.sub_free = 0;
+    s.sub_quota = 0;
+    s.rung_seq = 0;
+    s.subs_reaped = 0;
+    s.subs_refused = 0;
+    s.subs_heap_denied = 0;
     // `append_scratch` and `wal_path` are caller-zeroed; bytes are
     // overwritten as records and the TLV param flow.
     0
@@ -802,6 +866,19 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     if state_ptr.is_null() {
         return -1;
     }
+    let rc = step_body(state_ptr);
+    // Whatever the step applied — a request, a committed record, a
+    // replayed one — rings the subscriptions watching it; and a read
+    // refused for now on the last step is asked for again.
+    let s = &mut *(state_ptr as *mut ModuleState);
+    if !s.syscalls.is_null() && s.boot == BOOT_READY {
+        ring_changes(s);
+        ring_deferred(s);
+    }
+    rc
+}
+
+unsafe fn step_body(state_ptr: *mut u8) -> i32 {
     let s = &mut *(state_ptr as *mut ModuleState);
     s.ticks = s.ticks.wrapping_add(1);
 
@@ -1482,10 +1559,14 @@ unsafe fn current(
     }
 }
 
-/// One entry of a name-ordered walk: its path and binding.
+/// One entry of a name-ordered walk: its path and binding, and the
+/// change-stream position it was last written at — the arena slot's
+/// own, or for a snapshot-only record the change horizon, which no
+/// evicted slot's position exceeds.
 struct Listed<'a> {
     path: &'a [u8],
     binding: super::wire::Binding<'a>,
+    change_rev: u64,
 }
 
 /// Walk the live bindings under `root` whose path starts with `prefix`
@@ -1590,6 +1671,7 @@ unsafe fn walk_ordered(
                             kind: slot.kind,
                             meta: wire_meta(&slot.meta()),
                         },
+                        change_rev: slot.change_rev,
                     })
                 }
             }
@@ -1614,6 +1696,7 @@ unsafe fn walk_ordered(
                                 content_type: rec.content_type(),
                             },
                         },
+                        change_rev: s.bindings.change_horizon(),
                     })
                 }
             }
@@ -2038,10 +2121,14 @@ unsafe fn apply_op(
         Err(_) => {
             // Retry once behind an eviction if the arena is FULL —
             // other rejections (AlreadyBound, NotBound) replay the
-            // same way and stay rejected.
+            // same way and stay rejected. A rename needs a slot for its
+            // new name, and the eviction spares the binding it moves.
+            let spare = super::wire::decode_rename(payload)
+                .ok()
+                .map(|d| (d.namespace_root, d.from));
             if s.snap_active != 0
                 && s.bindings.occupied_count() == s.bindings.capacity()
-                && s.bindings.evict_one_snapshotted()
+                && s.bindings.evict_one_snapshotted_sparing(spare)
             {
                 s.evictions = s.evictions.wrapping_add(1);
                 return apply_to_arena(&mut s.bindings, payload).map_err(|_| ApplyFault::Rejected);
@@ -2790,9 +2877,11 @@ unsafe fn merge_slice(s: &mut ModuleState, syscalls: &super::SyscallTable) -> bo
     false
 }
 
-/// Decode a RENAME record and apply it to the arena. Binds and
-/// unbinds are decided in `apply_op`, against the snapshot as well as
-/// the arena.
+/// Decode a RENAME record and apply it to the arena: the new name bound
+/// and a tombstone at the old one (`PicNamespaceState::rename`), so the
+/// change stream reports both halves on every replica and every replay.
+/// Binds and unbinds are decided in `apply_op`, against the snapshot as
+/// well as the arena.
 pub(super) fn apply_to_arena(
     bindings: &mut super::state::PicNamespaceState<ARENA_CAPACITY>,
     payload: &[u8],
@@ -2818,19 +2907,18 @@ pub(super) fn apply_to_arena(
 // by resolving `module_provides_contract` + `module_provider_dispatch`,
 // so a declaration without them advertises a surface nothing can reach.
 //
-// COST NOTE. `SUBSCRIBE`'s initial listing and `CHANGES` both walk
-// the whole arena inside one `provider_call`. That is O(arena), the
-// same order every other op here already pays — `live_slot` scans
-// linearly for LOOKUP, STAT and DELETE — so it is consistent with
-// the module rather than a new hazard. It is still a real number at
-// service-class capacity (8192 slots), and paging `CHANGES` on a
-// cursor the way `LIST` and `OP_REFERENCED` are paged is the obvious
-// next move if it starts to bind. The OUTPUT is already bounded: a
-// window that does not fit the caller's buffer answers LOST.
+// COST NOTE. Nothing here is unbounded per call. A delta `CHANGES`
+// page scans the arena once per bisection step (O(arena · log window))
+// and its output is cut to the caller's buffer at a revision; a relist
+// page walks names exactly as `LIST` does. The subscription ring runs
+// once per call or step that moved the change stream: one arena scan,
+// then the subscription table per changed key — the same order every
+// other op here already pays (`live_slot` scans linearly for LOOKUP,
+// STAT and DELETE).
 //
 // What is implemented is exactly what `CAPS` reports, and that is now
 // the whole surface: the mandatory read ops, BIND, RENAME, DELETE,
-// and the two change ops. SUBSCRIBE and CHANGES are what make loam
+// and the change ops (SUBSCRIBE, TAKE_RUNG, CHANGES). They are what make loam
 // usable as a control-plane store — level-triggered reconciliation is
 // how nanocloud's forty store-consuming modules are built, and a
 // store that must be polled cannot be that store.
@@ -2847,7 +2935,13 @@ pub const NS_OP_SUBSCRIBE: u32 = 0x1305;
 pub const NS_OP_CHANGES: u32 = 0x1307;
 pub const NS_OP_CLOSE: u32 = 0x1306;
 pub const NS_OP_BIND: u32 = 0x1308;
+pub const NS_OP_TAKE_RUNG: u32 = 0x1309;
 pub const NS_OP_CAPS: u32 = 0x13FF;
+
+/// `internal::reconfigure::OWNER_RELEASED`: the kernel tells a provider
+/// that exports `module_observes_owner_release` that an owner is going
+/// away; the argument is its 8-byte owner record.
+pub const OWNER_RELEASED: u32 = 0x0C22;
 
 /// Capability bits this provider sets: BIND(0), RENAME(1), DELETE(2),
 /// SUBSCRIBE(3), CHANGES(4). Every optional op on the surface. The
@@ -3029,76 +3123,288 @@ unsafe fn respond(s: &mut ModuleState, syscalls: &super::SyscallTable, byte: u8)
     let _ = s.reply.send(syscalls.channel_write, s.out_chan, &[byte]);
 }
 
-/// Push one change to every subscriber watching a matching prefix.
-///
-/// Called AFTER the arena has been mutated, so what a subscriber sees
-/// is a change that happened, never one that was about to. A sink
-/// that refuses the write (a full channel) does not lose the event
-/// quietly: the subscription is flagged `lost_pending`, and the next
-/// successful push is the LOST sentinel, which tells the consumer to
-/// relist through `CHANGES` instead of trusting an incomplete stream.
-/// Silent loss is the one failure a level-triggered reconciler cannot
-/// detect for itself, which is why it is not an option here.
-unsafe fn notify_change(
-    s: &mut ModuleState,
-    syscalls: &super::SyscallTable,
-    kind: u8,
-    key: &[u8],
-    value: &[u8],
-) {
-    // The arena stamped this mutation as it applied it, so the event
-    // and the slot carry the SAME position — a subscriber and a
-    // `CHANGES` caller therefore agree about ordering, which is the
-    // whole point of the pair.
-    let rev = s.bindings.change_seq();
-    for i in 0..NS_SUB_MAX {
-        if s.subs[i].in_use == 0 || s.subs[i].sink_chan < 0 {
-            continue;
-        }
-        if !super::change_wire::under_prefix(key, s.subs[i].prefix()) {
-            continue;
-        }
-        push_to_sub(s, syscalls, i, rev, kind, key, value);
+// ── Subscriptions: doorbells on the subscriber's own event ─────────
+
+/// `query_key::CALLER_MODULE`, `MODULE_LIVE`, `EVENT_OWNER` and
+/// `kernel_abi::event::SIGNAL`.
+const CALLER_MODULE: u32 = 10;
+const MODULE_LIVE: u32 = 11;
+const EVENT_OWNER: u32 = 12;
+const EVENT_SIGNAL: u32 = 0x0B01;
+
+/// An 8-byte record from `provider_query(handle, key)`, or `None` when
+/// the kernel answers none. All zero is a record too: module 0 at
+/// generation 0.
+unsafe fn query8(s: &ModuleState, handle: i32, key: u32) -> Option<[u8; 8]> {
+    if s.syscalls.is_null() {
+        return None;
+    }
+    let mut b = [0u8; 8];
+    let rc = ((*s.syscalls).provider_query)(handle, key, b.as_mut_ptr(), b.len());
+    (rc >= 8).then_some(b)
+}
+
+/// The module occupancy calling in: `(module idx, slot generation)`.
+unsafe fn caller_module(s: &ModuleState) -> Option<[u8; 8]> {
+    query8(s, -1, CALLER_MODULE)
+}
+
+/// Whether a module occupancy still stands: its slot holds that
+/// generation and its module has not finished.
+unsafe fn module_live(s: &ModuleState, module: [u8; 8]) -> bool {
+    if s.syscalls.is_null() {
+        return false;
+    }
+    let mut rec = module;
+    ((*s.syscalls).provider_query)(-1, MODULE_LIVE, rec.as_mut_ptr(), rec.len()) == 1
+}
+
+/// The module occupancy owning event `event`, or `None` when it is not
+/// allocated.
+unsafe fn event_owner(s: &ModuleState, event: i32) -> Option<[u8; 8]> {
+    query8(s, event, EVENT_OWNER)
+}
+
+/// Signal `event`; negative when the kernel refused (a freed event).
+unsafe fn signal(s: &ModuleState, event: i32) -> i32 {
+    if s.syscalls.is_null() {
+        return E_INVAL;
+    }
+    ((*s.syscalls).provider_call)(event, EVENT_SIGNAL, core::ptr::null_mut(), 0)
+}
+
+/// The subscription records that exist: every taken page's.
+fn sub_cap(s: &ModuleState) -> usize {
+    (s.sub_page_count as usize).min(SUB_PAGES_MAX) * SUB_PAGE_RECORDS
+}
+
+/// Subscription record `i`, if its page has been taken.
+fn sub(s: &ModuleState, i: usize) -> Option<&SubSlot> {
+    let page = *s.sub_pages.get(i / SUB_PAGE_RECORDS)?;
+    if page.is_null() {
+        return None;
+    }
+    // SAFETY: a non-null page pointer is a page this module took from its
+    // heap and never returns; nothing else holds a reference into it.
+    unsafe { (*page).recs.get(i % SUB_PAGE_RECORDS) }
+}
+
+fn sub_mut(s: &mut ModuleState, i: usize) -> Option<&mut SubSlot> {
+    let page = *s.sub_pages.get(i / SUB_PAGE_RECORDS)?;
+    if page.is_null() {
+        return None;
+    }
+    // SAFETY: as for `sub`, through the state's unique borrow.
+    unsafe { (*page).recs.get_mut(i % SUB_PAGE_RECORDS) }
+}
+
+/// Whether record `i` holds a live subscription.
+fn sub_live(s: &ModuleState, i: usize) -> bool {
+    sub(s, i).is_some_and(|r| r.in_use != 0)
+}
+
+/// End subscription `i` and put its record on the free list, to be
+/// reused before another page is asked for.
+fn release_sub(s: &mut ModuleState, i: usize) {
+    let head = s.sub_free;
+    let Some(r) = sub_mut(s, i) else {
+        return;
+    };
+    if r.in_use == 0 {
+        return;
+    }
+    r.in_use = 0;
+    r.rung = 0;
+    r.deferred = 0;
+    r.next_free = head;
+    s.sub_free = i as u32 + 1;
+}
+
+/// Drop subscription `i` as dead: released and counted.
+fn reap_sub(s: &mut ModuleState, i: usize) {
+    if sub_live(s, i) {
+        release_sub(s, i);
+        s.subs_reaped = s.subs_reaped.wrapping_add(1);
     }
 }
 
-/// Encode and push one event to subscription `i`, settling any owed
-/// LOST sentinel first.
-unsafe fn push_to_sub(
-    s: &mut ModuleState,
-    syscalls: &super::SyscallTable,
-    i: usize,
-    rev: u64,
-    kind: u8,
-    key: &[u8],
-    value: &[u8],
-) {
-    let chan = s.subs[i].sink_chan;
-    if s.subs[i].lost_pending != 0 {
-        let seq = s.subs[i].sequence;
-        let Some(n) = super::change_wire::encode_lost_event(&mut s.event_buf, seq, rev) else {
-            return;
-        };
-        if (syscalls.channel_write)(chan, s.event_buf.as_ptr(), n) != n as i32 {
-            return; // still blocked; stay owed
-        }
-        s.subs[i].sequence = seq.wrapping_add(1);
-        s.subs[i].lost_pending = 0;
-        // The sentinel told the consumer to relist, so this event is
-        // covered by the relist it will now perform.
-        return;
-    }
-    let seq = s.subs[i].sequence;
-    let Some(n) = super::change_wire::encode_event(&mut s.event_buf, seq, rev, kind, key, value)
-    else {
-        s.subs[i].lost_pending = 1;
-        return;
+/// Ring subscription `i`: set its rung bit and signal its event, once
+/// until it is taken. Before every signal the subscriber's module
+/// occupancy must still stand and its event still be that module's — a
+/// subscription whose module is gone, or whose event slot another
+/// module now holds, is dropped and never signalled, so a stale handle
+/// costs nobody a wake. `false` when it was dropped.
+unsafe fn ring_sub(s: &mut ModuleState, i: usize) -> bool {
+    let Some(r) = sub(s, i).filter(|r| r.in_use != 0) else {
+        return false;
     };
-    if (syscalls.channel_write)(chan, s.event_buf.as_ptr(), n) == n as i32 {
-        s.subs[i].sequence = seq.wrapping_add(1);
-    } else {
-        s.subs[i].lost_pending = 1;
+    if r.rung != 0 {
+        return true;
     }
+    let (module, event) = (r.module, r.event);
+    if !module_live(s, module) || event_owner(s, event) != Some(module) || signal(s, event) < 0 {
+        reap_sub(s, i);
+        return false;
+    }
+    if let Some(r) = sub_mut(s, i) {
+        r.rung = 1;
+    }
+    true
+}
+
+/// Ring every subscription watching a key the arena has stamped since
+/// the last call. The arena's change stream is the one place every
+/// mutation lands — the provider surface, the request and committed
+/// streams, the replay — so nothing that changes a key can skip this.
+/// When the change horizon has passed what was rung (a change left the
+/// arena before it was seen), every subscription is rung: its next
+/// read answers LOST and it relists.
+///
+/// The provider surface is the empty root's flat keyspace, so only its
+/// keys ring. O(arena + changed keys × subscriptions), paid only when
+/// the stream has moved.
+unsafe fn ring_changes(s: &mut ModuleState) {
+    let head = s.bindings.change_seq();
+    let from = s.rung_seq;
+    if head == from && s.bindings.change_horizon() <= from {
+        return;
+    }
+    s.rung_seq = head;
+    if s.bindings.change_horizon() > from {
+        for i in 0..sub_cap(s) {
+            ring_sub(s, i);
+        }
+        return;
+    }
+    for k in 0..s.bindings.capacity() {
+        let Some(slot) = s.bindings.slot_ref(k) else {
+            continue;
+        };
+        if !slot.occupied || slot.root_len != 0 || slot.change_rev <= from || slot.change_rev > head
+        {
+            continue;
+        }
+        let mut key = [0u8; super::limits::MAX_PATH];
+        let kl = (slot.path_len as usize).min(key.len());
+        key[..kl].copy_from_slice(&slot.path()[..kl]);
+        for i in 0..sub_cap(s) {
+            let watching = sub(s, i).is_some_and(|r| {
+                r.in_use != 0
+                    && r.rung == 0
+                    && super::change_wire::under_prefix(&key[..kl], r.prefix())
+            });
+            if watching {
+                ring_sub(s, i);
+            }
+        }
+    }
+}
+
+/// Ring again every subscription a `CHANGES` refused for now. Run on
+/// the step, which is what drives the snapshot fetch the read waited
+/// on.
+unsafe fn ring_deferred(s: &mut ModuleState) {
+    for i in 0..sub_cap(s) {
+        let deferred = match sub_mut(s, i) {
+            Some(r) if r.in_use != 0 && r.deferred != 0 => {
+                r.deferred = 0;
+                true
+            }
+            _ => false,
+        };
+        if deferred {
+            ring_sub(s, i);
+        }
+    }
+}
+
+/// Drop every subscription and LOOKUP handle `owner` holds: the early
+/// reclaim `OWNER_RELEASED` offers. Correctness never rests on it — a
+/// subscription it misses fails `MODULE_LIVE` before its next signal.
+fn owner_released(s: &mut ModuleState, owner: [u8; 8]) {
+    for i in 0..sub_cap(s) {
+        if sub(s, i).is_some_and(|r| r.in_use != 0 && r.owner == owner) {
+            reap_sub(s, i);
+        }
+    }
+    for h in s.ns_open.iter_mut() {
+        if h.in_use != 0 && h.owner == owner {
+            h.in_use = 0;
+        }
+    }
+}
+
+/// The live subscriptions `owner` holds, after dropping those whose
+/// module occupancy has ended.
+unsafe fn owned_subs(s: &mut ModuleState, owner: [u8; 8]) -> usize {
+    let mut n = 0usize;
+    for i in 0..sub_cap(s) {
+        let Some(module) = sub(s, i)
+            .filter(|r| r.in_use != 0 && r.owner == owner)
+            .map(|r| r.module)
+        else {
+            continue;
+        };
+        if module_live(s, module) {
+            n += 1;
+        } else {
+            reap_sub(s, i);
+        }
+    }
+    n
+}
+
+/// Take a record off the free list.
+fn pop_free(s: &mut ModuleState) -> Option<usize> {
+    let i = (s.sub_free as usize).checked_sub(1)?;
+    let next = sub(s, i)?.next_free;
+    s.sub_free = next;
+    Some(i)
+}
+
+/// A free subscription record: off the free list; else, after sweeping
+/// the dead onto it, off it again; else from a new page of the module's
+/// heap. `None` when the heap has no page to give (or the index is
+/// full) — the caller's counted `ENOMEM`.
+unsafe fn free_sub(s: &mut ModuleState) -> Option<usize> {
+    if let Some(i) = pop_free(s) {
+        return Some(i);
+    }
+    for i in 0..sub_cap(s) {
+        let module = match sub(s, i) {
+            Some(r) if r.in_use != 0 => r.module,
+            _ => continue,
+        };
+        if !module_live(s, module) {
+            reap_sub(s, i);
+        }
+    }
+    if let Some(i) = pop_free(s) {
+        return Some(i);
+    }
+    let p = s.sub_page_count as usize;
+    if p >= SUB_PAGES_MAX || s.syscalls.is_null() {
+        return None;
+    }
+    let page = ((*s.syscalls).heap_alloc)(core::mem::size_of::<SubPage>() as u32) as *mut SubPage;
+    if page.is_null() {
+        s.subs_heap_denied = s.subs_heap_denied.wrapping_add(1);
+        return None;
+    }
+    // A fresh page is all free records: zeroed, and threaded onto the
+    // free list in index order.
+    core::ptr::write_bytes(page as *mut u8, 0, core::mem::size_of::<SubPage>());
+    s.sub_pages[p] = page;
+    s.sub_page_count = p as u32 + 1;
+    let base = p * SUB_PAGE_RECORDS;
+    for k in (0..SUB_PAGE_RECORDS).rev() {
+        let head = s.sub_free;
+        if let Some(r) = sub_mut(s, base + k) {
+            r.next_free = head;
+        }
+        s.sub_free = (base + k) as u32 + 1;
+    }
+    pop_free(s)
 }
 
 /// Find the live binding for `path`, or `None`.
@@ -3137,15 +3443,49 @@ unsafe fn live_volume(s: &ModuleState, path: &[u8]) -> Result<bool, i32> {
 }
 
 unsafe fn alloc_handle(s: &mut ModuleState, slot: u32, revision: u64) -> i32 {
+    let Some(owner) = caller_owner(s) else {
+        return E_INVAL;
+    };
     for (i, h) in s.ns_open.iter_mut().enumerate() {
         if h.in_use == 0 {
             h.in_use = 1;
             h.slot = slot;
             h.revision = revision;
+            h.owner = owner;
             return i as i32;
         }
     }
     E_MFILE
+}
+
+/// `query_key::CALLER_OWNER`.
+const CALLER_OWNER: u32 = 9;
+
+/// The owner record of the module calling in; `None` when the kernel cannot
+/// name one, and then nothing is opened for it.
+unsafe fn caller_owner(s: &ModuleState) -> Option<[u8; 8]> {
+    if s.syscalls.is_null() {
+        return None;
+    }
+    let mut b = [0u8; 8];
+    let rc = ((*s.syscalls).provider_query)(-1, CALLER_OWNER, b.as_mut_ptr(), b.len());
+    // All zero is the system owner (slot 0, generation 0), not "no owner".
+    (rc >= 8).then_some(b)
+}
+
+/// Whether open handle `idx` was opened by the caller: a handle answers its
+/// opener alone, and to anyone else is as if it were not open.
+unsafe fn ns_open_by_caller(s: &ModuleState, idx: usize) -> bool {
+    idx < NS_OPEN_MAX
+        && s.ns_open[idx].in_use != 0
+        && caller_owner(s).is_some_and(|o| o == s.ns_open[idx].owner)
+}
+
+unsafe fn sub_by_caller(s: &ModuleState, idx: usize) -> bool {
+    let Some(owner) = sub(s, idx).filter(|r| r.in_use != 0).map(|r| r.owner) else {
+        return false;
+    };
+    caller_owner(s).is_some_and(|o| o == owner)
 }
 
 /// Answer one `storage.namespace` call.
@@ -3165,6 +3505,17 @@ pub unsafe fn provider_dispatch_impl(
     }
     let s = &mut *(state_ptr as *mut ModuleState);
 
+    // An owner going away: its subscriptions and handles go now. Before
+    // the boot gate — a release never waits for the store.
+    if opcode == OWNER_RELEASED {
+        if !arg.is_null() && arg_len >= 8 {
+            let mut owner = [0u8; 8];
+            core::ptr::copy_nonoverlapping(arg as *const u8, owner.as_mut_ptr(), 8);
+            owner_released(s, owner);
+        }
+        return 0;
+    }
+
     // Before the boot is done the arena is not the log's state yet, so
     // every answer but the capability bitmap would be a guess. A refused
     // boot is a failure, not a wait.
@@ -3172,6 +3523,20 @@ pub unsafe fn provider_dispatch_impl(
         return if s.boot == BOOT_FAILED { E_IO } else { E_AGAIN };
     }
 
+    let rc = dispatch_op(s, handle, opcode, arg, arg_len);
+    // A write through this surface rings its subscribers before the
+    // call returns, so the wake is as prompt as the change.
+    ring_changes(s);
+    rc
+}
+
+unsafe fn dispatch_op(
+    s: &mut ModuleState,
+    handle: i32,
+    opcode: u32,
+    arg: *mut u8,
+    arg_len: usize,
+) -> i32 {
     if opcode == super::abi::fence::QUERY_OP {
         if arg.is_null() || arg_len < super::abi::fence::WIRE_MAX_LEN {
             return E_INVAL;
@@ -3201,7 +3566,7 @@ pub unsafe fn provider_dispatch_impl(
         // `handle` is a LOOKUP handle; writes [kind][revision][target].
         NS_OP_STAT => {
             let idx = handle as usize;
-            if handle < 0 || idx >= NS_OPEN_MAX || s.ns_open[idx].in_use == 0 {
+            if handle < 0 || !ns_open_by_caller(s, idx) {
                 return E_INVAL;
             }
             let (slot_idx, pinned_rev) = (s.ns_open[idx].slot, s.ns_open[idx].revision);
@@ -3230,16 +3595,14 @@ pub unsafe fn provider_dispatch_impl(
         NS_OP_CLOSE => {
             if handle >= SUB_HANDLE_BASE {
                 let idx = (handle - SUB_HANDLE_BASE) as usize;
-                if idx >= NS_SUB_MAX || s.subs[idx].in_use == 0 {
+                if !sub_by_caller(s, idx) {
                     return E_INVAL;
                 }
-                s.subs[idx].in_use = 0;
-                s.subs[idx].sink_chan = -1;
-                s.subs[idx].lost_pending = 0;
+                release_sub(s, idx);
                 return 0;
             }
             let idx = handle as usize;
-            if handle < 0 || idx >= NS_OPEN_MAX || s.ns_open[idx].in_use == 0 {
+            if handle < 0 || !ns_open_by_caller(s, idx) {
                 return E_INVAL;
             }
             s.ns_open[idx].in_use = 0;
@@ -3310,7 +3673,9 @@ pub unsafe fn provider_dispatch_impl(
                     }
                     rev.wrapping_add(1)
                 }
-                None => 1,
+                // A deleted (or renamed-away) name binds past its
+                // tombstone, whose revision a bind must exceed.
+                None => tombstone_rev(s, path).map_or(1, |r| r.wrapping_add(1)),
             };
 
             match s
@@ -3319,24 +3684,13 @@ pub unsafe fn provider_dispatch_impl(
             {
                 Ok(_) => {
                     write_fence_out(s, fence_ptr, fence_cap);
-                    let k = if existing.is_some() {
-                        super::change_wire::KIND_MODIFIED
-                    } else {
-                        super::change_wire::KIND_ADDED
-                    };
-                    // Copy the key and value out before notifying: the
-                    // borrow of `arg` cannot outlive the &mut on state
-                    // that the push needs.
-                    let mut kb = [0u8; super::limits::MAX_PATH];
-                    let mut vb = [0u8; super::limits::MAX_OBJECT_ID];
-                    kb[..path.len()].copy_from_slice(path);
-                    vb[..target.len()].copy_from_slice(target);
-                    let (klen, vlen) = (path.len(), target.len());
-                    let sys = &*s.syscalls;
-                    notify_change(s, sys, k, &kb[..klen], &vb[..vlen]);
                     0
                 }
                 Err(super::state::ApplyError::KeyTooLong) => E_INVAL,
+                // A full arena with nothing it may evict — the whole set
+                // on a profile without the snapshot tier — is out of
+                // room, not a conflict.
+                Err(super::state::ApplyError::OutOfCapacity) => E_NOMEM,
                 Err(_) => E_EXIST,
             }
         }
@@ -3361,14 +3715,7 @@ pub unsafe fn provider_dispatch_impl(
                 None => return E_NOENT,
             };
             match s.bindings.tombstone(&[], path, rev.wrapping_add(1)) {
-                Ok(_) => {
-                    let mut kb = [0u8; super::limits::MAX_PATH];
-                    kb[..path.len()].copy_from_slice(path);
-                    let klen = path.len();
-                    let sys = &*s.syscalls;
-                    notify_change(s, sys, super::change_wire::KIND_DELETED, &kb[..klen], &[]);
-                    0
-                }
+                Ok(_) => 0,
                 Err(super::state::ApplyError::KeyTooLong) => E_INVAL,
                 Err(_) => E_NOENT,
             }
@@ -3397,11 +3744,13 @@ pub unsafe fn provider_dispatch_impl(
             off += to_len;
             let (fence_ptr, fence_cap) = read_fence_out(a, off);
 
-            // Rename is a move, so the change stream carries it as the
-            // two events a consumer's table has to apply: the old key
-            // is gone and the new one exists. Collapsing it into one
-            // event would leave every consumer holding a stale entry
-            // under the old name.
+            // Rename is a move, and a reader of the change stream has to
+            // see both halves: the new name bound, and the old one gone.
+            // So it is applied as exactly that — a bind of the new name
+            // and a tombstone at the old — rather than by re-keying the
+            // slot, which would leave no record that the old name ever
+            // went away: `CHANGES` would never report it Deleted, and
+            // every consumer would keep a stale entry under it.
             let Some((idx, rev)) = live_slot(s, from) else {
                 return E_NOENT;
             };
@@ -3413,248 +3762,88 @@ pub unsafe fn provider_dispatch_impl(
             if live_slot(s, to).is_some() {
                 return E_EXIST;
             }
-            let mut vb = [0u8; super::limits::MAX_OBJECT_ID];
-            let mut vlen = 0usize;
-            if let Some(slot) = s.bindings.slot_ref(idx as usize) {
-                let oid = slot.object_id();
-                vlen = oid.len();
-                vb[..vlen].copy_from_slice(oid);
-            }
-            match s.bindings.rename(&[], from, to, rev.wrapping_add(1)) {
-                Ok(_) => {
-                    write_fence_out(s, fence_ptr, fence_cap);
-                    let mut fb = [0u8; super::limits::MAX_PATH];
-                    let mut tb = [0u8; super::limits::MAX_PATH];
-                    fb[..from.len()].copy_from_slice(from);
-                    tb[..to.len()].copy_from_slice(to);
-                    let (flen, tlen) = (from.len(), to.len());
-                    let sys = &*s.syscalls;
-                    notify_change(s, sys, super::change_wire::KIND_DELETED, &fb[..flen], &[]);
-                    notify_change(
-                        s,
-                        sys,
-                        super::change_wire::KIND_ADDED,
-                        &tb[..tlen],
-                        &vb[..vlen],
-                    );
-                    0
-                }
-                Err(super::state::ApplyError::KeyTooLong) => E_INVAL,
-                Err(super::state::ApplyError::DestinationOccupied) => E_EXIST,
-                Err(_) => E_NOENT,
-            }
-        }
-
-        // [prefix_len u16][prefix][sink_chan u32][flags u8]
-        //
-        // Returns a subscription handle. `flags` bit 0 asks for the
-        // current listing as synthesised Added events; fluxor's own
-        // `table_consumer` core leaves it clear and takes the snapshot
-        // through CHANGES(since=0) instead, so cold start and LOST
-        // recovery run the same code. Both are supported: refusing the
-        // flag would make this provider the odd one out.
-        NS_OP_SUBSCRIBE => {
-            if arg.is_null() || arg_len < 2 {
-                return E_INVAL;
-            }
-            let a = core::slice::from_raw_parts(arg, arg_len);
-            let plen = u16::from_le_bytes([a[0], a[1]]) as usize;
-            if arg_len < 2 + plen + 5 || plen > super::limits::MAX_PATH {
-                return E_INVAL;
-            }
-            let prefix = &a[2..2 + plen];
-            let off = 2 + plen;
-            let sink = u32::from_le_bytes([a[off], a[off + 1], a[off + 2], a[off + 3]]) as i32;
-            let flags = a[off + 4];
-
-            let Some(idx) = (0..NS_SUB_MAX).find(|&i| s.subs[i].in_use == 0) else {
-                return E_MFILE;
+            let Some(src) = s.bindings.slot_ref(idx as usize).copied() else {
+                return E_NOENT;
             };
-            let mut pb = [0u8; super::limits::MAX_PATH];
-            pb[..plen].copy_from_slice(prefix);
-            s.subs[idx].prefix[..plen].copy_from_slice(prefix);
-            s.subs[idx].prefix_len = plen as u16;
-            s.subs[idx].sink_chan = sink;
-            s.subs[idx].sequence = 0;
-            s.subs[idx].lost_pending = 0;
-            s.subs[idx].in_use = 1;
-
-            if flags & 1 != 0 {
-                // Synthesise the current listing as Added events, in
-                // slot order. Bounded by the arena, like LIST.
-                let sys = &*s.syscalls;
-                for i in 0..s.bindings.capacity() {
-                    let Some(slot) = s.bindings.slot_ref(i) else {
-                        continue;
-                    };
-                    if !slot.occupied
-                        || slot.kind == super::state::KIND_TOMBSTONE
-                        || slot.path_len == 0
-                    {
-                        continue;
-                    }
-                    let mut kb = [0u8; super::limits::MAX_PATH];
-                    let mut vb = [0u8; super::limits::MAX_OBJECT_ID];
-                    let (k, v) = (slot.path(), slot.object_id());
-                    let (klen, vlen) = (k.len(), v.len());
-                    kb[..klen].copy_from_slice(k);
-                    vb[..vlen].copy_from_slice(v);
-                    let rev = slot.change_rev;
-                    if !super::change_wire::under_prefix(&kb[..klen], &pb[..plen]) {
-                        continue;
-                    }
-                    push_to_sub(
-                        s,
-                        sys,
-                        idx,
-                        rev,
-                        super::change_wire::KIND_ADDED,
-                        &kb[..klen],
-                        &vb[..vlen],
-                    );
-                }
+            if src.locked != 0 {
+                // A move is a delete as far as the old name is
+                // concerned, so a lock stops it.
+                return E_NOENT;
             }
-            SUB_HANDLE_BASE + idx as i32
+            let new_rev = rev.wrapping_add(1);
+            let to_rev = match tombstone_rev(s, to) {
+                Some(t) if t >= new_rev => t.wrapping_add(1),
+                _ => new_rev,
+            };
+            // The old name first, in place: its slot is held, and a
+            // tombstone is never evicted, so the bind below cannot take
+            // it away.
+            if remove_binding(s, &[], from, new_rev).is_err() {
+                return E_NOENT;
+            }
+            let mut res = s
+                .bindings
+                .bind(&[], to, src.object_id(), src.kind, to_rev, &src.meta());
+            if res == Err(super::state::ApplyError::OutOfCapacity)
+                && s.bindings.evict_one_snapshotted()
+            {
+                s.evictions = s.evictions.wrapping_add(1);
+                res = s
+                    .bindings
+                    .bind(&[], to, src.object_id(), src.kind, to_rev, &src.meta());
+            }
+            if let Err(e) = res {
+                // Not moved: the old name is put back as it was, over
+                // its own tombstone.
+                let _ = s.bindings.commit_bind(
+                    &[],
+                    from,
+                    src.object_id(),
+                    src.kind,
+                    src.revision,
+                    &src.meta(),
+                );
+                if src.expires_at != 0 {
+                    let _ = s.bindings.set_expiry(&[], from, src.expires_at);
+                }
+                return match e {
+                    super::state::ApplyError::KeyTooLong => E_INVAL,
+                    super::state::ApplyError::OutOfCapacity => E_NOMEM,
+                    _ => E_EXIST,
+                };
+            }
+            if src.expires_at != 0 {
+                let _ = s.bindings.set_expiry(&[], to, src.expires_at);
+            }
+            write_fence_out(s, fence_ptr, fence_cap);
+            0
         }
 
-        // [prefix_len u16][prefix][since u64][out_ptr u64][out_cap u32]
-        // [fence_out_ptr u64][fence_out_cap u16]
-        //
-        // The synchronous dual of SUBSCRIBE: "what changed under
-        // `prefix` since revision `since`?". `since = 0` is the full
-        // current snapshot as Added records — the relist a consumer
-        // performs on cold start and after a LOST.
+        // [prefix_len u16][prefix][event i32][flags u8] (the contract's
+        // `subscribe` codec). Returns a subscription handle.
+        NS_OP_SUBSCRIBE => {
+            if arg.is_null() {
+                return E_INVAL;
+            }
+            ns_subscribe(s, core::slice::from_raw_parts(arg, arg_len))
+        }
+
+        // [event i32][out_ptr u64][out_cap u32] (the `take` codec).
+        NS_OP_TAKE_RUNG => {
+            if arg.is_null() {
+                return E_INVAL;
+            }
+            ns_take_rung(s, core::slice::from_raw_parts(arg, arg_len))
+        }
+
+        // [prefix_len u16][prefix][sub i32][token_len u16][token]
+        // [out_ptr u64][out_cap u32][fence_ptr u64][fence_cap u16] (the
+        // `changes` codec): one bounded page of what changed.
         NS_OP_CHANGES => {
-            if arg.is_null() || arg_len < 2 {
+            if arg.is_null() {
                 return E_INVAL;
             }
-            let a = core::slice::from_raw_parts(arg, arg_len);
-            let plen = u16::from_le_bytes([a[0], a[1]]) as usize;
-            let mut off = 2usize;
-            if arg_len < off + plen + 8 + 8 + 4 {
-                return E_INVAL;
-            }
-            let mut pb = [0u8; super::limits::MAX_PATH];
-            if plen > super::limits::MAX_PATH {
-                return E_INVAL;
-            }
-            pb[..plen].copy_from_slice(&a[off..off + plen]);
-            off += plen;
-            let since = u64::from_le_bytes([
-                a[off],
-                a[off + 1],
-                a[off + 2],
-                a[off + 3],
-                a[off + 4],
-                a[off + 5],
-                a[off + 6],
-                a[off + 7],
-            ]);
-            off += 8;
-            let out_ptr = u64::from_le_bytes([
-                a[off],
-                a[off + 1],
-                a[off + 2],
-                a[off + 3],
-                a[off + 4],
-                a[off + 5],
-                a[off + 6],
-                a[off + 7],
-            ]) as *mut u8;
-            off += 8;
-            let out_cap = u32::from_le_bytes([a[off], a[off + 1], a[off + 2], a[off + 3]]) as usize;
-            off += 4;
-            let (fence_ptr, fence_cap) = read_fence_out(a, off);
-            if out_ptr.is_null() || out_cap < super::change_wire::CHANGES_HEADER {
-                return E_INVAL;
-            }
-            let out = core::slice::from_raw_parts_mut(out_ptr, out_cap);
-
-            // A window we can no longer account for is answered LOST,
-            // never with a silently short one. `since > change_rev` is
-            // a client ahead of us — also a relist, since we cannot
-            // prove what it missed.
-            let head = s.bindings.change_seq();
-            // The arena is a hot cache, so a window is only
-            // answerable while the evidence is still resident. Below
-            // the horizon — a slot evicted, a tombstone compacted
-            // away — the honest answer is LOST, because a short
-            // window that looked complete is exactly what a
-            // level-triggered consumer cannot detect.
-            let horizon = s.bindings.change_horizon();
-            if (since != 0 && since < horizon) || since > head {
-                out[0] = super::change_wire::STATUS_LOST;
-                out[1..5].copy_from_slice(&0u32.to_le_bytes());
-                write_view_fence_out(&pb[..plen], head, fence_ptr, fence_cap);
-                return super::change_wire::CHANGES_HEADER as i32;
-            }
-
-            let mut n = super::change_wire::CHANGES_HEADER;
-            let mut count = 0u32;
-            for i in 0..s.bindings.capacity() {
-                let Some(slot) = s.bindings.slot_ref(i) else {
-                    continue;
-                };
-                if !slot.occupied || slot.path_len == 0 {
-                    continue;
-                }
-                // Ordered on the CHANGE stream, never on the
-                // per-key pointer revision: a freshly bound path
-                // starts at revision 1 no matter what else has
-                // happened, so filtering on that would drop every new
-                // key from a delta window.
-                if since != 0 && slot.change_rev <= since {
-                    continue;
-                }
-                let tomb = slot.kind == super::state::KIND_TOMBSTONE;
-                // since = 0 is a SNAPSHOT: it answers "what is there",
-                // so a tombstone — the record of an absence — has no
-                // place in it. A delta window carries it as Deleted.
-                if tomb && since == 0 {
-                    continue;
-                }
-                if !super::change_wire::under_prefix(slot.path(), &pb[..plen]) {
-                    continue;
-                }
-                let kind = if tomb {
-                    super::change_wire::KIND_DELETED
-                } else if since == 0 {
-                    super::change_wire::KIND_ADDED
-                } else {
-                    super::change_wire::KIND_MODIFIED
-                };
-                let value: &[u8] = if tomb { &[] } else { slot.object_id() };
-                match super::change_wire::encode_record(
-                    &mut out[n..],
-                    slot.change_rev,
-                    kind,
-                    slot.path(),
-                    value,
-                ) {
-                    Some(written) => {
-                        n += written;
-                        count += 1;
-                    }
-                    // The caller's buffer is full. Answering LOST is
-                    // the honest response: a truncated window that
-                    // looked complete is exactly the bug this surface
-                    // exists to prevent, and the contract already has
-                    // a code for "relist".
-                    None => {
-                        out[0] = super::change_wire::STATUS_LOST;
-                        out[1..5].copy_from_slice(&0u32.to_le_bytes());
-                        write_view_fence_out(&pb[..plen], head, fence_ptr, fence_cap);
-                        return super::change_wire::CHANGES_HEADER as i32;
-                    }
-                }
-            }
-            out[0] = super::change_wire::STATUS_EVENTS;
-            out[1..5].copy_from_slice(&count.to_le_bytes());
-            // The revision this window COVERS — the caller's next
-            // `since`, and the point in time a snapshot manifest
-            // built from it records.
-            write_view_fence_out(&pb[..plen], head, fence_ptr, fence_cap);
-            n as i32
+            ns_changes(s, core::slice::from_raw_parts(arg, arg_len))
         }
 
         // List the keys under a prefix, one page per call.
@@ -3740,4 +3929,378 @@ pub unsafe fn provider_dispatch_impl(
 
         _ => E_NOSYS,
     }
+}
+
+/// The revision of the tombstone the arena holds for `path` in the
+/// surface's root, if it holds one.
+fn tombstone_rev(s: &ModuleState, path: &[u8]) -> Option<u64> {
+    match s.bindings.lookup(&[], path) {
+        Some(slot) if slot.kind == super::state::KIND_TOMBSTONE => Some(slot.revision),
+        _ => None,
+    }
+}
+
+/// `SUBSCRIBE`: a subscription that rings the caller's own event
+/// whenever something under the prefix changes. The event must be the
+/// calling module's (`EVENT_OWNER`); the subscription is stamped with
+/// the caller's owner record and module occupancy, and is idempotent on
+/// (owner, occupancy, event, prefix). A workload owner past its quota,
+/// or a full table — each after its dead subscriptions are swept — is
+/// `ENOMEM`.
+unsafe fn ns_subscribe(s: &mut ModuleState, a: &[u8]) -> i32 {
+    use super::abi::contracts::storage::namespace::subscribe;
+    let Some(req) = subscribe::parse(a) else {
+        return E_INVAL;
+    };
+    if req.prefix.len() > SUB_PREFIX_MAX.min(super::limits::MAX_PATH) {
+        return E_INVAL;
+    }
+    let (Some(owner), Some(module)) = (caller_owner(s), caller_module(s)) else {
+        return E_INVAL;
+    };
+    // The event must be the calling module's own: a subscription never
+    // wakes anyone else.
+    if event_owner(s, req.event) != Some(module) {
+        return E_INVAL;
+    }
+    let ring_now = req.flags & subscribe::FLAG_RING_NOW != 0;
+    // The same subscription asked again: the same handle.
+    for i in 0..sub_cap(s) {
+        let same = sub(s, i).is_some_and(|r| {
+            r.in_use != 0
+                && r.owner == owner
+                && r.module == module
+                && r.event == req.event
+                && r.prefix() == req.prefix
+        });
+        if same {
+            if ring_now {
+                if let Some(r) = sub_mut(s, i) {
+                    r.rung = 0;
+                }
+                ring_sub(s, i);
+            }
+            return SUB_HANDLE_BASE + i as i32;
+        }
+    }
+    // A workload owner's quota; the system owner (slot 0) holds the
+    // node's own controllers and is bounded by the table alone.
+    let quota = if s.sub_quota == 0 {
+        super::limits::NAMESPACE_SUB_QUOTA
+    } else {
+        s.sub_quota as usize
+    };
+    if (owner[0] != 0 || owner[1] != 0) && owned_subs(s, owner) >= quota {
+        s.subs_refused = s.subs_refused.wrapping_add(1);
+        return E_NOMEM;
+    }
+    let Some(i) = free_sub(s) else {
+        s.subs_refused = s.subs_refused.wrapping_add(1);
+        return E_NOMEM;
+    };
+    let n = req.prefix.len();
+    let Some(r) = sub_mut(s, i) else {
+        return E_NOMEM;
+    };
+    r.prefix[..n].copy_from_slice(req.prefix);
+    r.prefix_len = n as u16;
+    r.owner = owner;
+    r.module = module;
+    r.event = req.event;
+    r.rung = 0;
+    r.deferred = 0;
+    r.next_free = 0;
+    r.in_use = 1;
+    if ring_now {
+        ring_sub(s, i);
+    }
+    SUB_HANDLE_BASE + i as i32
+}
+
+/// `TAKE_RUNG`: the caller's subscriptions on an event that have rung
+/// since it last asked, their bits cleared. When they do not all fit,
+/// `more` is set and the event signalled again, so the rest is taken on
+/// the next wake.
+unsafe fn ns_take_rung(s: &mut ModuleState, a: &[u8]) -> i32 {
+    use super::abi::contracts::storage::namespace::take;
+    let Some(req) = take::parse(a) else {
+        return E_INVAL;
+    };
+    // SAFETY: the contract names `out_cap` writable bytes at `out_ptr`.
+    let out =
+        core::slice::from_raw_parts_mut(req.out_ptr as usize as *mut u8, req.out_cap as usize);
+    let Some(mut w) = take::Writer::new(out) else {
+        return E_NOMEM;
+    };
+    let (Some(owner), Some(module)) = (caller_owner(s), caller_module(s)) else {
+        return E_INVAL;
+    };
+    let mut more = false;
+    for i in 0..sub_cap(s) {
+        let Some(r) = sub_mut(s, i) else {
+            continue;
+        };
+        if r.in_use == 0
+            || r.rung == 0
+            || r.event != req.event
+            || r.owner != owner
+            || r.module != module
+        {
+            continue;
+        }
+        if !w.push(SUB_HANDLE_BASE + i as i32) {
+            more = true;
+            break;
+        }
+        r.rung = 0;
+    }
+    let n = w.finish(more);
+    if more && event_owner(s, req.event) == Some(module) {
+        let _ = signal(s, req.event);
+    }
+    n as i32
+}
+
+/// Provider-issued relist continuation: `[T_RELIST][pinned u64][cursor]`.
+const T_RELIST: u8 = 1;
+
+/// `CHANGES`: one bounded page of what changed under a prefix.
+///
+/// The token says where from: empty, a relist (every entry now, by
+/// key, with its value); eight bytes, a bare revision `since`; else the
+/// relist continuation this provider issued. The arena stamps every
+/// mutation with its own change-stream position and holds one slot per
+/// key, so a key's slot IS its newest change: a delta window is the
+/// slots stamped inside it, read at the present, and versions collapse
+/// by construction. A window the arena can no longer vouch for (below
+/// the change horizon: a slot evicted, a tombstone compacted away) or
+/// one past the head is LOST, never a short answer.
+unsafe fn ns_changes(s: &mut ModuleState, a: &[u8]) -> i32 {
+    use super::abi::contracts::storage::namespace::changes;
+    let Some(req) = changes::parse_request(a) else {
+        return E_INVAL;
+    };
+    // SAFETY: the contract names `out_cap` writable bytes at `out_ptr`.
+    let out =
+        core::slice::from_raw_parts_mut(req.out_ptr as usize as *mut u8, req.out_cap as usize);
+    // The subscription this read serves, when it is the caller's: a read
+    // refused for now rings it again once the cause clears.
+    let sub = (req.sub >= SUB_HANDLE_BASE)
+        .then(|| (req.sub - SUB_HANDLE_BASE) as usize)
+        .filter(|&i| sub_by_caller(s, i));
+    let head = s.bindings.change_seq();
+    let rc = match req.token.len() {
+        0 => relist_page(s, req.prefix, head, &[], out),
+        changes::REVISION_TOKEN_LEN => {
+            let since = changes::token_revision(req.token).unwrap_or(0);
+            delta_page(s, req.prefix, since, out)
+        }
+        n if n >= 9 && req.token[0] == T_RELIST => {
+            let mut p = [0u8; 8];
+            p.copy_from_slice(&req.token[1..9]);
+            relist_page(s, req.prefix, u64::from_le_bytes(p), &req.token[9..], out)
+        }
+        _ => E_INVAL,
+    };
+    if rc == E_AGAIN {
+        if let Some(r) = sub.and_then(|i| sub_mut(s, i)) {
+            r.deferred = 1;
+        }
+        return E_AGAIN;
+    }
+    if rc >= 0 {
+        write_view_fence_out(
+            req.prefix,
+            head,
+            req.fence_out_ptr as usize as *mut u8,
+            req.fence_out_cap as usize,
+        );
+    }
+    rc
+}
+
+/// Whether arena slot `slot` is a change in `(since, cut]` under the
+/// prefix, in the surface's root.
+fn in_window(slot: &super::state::BindingSlot, prefix: &[u8], since: u64, cut: u64) -> bool {
+    slot.occupied
+        && slot.path_len != 0
+        && slot.root_len == 0
+        && slot.change_rev > since
+        && slot.change_rev <= cut
+        && super::change_wire::under_prefix(slot.path(), prefix)
+}
+
+/// A slot's value on the change page: the bound target, or nothing for
+/// a tombstone.
+fn change_value(slot: &super::state::BindingSlot) -> &[u8] {
+    if slot.kind == super::state::KIND_TOMBSTONE {
+        &[]
+    } else {
+        slot.object_id()
+    }
+}
+
+/// The record bytes of the changes in `(since, cut]` under the prefix;
+/// `EOVERFLOW` when one of their keys is longer than a record can name.
+fn window_bytes(s: &ModuleState, prefix: &[u8], since: u64, cut: u64) -> Result<usize, i32> {
+    use super::abi::contracts::storage::handle::STORAGE_KEY_MAX;
+    use super::abi::contracts::storage::namespace::changes;
+    let mut n = 0usize;
+    for k in 0..s.bindings.capacity() {
+        let Some(slot) = s.bindings.slot_ref(k) else {
+            continue;
+        };
+        if !in_window(slot, prefix, since, cut) {
+            continue;
+        }
+        if slot.path_len as usize > STORAGE_KEY_MAX {
+            return Err(E_OVERFLOW);
+        }
+        n += changes::RECORD_FIXED_LEN + slot.path_len as usize + change_value(slot).len();
+    }
+    Ok(n)
+}
+
+/// One page of the changes after `since`. The page is cut at a revision:
+/// the highest `cut` whose window `(since, cut]` fits the caller's
+/// buffer, found by bisection over the window's byte count (monotone in
+/// `cut`). Every key changed inside it is reported at the present —
+/// present, Modified with its value; tombstoned, Deleted — and none is
+/// omitted. A key changed again past the cut carries that later
+/// position and is left to the page that holds it, so no record's
+/// `mod_rev` is ahead of the page's `safe_rev`. A non-final page's
+/// token is the bare revision of its cut; the final one's, the head.
+unsafe fn delta_page(s: &ModuleState, prefix: &[u8], since: u64, out: &mut [u8]) -> i32 {
+    use super::abi::contracts::storage::namespace::changes;
+    let head = s.bindings.change_seq();
+    if since < s.bindings.change_horizon() || since > head {
+        return changes::write_lost(out).map_or(E_NOMEM, |n| n as i32);
+    }
+    let budget = out.len().saturating_sub(
+        changes::HEAD_LEN + changes::TRAILER_FIXED_LEN + changes::REVISION_TOKEN_LEN,
+    );
+    let Some(mut w) = changes::PageWriter::new(out, changes::REVISION_TOKEN_LEN) else {
+        return E_NOMEM;
+    };
+    let total = match window_bytes(s, prefix, since, head) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let cut = if total <= budget {
+        head
+    } else {
+        let (mut lo, mut hi) = (since, head);
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            match window_bytes(s, prefix, since, mid) {
+                Ok(n) if n <= budget => lo = mid,
+                Ok(_) => hi = mid,
+                Err(e) => return e,
+            }
+        }
+        lo
+    };
+    if cut == since && total > 0 {
+        // Not even the first change fits beside the trailer.
+        return E_NOMEM;
+    }
+    for k in 0..s.bindings.capacity() {
+        let Some(slot) = s.bindings.slot_ref(k) else {
+            continue;
+        };
+        if !in_window(slot, prefix, since, cut) {
+            continue;
+        }
+        let kind = if slot.kind == super::state::KIND_TOMBSTONE {
+            changes::KIND_DELETED
+        } else {
+            changes::KIND_MODIFIED
+        };
+        if !w.push(slot.change_rev, kind, slot.path(), change_value(slot)) {
+            return E_NOMEM;
+        }
+    }
+    let more = cut < head;
+    let rest = if more { cut } else { head };
+    w.finish(more, rest, &changes::revision_token(rest))
+        .map_or(E_NOMEM, |n| n as i32)
+}
+
+/// One page of a relist: every live entry under the prefix now — the
+/// arena and the snapshot merged, exactly as `LIST` walks them — in key
+/// order from just past `cursor`, Added with its value. `pinned` is the
+/// head when the relist began: the revision the final page hands back,
+/// so what changes while it pages is read again by the `CHANGES` that
+/// follows it. A snapshot read being fetched is `EAGAIN`.
+unsafe fn relist_page(
+    s: &ModuleState,
+    prefix: &[u8],
+    pinned: u64,
+    cursor: &[u8],
+    out: &mut [u8],
+) -> i32 {
+    use super::abi::contracts::storage::handle::STORAGE_KEY_MAX;
+    use super::abi::contracts::storage::namespace::changes;
+    /// The longest cursor a relist token names.
+    const CURSOR_MAX: usize = if super::limits::MAX_PATH < STORAGE_KEY_MAX {
+        super::limits::MAX_PATH
+    } else {
+        STORAGE_KEY_MAX
+    };
+    if !cursor.is_empty() && (cursor.len() > CURSOR_MAX || !cursor.starts_with(prefix)) {
+        return E_INVAL;
+    }
+    if s.syscalls.is_null() {
+        return E_INVAL;
+    }
+    // The trailer is kept for the longest token a page can end on: a
+    // continuation naming its last key.
+    let Some(mut w) = changes::PageWriter::new(out, 9 + CURSOR_MAX) else {
+        return E_NOMEM;
+    };
+    let mut last = [0u8; CURSOR_MAX];
+    let mut last_len = 0usize;
+    let mut overflow = false;
+    let sys = &*s.syscalls;
+    let walked = walk_ordered(s, sys, &[], prefix, cursor, |e| {
+        if e.path.len() > CURSOR_MAX {
+            // Unlistable here: refusing beats a short relist the caller
+            // believes complete.
+            overflow = true;
+            return false;
+        }
+        if !w.push(
+            e.change_rev,
+            changes::KIND_ADDED,
+            e.path,
+            e.binding.object_id,
+        ) {
+            return false;
+        }
+        last[..e.path.len()].copy_from_slice(e.path);
+        last_len = e.path.len();
+        true
+    });
+    if overflow {
+        return E_OVERFLOW;
+    }
+    let more = match walked {
+        super::snapshot::SnapRead::Ready(more) => more,
+        super::snapshot::SnapRead::Pending => return E_AGAIN,
+        super::snapshot::SnapRead::Failed => return E_IO,
+    };
+    if more && w.count() == 0 {
+        return E_NOMEM;
+    }
+    let done = if more {
+        let mut t = [0u8; 9 + CURSOR_MAX];
+        t[0] = T_RELIST;
+        t[1..9].copy_from_slice(&pinned.to_le_bytes());
+        t[9..9 + last_len].copy_from_slice(&last[..last_len]);
+        // Nothing is delivered whole until the relist ends.
+        w.finish(true, 0, &t[..9 + last_len])
+    } else {
+        w.finish(false, pinned, &changes::revision_token(pinned))
+    };
+    done.map_or(E_NOMEM, |n| n as i32)
 }

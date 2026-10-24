@@ -46,6 +46,16 @@ content_type = "OctetStream"
 requires_contract = "fs"
 access = "write"
 
+# Subscription records come from the module's heap, a page at a time,
+# never from a preallocated table: every instance's heap is its declared
+# arena (`base`, `SUB_ARENA_BASE` in namespace_pic_body.rs: two pages)
+# plus `bytes_each` (`SUB_RECORD_HEAP_BYTES`, one record's share of a
+# page) per subscription the graph plans for `store_subs`. A spent heap
+# is SUBSCRIBE's counted ENOMEM. `namespace_provider.rs` holds both
+# figures to the source.
+[capacities]
+heap_per_demand = { pool = "store_subs", bytes_each = 289, base = 9248 }
+
 [observability]
 exempt = "in-arena state counters (ops/errors/scrub tallies) readable by the host harness; typed MSG_METRIC_SAMPLE emission is not wired yet"
 

@@ -572,6 +572,20 @@ impl<const N: usize> PicNamespaceState<N> {
         self.bind(namespace_root, path, object_id, kind, revision, meta)
     }
 
+    /// Move a binding from `from` to `to` at `new_revision`, as the two
+    /// changes a reader of the change stream has to see: `to` bound with
+    /// the binding's content, and a tombstone at `from`. Re-keying the
+    /// slot instead would leave no record that `from` ever went away, so
+    /// `CHANGES` would never report it Deleted, and a snapshot record of
+    /// `from` would show through again.
+    ///
+    /// Decided wholly from the arena before anything changes, so every
+    /// replica — and every replay — applies it identically or refuses it
+    /// identically: `from` must be live here and unlocked; `to` must not
+    /// be live, and may be a tombstone, which the new binding replaces
+    /// (stepping past its revision); otherwise `to` needs a free slot,
+    /// and with none the rename is refused `OutOfCapacity` with the
+    /// arena untouched, for the caller to retry behind an eviction.
     pub fn rename(
         &mut self,
         namespace_root: &[u8],
@@ -582,35 +596,72 @@ impl<const N: usize> PicNamespaceState<N> {
         if !key_fits(namespace_root, from, &[]) || !key_fits(namespace_root, to, &[]) {
             return Err(ApplyError::KeyTooLong);
         }
-        let seq = self.change_seq.wrapping_add(1);
         let (ns_h, from_h) = key_hash(namespace_root, from);
         let (_, to_h) = key_hash(namespace_root, to);
-        if self.lookup_hashed(ns_h, to_h, namespace_root, to).is_some() {
-            return Err(ApplyError::DestinationOccupied);
-        }
-        for s in self.slots.iter_mut() {
+        let mut src_at = None;
+        let mut dst_at = None;
+        let mut free_at = None;
+        for i in 0..N {
+            let s = &self.slots[i];
             if s.matches(ns_h, from_h, namespace_root, from) {
-                if s.locked != 0 {
-                    // A move is a delete plus a create as far as the
-                    // old name is concerned, so a lock has to stop it
-                    // or the lock is trivially bypassed by renaming.
-                    return Err(ApplyError::Locked);
+                src_at = Some(i);
+            } else if s.matches(ns_h, to_h, namespace_root, to) {
+                if s.kind != KIND_TOMBSTONE {
+                    return Err(ApplyError::DestinationOccupied);
                 }
-                s.path_hash = to_h;
-                s.revision = new_revision;
-                s.snapshotted = 0;
-                s.cmp_emitted = 0;
-                s.path_len = 0;
-                if !to.is_empty() {
-                    s.path_bytes[..to.len()].copy_from_slice(to);
-                    s.path_len = to.len() as u16;
-                }
-                s.change_rev = seq;
-                self.change_seq = seq;
-                return Ok(ApplyOk::Renamed { new_revision });
+                dst_at = Some(i);
+            } else if !s.occupied && free_at.is_none() {
+                free_at = Some(i);
             }
         }
-        Err(ApplyError::NotBound)
+        let Some(src_at) = src_at else {
+            return Err(ApplyError::NotBound);
+        };
+        let src = self.slots[src_at];
+        if src.kind == KIND_TOMBSTONE {
+            return Err(ApplyError::NotBound);
+        }
+        if src.locked != 0 {
+            // A move is a delete plus a create as far as the old name
+            // is concerned, so a lock has to stop it or the lock is
+            // trivially bypassed by renaming.
+            return Err(ApplyError::Locked);
+        }
+        // A tombstone at `to` holds the revision a bind must exceed.
+        let to_rev = match dst_at {
+            Some(d) if self.slots[d].revision >= new_revision => {
+                self.slots[d].revision.wrapping_add(1)
+            }
+            _ => new_revision,
+        };
+        let Some(dst) = dst_at.or(free_at) else {
+            return Err(ApplyError::OutOfCapacity);
+        };
+        let seq = self.change_seq.wrapping_add(1);
+        // The new name: the binding's content, under `to`.
+        let mut moved = src;
+        moved.path_hash = to_h;
+        moved.revision = to_rev;
+        moved.snapshotted = 0;
+        moved.cmp_emitted = 0;
+        moved.path_bytes = [0u8; MAX_LIST_PATH];
+        moved.path_bytes[..to.len()].copy_from_slice(to);
+        moved.path_len = to.len() as u16;
+        moved.change_rev = seq;
+        self.slots[dst] = moved;
+        // The old name: a tombstone, in place.
+        let t = &mut self.slots[src_at];
+        t.kind = KIND_TOMBSTONE;
+        t.revision = new_revision;
+        t.object_id_hash = 0;
+        t.object_id_len = 0;
+        t.set_meta(&Meta::NONE);
+        t.expires_at = 0;
+        t.snapshotted = 0;
+        t.cmp_emitted = 0;
+        t.change_rev = seq.wrapping_add(1);
+        self.change_seq = seq.wrapping_add(1);
+        Ok(ApplyOk::Renamed { new_revision })
     }
 
     /// Is `object_id` bound by ANY live slot, in any root?
@@ -804,8 +855,21 @@ impl<const N: usize> PicNamespaceState<N> {
     /// (never a tombstone — those mask the snapshot). Returns
     /// whether a slot was freed.
     pub fn evict_one_snapshotted(&mut self) -> bool {
+        self.evict_one_snapshotted_sparing(None)
+    }
+
+    /// [`evict_one_snapshotted`](Self::evict_one_snapshotted), never
+    /// choosing `spare`'s `(root, path)` slot — a rename retried behind
+    /// an eviction must not evict the binding it is moving.
+    pub fn evict_one_snapshotted_sparing(&mut self, spare: Option<(&[u8], &[u8])>) -> bool {
+        let spare = spare.map(|(r, p)| (key_hash(r, p), r, p));
         let mut evicted = None;
         for s in self.slots.iter_mut() {
+            if let Some(((ns_h, p_h), r, p)) = spare {
+                if s.matches(ns_h, p_h, r, p) {
+                    continue;
+                }
+            }
             // A locked binding is never evicted. The arena is a hot
             // cache over the snapshot, and the snapshot record does
             // not carry the lock — so evicting one would silently
