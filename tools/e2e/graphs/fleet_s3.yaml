@@ -82,6 +82,10 @@ modules:
   - name: http
     port: ${param:port}
     host_tcp: 1
+    # The store `http` follows dynamic route tables in. These routes are
+    # static, so it follows the target's own store rather than holding a
+    # subscription on loam's namespace for tables nothing writes there.
+    table_volume: platform
     route_0_max_body_kib: 1073741824
     routes:
       - path: "/"
