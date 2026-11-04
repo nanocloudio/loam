@@ -85,9 +85,10 @@ fluxor run loam-s3 \
 | [`loam-crypt-nbd`](packaging/service/loam-crypt-nbd/) | loam-nbd with fluxor's `crypt_block` between the export and the volume: the node holding the volume stores only ciphertext |
 
 The mutual-TLS services take their CA, certificate and key as `file`
-params: files the caller supplies, read when the run builds the graph
-(`--param ca=ca.pem --param cert=node.der --param key=node.key.der`).
-The bundles carry none of them.
+params: files the caller supplies
+(`--param ca=ca.pem --param cert=node.der --param key=node.key.der`),
+which the run renders as absolute paths and `tls` reads at runtime,
+re-reading them when they change. The bundles carry none of them.
 
 | Stack | What it is |
 |---|---|

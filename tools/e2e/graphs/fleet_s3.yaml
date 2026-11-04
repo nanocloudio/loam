@@ -118,7 +118,7 @@ modules:
     type: tls
     mode: 0
     peer_auth: ca_dns
-    trust: "${file:${param:ca}}"
+    trust: "${param:ca}"
     cert_file: "${param:cert}"
     key_file: "${param:key}"
   - name: rc_a
@@ -131,7 +131,7 @@ modules:
     type: tls
     mode: 0
     peer_auth: ca_dns
-    trust: "${file:${param:ca}}"
+    trust: "${param:ca}"
     cert_file: "${param:cert}"
     key_file: "${param:key}"
   - name: rc_b

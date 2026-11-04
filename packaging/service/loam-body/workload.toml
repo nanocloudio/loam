@@ -6,8 +6,10 @@
 #     --param <name>=<value> …
 #
 # Its params are the graph's (linux.yaml). Its TLS identity — the CA,
-# certificate and key — is `file` params: files the caller supplies, read
-# when the run builds the graph. The bundle carries none of them.
+# certificate and key — is `file` params: files the caller supplies, which
+# the run checks are there and renders as absolute paths; `tls` reads them
+# at runtime and re-reads them when they change, so a rotated certificate
+# takes effect without a restart. The bundle carries none of them.
 #
 # A router graph reaches it with one member per body node: a
 # `body_fanout_router` member port wired to a `remote_channel` that dials

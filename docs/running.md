@@ -246,8 +246,10 @@ an exchange the front answers. `tools/e2e/storage_front.sh` gates it.
 ## The admin plane and the applet
 
 The loam-admin service is a node's admin plane over mutual TLS. Its
-CA, certificate and key are `file` params, read when the run builds the
-graph:
+CA, certificate and key are `file` params: the run checks they are there
+and renders them as absolute paths, and `tls` reads them at runtime,
+re-reading them when they change (a rotated certificate takes effect
+without a restart):
 
 ```sh
 fluxor run loam-admin \

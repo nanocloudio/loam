@@ -76,7 +76,7 @@ modules:
     mode: 1                       # server
     verify_peer: 1
     peer_auth: ca_dns
-    trust: "${file:${param:ca}}"
+    trust: "${param:ca}"
     cert_file: "${param:cert}"
     key_file: "${param:key}"
 
