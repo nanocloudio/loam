@@ -204,7 +204,8 @@ whether its cap is a ceiling:
   snapshot tier is compiled in. The snapshot file and the WAL hold
   the whole set, so a bind into a full arena retries once behind an
   eviction of a snapshot-covered slot (never a locked one, whose
-  lock the snapshot record does not carry);
+  lock the snapshot record does not carry; a key reference, retention
+  and hold are in the record, so a slot carrying them evicts freely);
   `ns_scales_past_arena_capacity_via_snapshot` drives 512 bindings
   past capacity with live compaction and a restart. With no active
   snapshot

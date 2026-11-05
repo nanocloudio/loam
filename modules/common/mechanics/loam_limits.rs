@@ -443,6 +443,10 @@ pub const ADMIN_WRITE_RETRIES: u8 = 8;
 /// slot is not where a constrained profile is won or lost.
 pub const CONTENT_TYPE_MAX: usize = 128;
 
+/// Longest key reference a binding keeps: `storage.object`'s `KEY_REF_MAX`,
+/// which the object provider asserts equal. An opaque name, never interpreted.
+pub const KEY_REF_MAX: usize = 64;
+
 // ── The admin gate ────────────────────────────────────────────────
 
 /// Network admin sessions one `admin_gate` serves at once: mutual-TLS

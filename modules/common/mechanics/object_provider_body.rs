@@ -26,11 +26,15 @@
 //                      the lookup found, a window of one body at a time
 //   HEAD               a LOOKUP
 //   DELETE             DELETE_FILE
+//   RETAIN             RETAIN
 //   LIST               LIST_FILES
 //
 // A write's condition (`precondition`) is the admin wire's `WriteCond`,
 // decided by the router at the namespace's single point of order. An
 // etag is the content digest, so `ETAG` is "bound to `sha256:<etag>`".
+// This store keeps what `Kept` names: a write's block travels with it to
+// the namespace, which decides against a retained or held binding in the
+// same log order, and every `HEAD` reports the binding's.
 //
 // A dispatch returns now and answers when the gate has: writes answer
 // `EINPROGRESS` and reads `EAGAIN` until then, and the caller asks
@@ -103,6 +107,13 @@ const LIST_BYTES: usize = obj::list::PAGE_HEADER_LEN
 const OUT_MAX: usize = 4 + aw::REQUEST_MAX;
 const RX_MAX: usize = 4 + aw::RESPONSE_MAX;
 const FENCE_LEN: usize = super::abi::fence::WIRE_MAX_LEN;
+const KEY_REF_MAX: usize = obj::KEY_REF_MAX;
+const _: () = assert!(KEY_REF_MAX == super::limits::KEY_REF_MAX);
+const _: () = assert!(
+    obj::hold::LEAVE == aw::RETAIN_HOLD_LEAVE
+        && obj::hold::SET == aw::RETAIN_HOLD_SET
+        && obj::hold::CLEAR == aw::RETAIN_HOLD_CLEAR
+);
 
 // errno
 const E_NOENT: i32 = -2;
@@ -118,6 +129,7 @@ const E_NOSPC: i32 = -28;
 const E_INPROGRESS: i32 = -36;
 const E_NOSYS: i32 = -38;
 const E_OVERFLOW: i32 = -75;
+const E_RETAINED: i32 = super::abi::kernel_abi::errno::ERETAINED;
 
 // fs
 const FS_READ: u32 = 0x0901;
@@ -207,6 +219,7 @@ const K_LIST: u8 = 5;
 const K_COMMIT: u8 = 6;
 /// A presentation, keyed in the ops table like a request.
 const K_PRESENT: u8 = 7;
+const K_RETAIN: u8 = 8;
 
 /// Where an upload's bytes come from.
 const SRC_MEM: u8 = 1;
@@ -306,6 +319,13 @@ pub struct Op {
     pub mode: u8,
     pub expect: [u8; OID_LEN],
     pub expect_len: u8,
+    /// What a write asks the store to keep, or what a lookup found kept.
+    pub key_ref: [u8; KEY_REF_MAX],
+    pub key_ref_len: u8,
+    pub retain_until_ms: u64,
+    pub legal_hold: u8,
+    /// RETAIN: the `hold` byte.
+    pub retain_hold: u8,
     // An upload.
     pub mem: u64,
     pub total: u64,
@@ -365,6 +385,11 @@ pub struct Stream {
     pub mode: u8,
     pub expect: [u8; OID_LEN],
     pub expect_len: u8,
+    /// Stated at `PUT_STREAMED_OPEN`, judged at the commit.
+    pub key_ref: [u8; KEY_REF_MAX],
+    pub key_ref_len: u8,
+    pub retain_until_ms: u64,
+    pub legal_hold: u8,
     pub spool: Spool,
     /// Bytes taken: in the spool file, or in the spill on their way.
     pub written: u64,
@@ -661,6 +686,7 @@ fn write_errno(status: u8) -> i32 {
         aw::STATUS_BUSY => E_BUSY,
         aw::STATUS_QUOTA => E_NOSPC,
         aw::STATUS_FORBIDDEN => E_ACCES,
+        aw::STATUS_RETAINED => E_RETAINED,
         _ => E_IO,
     }
 }
@@ -899,6 +925,10 @@ fn alloc_op(
     o.ctype_len = 0;
     o.mode = aw::WRITE_ANY;
     o.expect_len = 0;
+    o.key_ref_len = 0;
+    o.retain_until_ms = 0;
+    o.legal_hold = 0;
+    o.retain_hold = 0;
     o.mem = 0;
     o.total = 0;
     o.sent = 0;
@@ -951,6 +981,23 @@ fn set_write(o: &mut Op, key: &[u8], ctype: &[u8], mode: u8, expect: &[u8]) {
     o.expect_len = expect.len() as u8;
 }
 
+/// Store what a write asks the store to keep on op `i`.
+fn set_kept(o: &mut Op, kept: &obj::Kept<'_>) {
+    put(&mut o.key_ref, kept.key_ref);
+    o.key_ref_len = kept.key_ref.len() as u8;
+    o.retain_until_ms = kept.retain_until_ms;
+    o.legal_hold = u8::from(kept.legal_hold);
+}
+
+/// The policy op `o` carries, as the admin wire takes it.
+fn policy_of(o: &Op) -> aw::Policy<'_> {
+    aw::Policy {
+        key_ref: &o.key_ref[..o.key_ref_len as usize],
+        retain_until_ms: o.retain_until_ms,
+        hold: o.legal_hold != 0,
+    }
+}
+
 // ── Dispatch ───────────────────────────────────────────────────────────────
 
 /// # Safety
@@ -986,6 +1033,7 @@ pub unsafe fn provider_dispatch_impl(
         obj::HEAD => op_head(s, handle, owner, a),
         obj::RANGE_GET => op_range(s, handle, owner, a),
         obj::DELETE => op_delete(s, handle, owner, a),
+        obj::RETAIN => op_retain(s, handle, owner, a),
         obj::CLOSE => op_close(s, handle, owner),
         obj::LIST => op_list(s, handle, owner, a),
         obj::PUT_STREAMED_OPEN => stream_open(s, handle, owner, a),
@@ -997,7 +1045,7 @@ pub unsafe fn provider_dispatch_impl(
 }
 
 /// `[key_len:u16][key][ct_len:u8][ct][body_ptr:u64][body_len:u64][pre:u8]
-/// [etag_len:u8][etag][fence_ptr:u64][fence_cap:u16]`
+/// [etag_len:u8][etag][Kept][fence_ptr:u64][fence_cap:u16]`
 unsafe fn op_put(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i32 {
     let Some(kl) = u16_at(a, 0) else {
         return E_INVAL;
@@ -1022,6 +1070,9 @@ unsafe fn op_put(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i3
         return E_INVAL;
     };
     p += el as usize;
+    let Some((kept, p)) = obj::Kept::parse(a, p) else {
+        return E_INVAL;
+    };
     let (Some(fence_ptr), Some(fence_cap)) = (u64_at(a, p), u16_at(a, p + 8)) else {
         return E_INVAL;
     };
@@ -1068,6 +1119,7 @@ unsafe fn op_put(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i3
     };
     let o = &mut s.ops[i];
     set_write(o, key, ctype, mode, &expect[..elen]);
+    set_kept(o, &kept);
     o.src = SRC_MEM;
     o.mem = body_ptr;
     o.total = body_len;
@@ -1135,6 +1187,47 @@ unsafe fn op_delete(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) ->
         return E_BUSY;
     };
     set_write(&mut s.ops[i], key, &[], mode, &expect[..elen]);
+    E_INPROGRESS
+}
+
+/// `retain::Request`: change a live object's retention or hold. A write, so
+/// it answers `EINPROGRESS` until the namespace has decided it in log order.
+unsafe fn op_retain(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i32 {
+    let Some(req) = obj::retain::parse_request(a) else {
+        return E_INVAL;
+    };
+    if split_key(req.key).is_none() {
+        return E_INVAL;
+    }
+    let g = match admit(s, handle, owner, true, req.key) {
+        Ok(g) => g,
+        Err(e) => return e,
+    };
+    let at = a.len() - 10;
+    let ask = ask_of(owner, K_RETAIN, &[&a[..at]]);
+    if let Some(i) = find_op(s, owner, &ask) {
+        if s.ops[i].state != O_DECIDED {
+            return E_INPROGRESS;
+        }
+        let rc = s.ops[i].result;
+        if rc == 0 {
+            let f = s.ops[i].fence;
+            write_fence(
+                req.fence_out_ptr,
+                req.fence_out_cap,
+                &f[..s.ops[i].fence_len as usize],
+            );
+        }
+        free_op(s, i);
+        return rc;
+    }
+    let Some(i) = alloc_op(s, K_RETAIN, g, owner, ask) else {
+        return E_BUSY;
+    };
+    let o = &mut s.ops[i];
+    set_write(o, req.key, &[], aw::WRITE_ANY, &[]);
+    o.retain_until_ms = req.retain_until_ms;
+    o.retain_hold = req.hold;
     E_INPROGRESS
 }
 
@@ -1246,6 +1339,11 @@ unsafe fn op_head(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i
         o.stamp_ms.saturating_mul(1_000_000),
         &o.ctype[..o.ctype_len as usize],
         &o.etag[..o.etag_len as usize],
+        obj::Kept {
+            key_ref: &o.key_ref[..o.key_ref_len as usize],
+            retain_until_ms: o.retain_until_ms,
+            legal_hold: o.legal_hold != 0,
+        },
     );
     free_op(s, i);
     match n {
@@ -1463,7 +1561,8 @@ unsafe fn op_close(s: &mut ModuleState, handle: i32, owner: Owner) -> i32 {
 
 // ── Streamed writes ────────────────────────────────────────────────────────
 
-/// `[key_len:u16][key][ct_len:u8][ct][expected:u64][pre:u8][etag_len:u8][etag]`
+/// `[key_len:u16][key][ct_len:u8][ct][expected:u64][pre:u8][etag_len:u8][etag]
+/// [Kept]`
 unsafe fn stream_open(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i32 {
     let Some(kl) = u16_at(a, 0) else {
         return E_INVAL;
@@ -1485,7 +1584,10 @@ unsafe fn stream_open(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) 
     let Some(etag) = a.get(p..p + el as usize) else {
         return E_INVAL;
     };
-    if a.len() != p + el as usize || split_key(key).is_none() || ctype.len() > CTYPE_MAX {
+    let Some((kept, end)) = obj::Kept::parse(a, p + el as usize) else {
+        return E_INVAL;
+    };
+    if a.len() != end || split_key(key).is_none() || ctype.len() > CTYPE_MAX {
         return E_INVAL;
     }
     if expected > super::body_wire::MAX_STREAM_TOTAL {
@@ -1543,6 +1645,10 @@ unsafe fn stream_open(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) 
     st.mode = mode;
     put(&mut st.expect, &expect[..elen]);
     st.expect_len = elen as u8;
+    put(&mut st.key_ref, kept.key_ref);
+    st.key_ref_len = kept.key_ref.len() as u8;
+    st.retain_until_ms = kept.retain_until_ms;
+    st.legal_hold = u8::from(kept.legal_hold);
     st.written = 0;
     st.hash = super::Sha256::new();
     handle_of(KIND_STREAM, gen, i)
@@ -1958,6 +2064,9 @@ unsafe fn stream_commit(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]
     let (key, kl) = (st.key, st.key_len as usize);
     let (ctype, cl) = (st.ctype, st.ctype_len as usize);
     let (mode, expect, el) = (st.mode, st.expect, st.expect_len as usize);
+    let (key_ref, rl) = (st.key_ref, st.key_ref_len as usize);
+    let kept_until = st.retain_until_ms;
+    let kept_hold = st.legal_hold != 0;
     let total = st.written;
     st.op = o as u8;
     // The spool, sealed, now belongs to the upload, which drains it,
@@ -1967,6 +2076,14 @@ unsafe fn stream_commit(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]
     spool.sealed = 1;
     let op = &mut s.ops[o];
     set_write(op, &key[..kl], &ctype[..cl], mode, &expect[..el]);
+    set_kept(
+        op,
+        &obj::Kept {
+            key_ref: &key_ref[..rl],
+            retain_until_ms: kept_until,
+            legal_hold: kept_hold,
+        },
+    );
     op.stream = i as u8;
     op.src = SRC_SPOOL;
     op.spool = spool;
@@ -2173,7 +2290,15 @@ unsafe fn stage_op(s: &mut ModuleState, i: usize) -> bool {
             match o.stage {
                 U_SINGLE => match upload_bytes(s, i, o.total as usize) {
                     Bytes::Ready(body) => aw::encode_admin_put_file(
-                        out, cid, root, path, KIND_FILE, &cond, ctype, body,
+                        out,
+                        cid,
+                        root,
+                        path,
+                        KIND_FILE,
+                        &cond,
+                        &policy_of(o),
+                        ctype,
+                        body,
                     ),
                     Bytes::NotYet => return false,
                     Bytes::Failed => {
@@ -2182,7 +2307,16 @@ unsafe fn stage_op(s: &mut ModuleState, i: usize) -> bool {
                     }
                 },
                 U_OPEN => aw::encode_put_file_open(
-                    out, cid, root, path, KIND_FILE, &cond, ctype, &o.digest, o.total,
+                    out,
+                    cid,
+                    root,
+                    path,
+                    KIND_FILE,
+                    &cond,
+                    &policy_of(o),
+                    ctype,
+                    &o.digest,
+                    o.total,
                 ),
                 U_CHUNK => {
                     let left = o.total - o.sent;
@@ -2205,6 +2339,15 @@ unsafe fn stage_op(s: &mut ModuleState, i: usize) -> bool {
         }
         K_DELETE => match split_key(key) {
             Some((root, path)) => aw::encode_admin_delete_file(out, cid, root, path, &cond),
+            None => {
+                decide(s, i, E_INVAL);
+                return false;
+            }
+        },
+        K_RETAIN => match split_key(key) {
+            Some((root, path)) => {
+                aw::encode_admin_retain(out, cid, root, path, o.retain_until_ms, o.retain_hold)
+            }
             None => {
                 decide(s, i, E_INVAL);
                 return false;
@@ -2415,9 +2558,21 @@ unsafe fn op_answered(s: &mut ModuleState, i: usize, frame: &[u8]) {
             Ok((_, status, fence)) => decide_write(s, i, write_errno(status), fence),
             Err(_) => decide(s, i, E_IO),
         },
+        K_RETAIN => match aw::decode_admin_retain_ack(frame) {
+            Ok((_, status, fence)) => decide_write(s, i, write_errno(status), fence),
+            Err(_) => decide(s, i, E_IO),
+        },
         K_HEAD | K_GET => match aw::decode_admin_lookup_ack(frame) {
             Ok((_, aw::STATUS_OK, Some(b))) => {
                 let o = &mut s.ops[i];
+                put(&mut o.key_ref, b.policy.key_ref);
+                o.key_ref_len = if b.policy.key_ref.len() <= KEY_REF_MAX {
+                    b.policy.key_ref.len() as u8
+                } else {
+                    0
+                };
+                o.retain_until_ms = b.policy.retain_until_ms;
+                o.legal_hold = u8::from(b.policy.hold);
                 o.size = b.size;
                 o.stamp_ms = b.stamp_ms;
                 put(&mut o.ctype, b.content_type);

@@ -85,8 +85,9 @@ to catch:
 | Admin wire | `loam_admin_wire::check_key` | The admin plane's front door, and so `storage.object`'s |
 | Object wire | `loam_object_wire::MAX_STRING` | `= MAX_OBJECT_ID`. Object ids are the only key-shaped field on this wire |
 | Block wire | `loam_block_wire::MAX_STRING` | `= MAX_OBJECT_ID`. Volume ids share the object-id ceiling |
+| Key reference | `KEY_REF_MAX` | `mechanics/loam_limits.rs`, asserted equal to `storage.object`'s `KEY_REF_MAX` in the provider: 64 bytes, opaque, refused past it |
 | Arena slot | `BindingSlot::{root_bytes,path_bytes,object_id_bytes}` | Sized to the ceilings; `path_len` is `u16` because `MAX_PATH` exceeds `u8` on host |
-| Snapshot record | `loam_snapshot::REC_SIZE` | Derived: 349 B embedded, 1213 B host |
+| Snapshot record | `loam_snapshot::REC_SIZE` | Derived: 423 B embedded, 1287 B host |
 | Composed write | `admin_router_body::{NS_PATH_BUF,NS_ROOT_BUF}` | Sized from `MAX_PATH`/`MAX_ROOT`. An independent buffer here would be a second, smaller, undeclared ceiling refusing a key the namespace accepts |
 | State machine | `state::key_fits`, `ApplyError::KeyTooLong` | Defence in depth: keeps "accepted but not storable" unrepresentable even if a caller bypasses the wire |
 
@@ -98,7 +99,7 @@ memory budget linearly.
 
 | Cap | Symbol | embedded | host | Binds instead / notes |
 |---|---|---|---|---|
-| Namespace bindings | `NAMESPACE_SLOTS` | 64 `minimal` / 256 `embedded` | 8192 | NOT a capacity ceiling while the snapshot tier is on: the arena is a hot cache over the durable snapshot, so a bind into a full arena retries behind an eviction of one snapshot-covered slot, and more bindings than slots is a working-set question — `ns_scales_past_arena_capacity_via_snapshot` drives `NAMESPACE_SLOTS + 512` through the real step loop. With no active snapshot to evict against — and on `minimal`, where the tier is compiled out — the arena IS the set and a bind past it is refused. Slot is 528 B embedded, 1392 B host — the host arena is therefore 11,403,264 B (10.875 MiB) per instance, the direct cost of storing a full-length S3 key and its content type inline. Pinned by `binding_slot_matches_the_size_the_limit_register_quotes` |
+| Namespace bindings | `NAMESPACE_SLOTS` | 64 `minimal` / 256 `embedded` | 8192 | NOT a capacity ceiling while the snapshot tier is on: the arena is a hot cache over the durable snapshot, so a bind into a full arena retries behind an eviction of one snapshot-covered slot, and more bindings than slots is a working-set question — `ns_scales_past_arena_capacity_via_snapshot` drives `NAMESPACE_SLOTS + 512` through the real step loop. With no active snapshot to evict against — and on `minimal`, where the tier is compiled out — the arena IS the set and a bind past it is refused. Slot is 600 B embedded, 1464 B host — the host arena is therefore 11,993,088 B (11.4375 MiB) per instance, the direct cost of storing a full-length S3 key, its content type and its key reference inline. Pinned by `binding_slot_matches_the_size_the_limit_register_quotes` |
 | Object descriptors | `OBJECT_SLOTS` | 64 `minimal` / 256 `embedded` | 8192 | A true ceiling — whole-set arena, so object count is hard-capped per node. The snapshot treatment that makes `NAMESPACE_SLOTS` a cache has no counterpart here yet |
 | Block volumes | `BLOCK_SLOTS` | 8 `minimal` / 64 `embedded` | 1024 | A true ceiling. Volumes are coarse-grained (one per logical disk or image), so the budget is far smaller than the per-binding and per-object arenas |
 | Body slots | `BODY_SLOTS` | 16 `minimal` / 64 `embedded` | 8192 | NOT a ceiling on bodies held: the slot table is an index over the on-disk inventory, and a cursor-0 `OP_SCAN` rehydrates it from the root directory. A PUT past a full table is stored and acknowledged unindexed, and a GET reads it from disk and verifies it. It bounds working-set lookup |
@@ -178,7 +179,7 @@ ceiling answers `EBUSY` or `ENOMEM`.
 
 | Cap | Symbol | Source | Value | Reason |
 |---|---|---|---|---|
-| Admin request | `REQUEST_MAX` | `mechanics/loam_admin_wire.rs` | derived, 61905 (160-byte paths) / 62769 (1024) | Derived: a single-frame `PUT_FILE` of a whole body under the longest root, path, expected object id and content type. What a receiver framing requests from a stream holds; a request past it is refused |
+| Admin request | `REQUEST_MAX` | `mechanics/loam_admin_wire.rs` | derived, 61979 (160-byte paths) / 62843 (1024) | Derived: a single-frame `PUT_FILE` of a whole body under the longest root, path, expected object id, content type and key reference. What a receiver framing requests from a stream holds; a request past it is refused |
 | Admin answer | `RESPONSE_MAX` | `mechanics/loam_admin_wire.rs` | derived, 61450 | Derived: a whole body read back. A listing page is asserted below it |
 | Admin listing page | `LIST_PAGE_MAX` | `mechanics/loam_admin_wire.rs` | 16 | Policy: the namespace's own page, so a `LIST_FILES` page is one namespace page joined with its objects |
 | Namespace request record | `REQUEST_RECORD_MAX` | `mechanics/loam_wire.rs` | derived | Derived: a bind of the longest key, object id and content type |

@@ -35,10 +35,9 @@
 // live binding budget per PIC instance, not just a hot cache size.
 // Bump per-instance for larger working sets; multi-PIC deployments
 // shard further by partition (`loam_placement.rs`).
-// ModuleState is dominated by the arena: `BindingSlot` is 384 B on
-// the embedded profile, so 256 slots is ~96 KiB of the ~116 KiB the
-// whole struct occupies there, the rest being the reassembly buffers
-// and the append scratch. The kernel heap-allocates it, so the cap
+// ModuleState is dominated by the arena: `BindingSlot` is 600 B on
+// the embedded profile, so 256 slots is ~150 KiB of the whole struct
+// there, the rest being the reassembly buffers and the append scratch. The kernel heap-allocates it, so the cap
 // and the module's memory budget move together — see
 // `docs/limit_register.md`, which carries the figures and the test
 // that pins them.
@@ -1005,6 +1004,8 @@ unsafe fn step_body(state_ptr: *mut u8) -> i32 {
                 | super::wire::OP_LOOKUP
                 | super::wire::OP_LIST
                 | super::wire::OP_REFERENCED
+                | super::wire::OP_RETAINED
+                | super::wire::OP_RETAIN
                 | super::wire::OP_GC_RESERVE
                 | super::wire::OP_GC_RELEASE
                 | super::wire::OP_LEASE
@@ -1031,6 +1032,7 @@ unsafe fn step_body(state_ptr: *mut u8) -> i32 {
         if op == super::wire::OP_LOOKUP
             || op == super::wire::OP_LIST
             || op == super::wire::OP_REFERENCED
+            || op == super::wire::OP_RETAINED
             || op == super::wire::OP_VOLUME_ROOTS
         {
             if s.replicated != 0 && s.read_ready == 0 {
@@ -1044,6 +1046,7 @@ unsafe fn step_body(state_ptr: *mut u8) -> i32 {
                 super::wire::OP_LOOKUP => handle_lookup(s, syscalls, bytes),
                 super::wire::OP_LIST => handle_list(s, syscalls, bytes),
                 super::wire::OP_VOLUME_ROOTS => handle_volume_roots(s, syscalls, bytes),
+                super::wire::OP_RETAINED => handle_retained(s, syscalls, bytes),
                 _ => handle_referenced(s, syscalls, bytes),
             };
             if !answered {
@@ -1259,9 +1262,12 @@ unsafe fn drain_committed(s: &mut ModuleState, syscalls: &super::SyscallTable) {
         inner_buf[..inner_len].copy_from_slice(&s.cmt_asm[off + hdr..off + hdr + inner_len]);
         let inner = &inner_buf[..inner_len];
         // A restore record is this module's own log entry, never a
-        // proposal. One arriving as a commit could set a fence
-        // directly, so it is refused; it answers no request of ours.
-        if inner.first() == Some(&super::wire::OP_LEASE_RESTORE) {
+        // proposal. One arriving as a commit could set a fence or a
+        // binding directly, so it is refused; it answers no request of
+        // ours.
+        if inner.first() == Some(&super::wire::OP_LEASE_RESTORE)
+            || inner.first() == Some(&super::wire::OP_BINDING_RESTORE)
+        {
             s.apply_errors = s.apply_errors.wrapping_add(1);
             off += rec_len;
             continue;
@@ -1461,11 +1467,7 @@ unsafe fn handle_lookup(s: &mut ModuleState, syscalls: &super::SyscallTable, byt
                 object_id: rec.oid(),
                 revision: rec.revision,
                 kind: rec.kind,
-                meta: super::wire::BindMeta {
-                    stamp_ms: rec.stamp_ms,
-                    size: rec.size,
-                    content_type: rec.content_type(),
-                },
+                meta: snap_meta(&rec),
             };
             super::wire::encode_lookup_found(&mut s.list_scratch, &b)
         }
@@ -1513,6 +1515,21 @@ fn wire_meta<'a>(m: &super::state::Meta<'a>) -> super::wire::BindMeta<'a> {
         stamp_ms: m.stamp_ms,
         size: m.size,
         content_type: m.content_type,
+        key_ref: m.key_ref,
+        retain_until_ms: m.retain_until_ms,
+        hold: m.hold,
+    }
+}
+
+/// A snapshot record's metadata, as the wire carries it.
+fn snap_meta(rec: &super::snapshot::SnapRecord) -> super::wire::BindMeta<'_> {
+    super::wire::BindMeta {
+        stamp_ms: rec.stamp_ms,
+        size: rec.size,
+        content_type: rec.content_type(),
+        key_ref: rec.key_ref(),
+        retain_until_ms: rec.retain_until_ms,
+        hold: rec.hold != 0,
     }
 }
 
@@ -1659,7 +1676,7 @@ unsafe fn walk_ordered(
                 let Some(slot) = s.bindings.slot_ref(i) else {
                     return SnapRead::Failed;
                 };
-                cur_path[..path_len].copy_from_slice(slot.path());
+                copy_field(&mut cur_path, slot.path());
                 if slot.kind == super::state::KIND_TOMBSTONE {
                     true
                 } else {
@@ -1680,7 +1697,7 @@ unsafe fn walk_ordered(
                     return SnapRead::Failed;
                 };
                 idx += 1;
-                cur_path[..path_len].copy_from_slice(rec.path());
+                copy_field(&mut cur_path, rec.path());
                 if rec.kind == super::state::KIND_TOMBSTONE {
                     true
                 } else {
@@ -1690,11 +1707,7 @@ unsafe fn walk_ordered(
                             object_id: rec.oid(),
                             revision: rec.revision,
                             kind: rec.kind,
-                            meta: super::wire::BindMeta {
-                                stamp_ms: rec.stamp_ms,
-                                size: rec.size,
-                                content_type: rec.content_type(),
-                            },
+                            meta: snap_meta(&rec),
                         },
                         change_rev: s.bindings.change_horizon(),
                     })
@@ -1821,6 +1834,79 @@ unsafe fn handle_referenced(
     true
 }
 
+/// Serve a RETAINED request: does a binding retained at the request's
+/// stamp name this object id? Read-only, channel-only. Unlike REFERENCED it
+/// must not over-answer from a snapshot record the arena has superseded, so
+/// a key the arena holds is the arena's to answer for. What is unreadable
+/// answers retained: nothing is destroyed on doubt.
+unsafe fn handle_retained(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    bytes: &[u8],
+) -> bool {
+    const SCAN_PER_CALL: u32 = 128;
+    let (cursor, oid, now) = match super::wire::decode_retained_req(bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            respond(s, syscalls, 0xFF);
+            return true;
+        }
+    };
+    let mut retained = false;
+    if cursor == 0 {
+        let mut i = 0;
+        while i < s.bindings.capacity() {
+            if let Some(slot) = s.bindings.slot_ref(i) {
+                if slot.object_id() == oid && slot.retained_at(now) {
+                    retained = true;
+                    break;
+                }
+            }
+            i += 1;
+        }
+    }
+    let mut next_cursor = 0u32;
+    if !retained && s.snap_active != 0 {
+        let snap = super::snapshot::OpenSnapshot {
+            fd: s.snap_fd,
+            count: s.snap_count,
+            generation: s.snap_gen,
+        };
+        let end = cursor.saturating_add(SCAN_PER_CALL).min(s.snap_count);
+        let mut idx = cursor;
+        while idx < end {
+            match super::snapshot::snap_read_at(syscalls, &snap, idx) {
+                super::snapshot::SnapRead::Ready(rec) => {
+                    if rec.kind != super::state::KIND_TOMBSTONE
+                        && rec.oid() == oid
+                        && super::state::retained_at(rec.retain_until_ms, rec.hold != 0, now)
+                        && s.bindings.lookup(rec.root(), rec.path()).is_none()
+                    {
+                        retained = true;
+                        break;
+                    }
+                }
+                super::snapshot::SnapRead::Pending => return false,
+                super::snapshot::SnapRead::Failed => {
+                    retained = true;
+                    break;
+                }
+            }
+            idx += 1;
+        }
+        if !retained && end < s.snap_count {
+            next_cursor = end;
+        }
+    }
+    let mut out = [0u8; 6];
+    if s.out_chan >= 0 && super::wire::encode_retained_resp(&mut out, retained, next_cursor).is_ok()
+    {
+        let _ = s.reply.send(syscalls.channel_write, s.out_chan, &out);
+    }
+    true
+}
+
 /// Answer one applied record. A reserve carries whether the id is now
 /// held — the sweep needs the grant, not just an ack — and a bind
 /// refused by a standing reservation gets its own nak so the client
@@ -1859,7 +1945,8 @@ unsafe fn respond_applied(
         Ok(op)
             if op == super::wire::OP_BIND
                 || op == super::wire::OP_RENAME
-                || op == super::wire::OP_UNBIND =>
+                || op == super::wire::OP_UNBIND
+                || op == super::wire::OP_RETAIN =>
         {
             respond_write(s, syscalls, op)
         }
@@ -1868,6 +1955,7 @@ unsafe fn respond_applied(
         Err(ApplyFault::Fenced) => respond(s, syscalls, super::wire::NAK_FENCED),
         Err(ApplyFault::Condition) => respond(s, syscalls, super::wire::NAK_CONDITION),
         Err(ApplyFault::Stale) => respond(s, syscalls, super::wire::NAK_STALE),
+        Err(ApplyFault::Retained) => respond(s, syscalls, super::wire::NAK_RETAINED),
         // `Pending` is intercepted by every caller before an answer is
         // owed; were one to reach here it is not a success either.
         Err(ApplyFault::Rejected) | Err(ApplyFault::Pending) => respond(s, syscalls, 0xFF),
@@ -1891,6 +1979,9 @@ enum ApplyFault {
     /// A record's revision is not above the key's current one: a write
     /// that lost a race, or one already applied and since superseded.
     Stale,
+    /// The binding is retained or held at the record's stamp, or a Retain
+    /// would shorten its retention: deterministic, like `Reserved`.
+    Retained,
     Rejected,
     /// Not decided: a snapshot read the decision needs is being
     /// fetched. Nothing changed. Never an answer — every caller of
@@ -1990,6 +2081,14 @@ unsafe fn apply_op(
         }
         return Ok(op);
     }
+    if op == super::wire::OP_BINDING_RESTORE {
+        let r = super::wire::decode_binding_restore(payload).map_err(|_| ApplyFault::Rejected)?;
+        return restore_binding(s, syscalls, &r).map(|_| op);
+    }
+    if op == super::wire::OP_RETAIN {
+        let r = super::wire::decode_retain(payload).map_err(|_| ApplyFault::Rejected)?;
+        return apply_retain(s, syscalls, &r).map(|_| op);
+    }
     if op == super::wire::OP_VOLUME {
         let req = super::wire::decode_volume_req(payload).map_err(|_| ApplyFault::Rejected)?;
         let (status, revision) = judge_volume(s, syscalls, &req)?;
@@ -2016,21 +2115,24 @@ unsafe fn apply_op(
         // Decided against the key's current state, wherever it lives,
         // so a key the arena evicted to the snapshot is gated exactly
         // as one it holds.
-        let (cur_rev, live, same) = match current(s, syscalls, dec.namespace_root, dec.path) {
-            Some(Current::Arena(slot)) => (
-                slot.revision,
-                slot.kind != super::state::KIND_TOMBSTONE,
-                slot.kind == dec.kind && slot.object_id() == dec.object_id,
-            ),
-            Some(Current::Snapshot(rec)) => (
-                rec.revision,
-                rec.kind != super::state::KIND_TOMBSTONE,
-                rec.kind == dec.kind && rec.oid() == dec.object_id,
-            ),
-            Some(Current::Unreadable) => return Err(ApplyFault::Rejected),
-            Some(Current::Pending) => return Err(ApplyFault::Pending),
-            None => (0, false, false),
-        };
+        let (cur_rev, live, same, retained) =
+            match current(s, syscalls, dec.namespace_root, dec.path) {
+                Some(Current::Arena(slot)) => (
+                    slot.revision,
+                    slot.kind != super::state::KIND_TOMBSTONE,
+                    slot.kind == dec.kind && slot.object_id() == dec.object_id,
+                    slot.retained_at(dec.meta.stamp_ms),
+                ),
+                Some(Current::Snapshot(rec)) => (
+                    rec.revision,
+                    rec.kind != super::state::KIND_TOMBSTONE,
+                    rec.kind == dec.kind && rec.oid() == dec.object_id,
+                    snap_retained_at(&rec, dec.meta.stamp_ms),
+                ),
+                Some(Current::Unreadable) => return Err(ApplyFault::Rejected),
+                Some(Current::Pending) => return Err(ApplyFault::Pending),
+                None => (0, false, false, false),
+            };
         if dec.revision <= cur_rev {
             // The same write applied again is done, not a conflict.
             if live && dec.revision == cur_rev && same {
@@ -2045,11 +2147,12 @@ unsafe fn apply_op(
             }
             _ => {}
         }
-        let meta = super::state::Meta {
-            stamp_ms: dec.meta.stamp_ms,
-            size: dec.meta.size,
-            content_type: dec.meta.content_type,
-        };
+        // Decided after the record's revision and its condition: a write
+        // that lost, or whose precondition failed, answers that.
+        if retained {
+            return Err(ApplyFault::Retained);
+        }
+        let meta = state_meta(&dec.meta);
         let mut res = s.bindings.bind(
             dec.namespace_root,
             dec.path,
@@ -2083,22 +2186,39 @@ unsafe fn apply_op(
         {
             return Err(ApplyFault::Fenced);
         }
+        // A move is a delete of the old name and, over a tombstone, a
+        // create of the new one, so a binding retained at either end
+        // refuses it, wherever that binding lives. A snapshot's live record
+        // at the new name occupies it as an arena entry would.
+        let (from_kept, _) = key_retained(s, syscalls, dec.namespace_root, dec.from, dec.stamp_ms)?;
+        let (to_kept, to_live) =
+            key_retained(s, syscalls, dec.namespace_root, dec.to, dec.stamp_ms)?;
+        if from_kept || to_kept {
+            return Err(ApplyFault::Retained);
+        }
+        if to_live {
+            return Err(ApplyFault::Rejected);
+        }
     }
     if op == super::wire::OP_UNBIND {
         let dec = super::wire::decode_unbind(payload).map_err(|_| ApplyFault::Rejected)?;
         if volume_gate(s, syscalls, dec.namespace_root, dec.path)? {
             return Err(ApplyFault::Fenced);
         }
-        let (cur_rev, live) = match current(s, syscalls, dec.namespace_root, dec.path) {
-            Some(Current::Arena(slot)) => {
-                (slot.revision, slot.kind != super::state::KIND_TOMBSTONE)
-            }
-            Some(Current::Snapshot(rec)) => {
-                (rec.revision, rec.kind != super::state::KIND_TOMBSTONE)
-            }
+        let (cur_rev, live, retained) = match current(s, syscalls, dec.namespace_root, dec.path) {
+            Some(Current::Arena(slot)) => (
+                slot.revision,
+                slot.kind != super::state::KIND_TOMBSTONE,
+                slot.retained_at(dec.stamp_ms),
+            ),
+            Some(Current::Snapshot(rec)) => (
+                rec.revision,
+                rec.kind != super::state::KIND_TOMBSTONE,
+                snap_retained_at(&rec, dec.stamp_ms),
+            ),
             Some(Current::Unreadable) => return Err(ApplyFault::Rejected),
             Some(Current::Pending) => return Err(ApplyFault::Pending),
-            None => (0, false),
+            None => (0, false, false),
         };
         if !live {
             // Already gone at this revision: the same delete again.
@@ -2112,6 +2232,9 @@ unsafe fn apply_op(
         }
         if dec.cond == super::wire::COND_REVISION && cur_rev != dec.expect {
             return Err(ApplyFault::Condition);
+        }
+        if retained {
+            return Err(ApplyFault::Retained);
         }
         return remove_binding(s, dec.namespace_root, dec.path, dec.revision)
             .map(|_| super::wire::OP_UNBIND);
@@ -2136,6 +2259,243 @@ unsafe fn apply_op(
             Err(ApplyFault::Rejected)
         }
     }
+}
+
+/// A wire binding's metadata, as the arena stores it.
+fn state_meta<'a>(m: &super::wire::BindMeta<'a>) -> super::state::Meta<'a> {
+    super::state::Meta {
+        stamp_ms: m.stamp_ms,
+        size: m.size,
+        content_type: m.content_type,
+        key_ref: m.key_ref,
+        retain_until_ms: m.retain_until_ms,
+        hold: m.hold,
+    }
+}
+
+/// A live snapshot record that refuses change at `now`.
+fn snap_retained_at(rec: &super::snapshot::SnapRecord, now: u64) -> bool {
+    rec.kind != super::state::KIND_TOMBSTONE
+        && super::state::retained_at(rec.retain_until_ms, rec.hold != 0, now)
+}
+
+/// `(retained at now, live)` for a key, wherever it lives.
+unsafe fn key_retained(
+    s: &ModuleState,
+    syscalls: &super::SyscallTable,
+    root: &[u8],
+    path: &[u8],
+    now: u64,
+) -> Result<(bool, bool), ApplyFault> {
+    match current(s, syscalls, root, path) {
+        Some(Current::Arena(slot)) => Ok((
+            slot.retained_at(now),
+            slot.kind != super::state::KIND_TOMBSTONE,
+        )),
+        Some(Current::Snapshot(rec)) => Ok((
+            snap_retained_at(&rec, now),
+            rec.kind != super::state::KIND_TOMBSTONE,
+        )),
+        Some(Current::Unreadable) => Err(ApplyFault::Rejected),
+        Some(Current::Pending) => Err(ApplyFault::Pending),
+        None => Ok((false, false)),
+    }
+}
+
+/// `commit_bind`, behind one eviction when the arena is full.
+unsafe fn commit_binding(
+    s: &mut ModuleState,
+    root: &[u8],
+    path: &[u8],
+    object_id: &[u8],
+    kind: u8,
+    revision: u64,
+    meta: &super::state::Meta<'_>,
+) -> Result<(), ApplyFault> {
+    let mut res = s
+        .bindings
+        .commit_bind(root, path, object_id, kind, revision, meta);
+    if res == Err(super::state::ApplyError::OutOfCapacity)
+        && s.snap_active != 0
+        && s.bindings.evict_one_snapshotted()
+    {
+        s.evictions = s.evictions.wrapping_add(1);
+        res = s
+            .bindings
+            .commit_bind(root, path, object_id, kind, revision, meta);
+    }
+    res.map(|_| ()).map_err(|_| ApplyFault::Rejected)
+}
+
+/// Copy `src` to the front of `dst` by index: a slice copy of a runtime
+/// length pulls panic paths the PIC link does not carry.
+fn copy_field(dst: &mut [u8], src: &[u8]) {
+    let mut i = 0;
+    while i < src.len() && i < dst.len() {
+        dst[i] = src[i];
+        i += 1;
+    }
+}
+
+/// Decide one Retain, in log order. Its revision decides first, as for
+/// every record: a record at or below the key's revision finds its own
+/// effect or a later one in place. A value earlier than the one held is
+/// refused whole, the hold included; one that changes nothing succeeds and
+/// leaves the binding, its revision included, as it was. Bytes, etag, mtime
+/// and key reference are never touched. A volume is fenced by its lease and
+/// has no retention.
+unsafe fn apply_retain(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    r: &super::wire::DecodedRetain<'_>,
+) -> Result<(), ApplyFault> {
+    let cur = match current(s, syscalls, r.namespace_root, r.path) {
+        Some(Current::Unreadable) => return Err(ApplyFault::Rejected),
+        Some(Current::Pending) => return Err(ApplyFault::Pending),
+        Some(c) => c,
+        // Never bound: what the record read has gone.
+        None => return Err(ApplyFault::Condition),
+    };
+    let mut oid = [0u8; super::limits::MAX_OBJECT_ID];
+    let mut ctype = [0u8; super::limits::CONTENT_TYPE_MAX];
+    let mut key_ref = [0u8; super::limits::KEY_REF_MAX];
+    let (rev, kind, oid_len, ctype_len, ref_len, stamp_ms, size, until, hold) = match &cur {
+        Current::Arena(slot) => {
+            let (o, c, k) = (slot.object_id(), slot.content_type(), slot.key_ref());
+            copy_field(&mut oid, o);
+            copy_field(&mut ctype, c);
+            copy_field(&mut key_ref, k);
+            (
+                slot.revision,
+                slot.kind,
+                o.len(),
+                c.len(),
+                k.len(),
+                slot.stamp_ms,
+                slot.size,
+                slot.retain_until_ms,
+                slot.hold != 0,
+            )
+        }
+        Current::Snapshot(rec) => {
+            let (o, c, k) = (rec.oid(), rec.content_type(), rec.key_ref());
+            copy_field(&mut oid, o);
+            copy_field(&mut ctype, c);
+            copy_field(&mut key_ref, k);
+            (
+                rec.revision,
+                rec.kind,
+                o.len(),
+                c.len(),
+                k.len(),
+                rec.stamp_ms,
+                rec.size,
+                rec.retain_until_ms,
+                rec.hold != 0,
+            )
+        }
+        _ => return Err(ApplyFault::Rejected),
+    };
+    if r.revision <= rev {
+        return Err(ApplyFault::Stale);
+    }
+    if rev != r.expect || kind == super::state::KIND_TOMBSTONE {
+        return Err(ApplyFault::Condition);
+    }
+    if kind == super::wire::KIND_VOLUME {
+        return Err(ApplyFault::Fenced);
+    }
+    if r.retain_until_ms != 0 && r.retain_until_ms < until {
+        return Err(ApplyFault::Retained);
+    }
+    let new_until = if r.retain_until_ms != 0 {
+        r.retain_until_ms
+    } else {
+        until
+    };
+    let new_hold = match r.hold {
+        super::wire::RETAIN_HOLD_SET => true,
+        super::wire::RETAIN_HOLD_CLEAR => false,
+        _ => hold,
+    };
+    if new_until == until && new_hold == hold {
+        return Ok(());
+    }
+    let meta = super::state::Meta {
+        stamp_ms,
+        size,
+        content_type: &ctype[..ctype_len],
+        key_ref: &key_ref[..ref_len],
+        retain_until_ms: new_until,
+        hold: new_hold,
+    };
+    commit_binding(
+        s,
+        r.namespace_root,
+        r.path,
+        &oid[..oid_len],
+        kind,
+        r.revision,
+        &meta,
+    )
+}
+
+/// Reinstate an arena entry the rotated log carries. Its revision orders it
+/// like any record's, so a log replayed over a later snapshot changes
+/// nothing.
+unsafe fn restore_binding(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    r: &super::wire::DecodedBind<'_>,
+) -> Result<(), ApplyFault> {
+    let cur_rev = match current(s, syscalls, r.namespace_root, r.path) {
+        Some(Current::Arena(slot)) => slot.revision,
+        Some(Current::Snapshot(rec)) => rec.revision,
+        Some(Current::Unreadable) => return Err(ApplyFault::Rejected),
+        Some(Current::Pending) => return Err(ApplyFault::Pending),
+        None => 0,
+    };
+    if r.revision <= cur_rev {
+        return Ok(());
+    }
+    if r.kind == super::state::KIND_TOMBSTONE {
+        return remove_binding(s, r.namespace_root, r.path, r.revision);
+    }
+    let meta = state_meta(&r.meta);
+    commit_binding(
+        s,
+        r.namespace_root,
+        r.path,
+        r.object_id,
+        r.kind,
+        r.revision,
+        &meta,
+    )
+}
+
+/// Encode arena slot `i` as the record that reinstates it in a rotated log:
+/// `Some(0)` for a slot the snapshot generation just made covers, `None`
+/// when it cannot be encoded, which abandons the rotation rather than write
+/// a log missing an acknowledged write.
+fn seed_binding(
+    bindings: &super::state::PicNamespaceState<ARENA_CAPACITY>,
+    i: usize,
+    buf: &mut [u8],
+) -> Option<usize> {
+    let slot = bindings.slot_ref(i)?;
+    if !slot.occupied || slot.snapshotted != 0 {
+        return Some(0);
+    }
+    super::wire::encode_binding_restore(
+        buf,
+        slot.root(),
+        slot.path(),
+        slot.object_id(),
+        slot.kind,
+        slot.revision,
+        &wire_meta(&slot.meta()),
+    )
+    .ok()
 }
 
 /// Encode lease entry `i` as the record that reinstates it: `Some(0)`
@@ -2295,7 +2655,8 @@ unsafe fn judge_volume(
         super::snapshot::SnapRead::Pending => return Err(ApplyFault::Pending),
         super::snapshot::SnapRead::Failed => return Err(ApplyFault::Rejected),
     };
-    Ok(judge_volume_at(s, req, current))
+    let (retained, _) = key_retained(s, syscalls, root, path, req.now_ms)?;
+    Ok(judge_volume_at(s, req, current, retained))
 }
 
 /// `judge_volume` against the binding already read.
@@ -2303,6 +2664,7 @@ unsafe fn judge_volume_at(
     s: &mut ModuleState,
     req: &super::wire::DecodedVolumeReq<'_>,
     current: Option<(u64, bool, bool)>,
+    retained: bool,
 ) -> (u8, u64) {
     let root = req.namespace_root;
     let path = req.path;
@@ -2380,10 +2742,18 @@ unsafe fn judge_volume_at(
                 return (super::wire::VOLUME_BAD_REQ, cur_rev);
             }
             let _ = s.leases.set_flushing(root, path, &req.holder, false);
+            // A commit replaces whatever the key holds, and a volume root
+            // laid over a retained object is an overwrite of it.
+            if retained {
+                return (super::wire::VOLUME_RETAINED, cur_rev);
+            }
             let meta = super::state::Meta {
                 stamp_ms: req.now_ms,
                 size: 0,
                 content_type: &[],
+                key_ref: &[],
+                retain_until_ms: 0,
+                hold: false,
             };
             let mut res = s.bindings.commit_bind(
                 root,
@@ -2555,6 +2925,10 @@ fn snap_record_from_slot(slot: &super::state::BindingSlot) -> super::snapshot::S
     r.size = slot.size;
     r.ctype_len = slot.ctype_len;
     r.ctype = slot.ctype_bytes;
+    r.key_ref_len = slot.key_ref_len;
+    r.key_ref = slot.key_ref_bytes;
+    r.retain_until_ms = slot.retain_until_ms;
+    r.hold = slot.hold;
     r
 }
 
@@ -2671,20 +3045,32 @@ unsafe fn compaction_step(s: &mut ModuleState, syscalls: &super::SyscallTable) {
             }
             CMP_ROTATE => {
                 // The snapshot holds bindings only. The lease table
-                // lives in the log, so the new log opens with it. The
-                // seed is read record by record across the rotation's
-                // steps; the table holds still meanwhile because nothing
-                // is applied while `rotator.busy()` holds back intake.
+                // lives in the log, so the new log opens with it. So do
+                // the arena entries this generation does not cover: a key
+                // written since the merge passed it has its record in the
+                // log being replaced, and an acknowledged write outlives
+                // the rotation. The seed is read record by record across
+                // the rotation's steps; both hold still meanwhile because
+                // nothing is applied while `rotator.busy()` holds back
+                // intake.
                 let wal_len = (s.wal_path_len as usize).min(WAL_PATH_BUF);
                 let wal_path = s.wal_path.get(..wal_len).unwrap_or(&[]);
                 let leases = &s.leases;
+                let bindings = &s.bindings;
+                let lease_seeds = leases.capacity();
                 let outcome = s.rotator.rotate_seeded(
                     syscalls,
                     s.wal_fd,
                     wal_path,
-                    leases.capacity(),
+                    lease_seeds + bindings.capacity(),
                     &mut s.append_scratch,
-                    |i, buf| seed_lease(leases, i, buf),
+                    |i, buf| {
+                        if i < lease_seeds {
+                            seed_lease(leases, i, buf)
+                        } else {
+                            seed_binding(bindings, i - lease_seeds, buf)
+                        }
+                    },
                 );
                 match outcome {
                     super::wal::RotateOutcome::Pending => return,
@@ -2965,6 +3351,28 @@ const E_OVERFLOW: i32 = -75;
 /// Not now: the boot is not done, or a snapshot read is being fetched.
 /// Nothing was done; the caller asks again later.
 const E_AGAIN: i32 = -11;
+const E_RETAINED: i32 = super::abi::kernel_abi::errno::ERETAINED;
+/// `TIMER::UNIX_MILLIS`: wall-clock milliseconds, 0 when the platform has
+/// none.
+const TIMER_UNIX_MILLIS: u32 = 0x0608;
+
+/// Whether `path`, in the provider surface's root, is retained now. This
+/// surface applies to the arena inside the call, with no record to carry a
+/// stamp, so it reads the clock the router stamps from. `Err` carries the
+/// errno when the snapshot cannot say yet or at all.
+unsafe fn surface_retained(s: &ModuleState, path: &[u8]) -> Result<bool, i32> {
+    let Some(sys) = s.syscalls.as_ref() else {
+        return Ok(false);
+    };
+    let mut clock = [0u8; 8];
+    let rc = (sys.provider_call)(-1, TIMER_UNIX_MILLIS, clock.as_mut_ptr(), clock.len());
+    let now = if rc < 0 { 0 } else { u64::from_le_bytes(clock) };
+    match key_retained(s, sys, &[], path, now) {
+        Ok((retained, _)) => Ok(retained),
+        Err(ApplyFault::Pending) => Err(E_AGAIN),
+        Err(_) => Err(E_IO),
+    }
+}
 
 /// The strongest fence this provider can honestly claim right now.
 ///
@@ -3665,6 +4073,11 @@ unsafe fn dispatch_op(
                 Ok(false) => {}
                 Err(rc) => return rc,
             }
+            match surface_retained(s, path) {
+                Ok(true) => return E_RETAINED,
+                Ok(false) => {}
+                Err(rc) => return rc,
+            }
             let existing = live_slot(s, path).map(|(_, rev)| rev);
             let revision = match existing {
                 Some(rev) => {
@@ -3707,6 +4120,11 @@ unsafe fn dispatch_op(
             let path = &a[2..2 + path_len];
             match live_volume(s, path) {
                 Ok(true) => return E_PERM,
+                Ok(false) => {}
+                Err(rc) => return rc,
+            }
+            match surface_retained(s, path) {
+                Ok(true) => return E_RETAINED,
                 Ok(false) => {}
                 Err(rc) => return rc,
             }
@@ -3758,6 +4176,11 @@ unsafe fn dispatch_op(
                 Ok(true) => return E_PERM,
                 Ok(false) => {}
                 Err(rc) => return rc,
+            }
+            match (surface_retained(s, from), surface_retained(s, to)) {
+                (Ok(true), _) | (_, Ok(true)) => return E_RETAINED,
+                (Err(rc), _) | (_, Err(rc)) => return rc,
+                _ => {}
             }
             if live_slot(s, to).is_some() {
                 return E_EXIST;

@@ -22,7 +22,7 @@ Three modules declare a surface, and each is the one that can answer it:
 | Module | Fluxor surface | Ops | Fence it returns |
 | --- | --- | --- | --- |
 | `namespace_router` | `storage.namespace` | `LOOKUP` `STAT` `LIST` `CLOSE` `BIND` `RENAME` `DELETE` `SUBSCRIBE` `TAKE_RUNG` `CHANGES` `CAPS`, by provider dispatch | `ReplicatedDurable` on the quorum path, `LocalDurable` WAL-only, `Volatile` with no WAL |
-| `object_provider` | `storage.object` | `PRESENT` `PUT` `GET` `HEAD` `RANGE_GET` `DELETE` `LIST` `PUT_STREAMED_*`, by provider dispatch, each under the capability its caller presented | For a write, the namespace's fence for its bind, as the admin plane's answer carries it; `Volatile` for a read |
+| `object_provider` | `storage.object` | `PRESENT` `PUT` `GET` `HEAD` `RANGE_GET` `DELETE` `RETAIN` `LIST` `PUT_STREAMED_*`, by provider dispatch, each under the capability its caller presented | For a write, the namespace's fence for its bind, as the admin plane's answer carries it; `Volatile` for a read |
 | `loam_volume` | `storage.block` | `CAPS` `EXEC` `SUBMIT` `REAP` on its `blocks` channel; `READ`, `WRITE`, `FLUSH`, with `FUA` and `PREFLUSH`. `DISCARD` is not advertised and is refused | `Volatile` for a staged write; `RevisionMonotone` at the volume's committed revision for a flush, a `FUA` write or a `PREFLUSH` |
 
 `LIST` (0x1302) answers one page of names under a prefix, in key

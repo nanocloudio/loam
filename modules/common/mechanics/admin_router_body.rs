@@ -10,6 +10,10 @@
 //   AdminPutFile    → composed: body PUT → ns LOOKUP → object PUT →
 //                     conditional ns BIND
 //   AdminDeleteFile → composed: ns LOOKUP → conditional ns UNBIND
+//   AdminRetain     → composed: ns LOOKUP → conditional ns RETAIN
+//   AdminDeleteBody, AdminPutBodyKeyed → held while the namespace proves
+//                     no retained binding names the digest: ns RESERVE →
+//                     ns RETAINED… → body op → ns RELEASE
 //
 // The namespace and object channels answer in the order they consume
 // requests, so each has a pending FIFO whose head is the next answer.
@@ -49,7 +53,7 @@ const NS_ASM: usize = 4096 * (super::limits::OPS_PER_STEP as usize + 1);
 const NS_PATH_BUF: usize = super::limits::MAX_PATH;
 const NS_ROOT_BUF: usize = super::limits::MAX_ROOT;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct PendingDownstream {
     pub in_use: u8,
@@ -75,6 +79,12 @@ pub struct PendingDownstream {
     /// through these ops, so a pin is always a digest.
     pub pinned: u8,
     pub pin: [u8; 32],
+    /// STAT_FILE: what the lookup found kept with the object, carried to
+    /// the body HEAD's answer.
+    pub kept_until: u64,
+    pub kept_hold: u8,
+    pub kept_ref_len: u8,
+    pub kept_ref: [u8; super::limits::KEY_REF_MAX],
 }
 
 impl PendingDownstream {
@@ -89,6 +99,10 @@ impl PendingDownstream {
             aux_len: 0,
             pinned: 0,
             pin: [0; 32],
+            kept_until: 0,
+            kept_hold: 0,
+            kept_ref_len: 0,
+            kept_ref: [0; super::limits::KEY_REF_MAX],
         }
     }
 }
@@ -122,6 +136,11 @@ pub struct WriteTarget {
     pub expect_len: u8,
     pub ctype: [u8; super::limits::CONTENT_TYPE_MAX],
     pub ctype_len: u8,
+    /// What the store keeps with the object the write binds.
+    pub key_ref: [u8; super::limits::KEY_REF_MAX],
+    pub key_ref_len: u8,
+    pub retain_until_ms: u64,
+    pub hold: u8,
 }
 
 impl WriteTarget {
@@ -132,12 +151,14 @@ impl WriteTarget {
         root: &[u8],
         path: &[u8],
         cond: &super::admin::WriteCond<'_>,
+        policy: &super::admin::Policy<'_>,
         ctype: &[u8],
     ) -> Option<WriteTarget> {
         if root.len() > NS_ROOT_BUF
             || path.len() > NS_PATH_BUF
             || cond.expect.len() > super::limits::MAX_OBJECT_ID
             || ctype.len() > super::limits::CONTENT_TYPE_MAX
+            || policy.key_ref.len() > super::limits::KEY_REF_MAX
         {
             return None;
         }
@@ -151,7 +172,12 @@ impl WriteTarget {
             expect_len: cond.expect.len() as u8,
             ctype: [0; super::limits::CONTENT_TYPE_MAX],
             ctype_len: ctype.len() as u8,
+            key_ref: [0; super::limits::KEY_REF_MAX],
+            key_ref_len: policy.key_ref.len() as u8,
+            retain_until_ms: policy.retain_until_ms,
+            hold: u8::from(policy.hold),
         };
+        heapless_copy::put(&mut t.key_ref, policy.key_ref);
         heapless_copy::put(&mut t.ns_root, root);
         heapless_copy::put(&mut t.path, path);
         heapless_copy::put(&mut t.expect, cond.expect);
@@ -174,6 +200,10 @@ impl WriteTarget {
     fn content_type(&self) -> &[u8] {
         &self.ctype[..self.ctype_len as usize]
     }
+
+    fn key_ref(&self) -> &[u8] {
+        &self.key_ref[..self.key_ref_len as usize]
+    }
 }
 
 pub const PUTFILE_STAGE_BODY: u8 = 0;
@@ -185,6 +215,8 @@ pub const PUTFILE_STAGE_DONE: u8 = 3;
 pub const PUTFILE_STAGE_LOOKUP: u8 = 4;
 /// A composed delete's conditional unbind.
 pub const PUTFILE_STAGE_UNBIND: u8 = 5;
+/// A composed retain's conditional record.
+pub const PUTFILE_STAGE_RETAIN: u8 = 6;
 
 /// A composed write or delete in flight.
 ///
@@ -198,7 +230,7 @@ pub const PUTFILE_STAGE_UNBIND: u8 = 5;
 pub struct PendingPutFile {
     pub in_use: u8,
     pub stage: u8,
-    /// `admin::OP_PUT_FILE` or `admin::OP_DELETE_FILE`.
+    /// `admin::OP_PUT_FILE`, `admin::OP_DELETE_FILE` or `admin::OP_RETAIN`.
     pub op: u8,
     pub correlation_id: u32,
     pub kind: u8,
@@ -353,7 +385,38 @@ pub struct ModuleState {
     /// requests inside one clock tick, or across a clock stepped back,
     /// must still read as later.
     pub lease_stamp: u64,
+    /// The raw body-plane request held while the namespace proves no
+    /// retained binding names its digest.
+    pub raw: RawBodyOp,
 }
+
+/// The raw body plane overwrites and deletes by digest, beneath every
+/// binding, so it answers to retention too: the request waits here under a
+/// namespace reservation, which keeps any bind naming the digest out, until
+/// the paged proof says nothing retained names it. One at a time; a second
+/// is told to back off.
+#[repr(C)]
+pub struct RawBodyOp {
+    pub stage: u8,
+    /// `admin::OP_DELETE_BODY` or `admin::OP_PUT_BODY_KEYED`.
+    pub op: u8,
+    pub correlation_id: u32,
+    pub key: [u8; 32],
+    /// The stamp the proof is judged at.
+    pub now: u64,
+    /// The answer to send once the reservation is released, staged here
+    /// while the release is with the namespace.
+    pub status: u8,
+    pub existed: u8,
+    pub body_len: u32,
+    pub body: [u8; super::body_wire::MAX_BODY],
+}
+
+const RAW_IDLE: u8 = 0;
+const RAW_RESERVE: u8 = 1;
+const RAW_CHECK: u8 = 2;
+const RAW_BODY: u8 = 3;
+const RAW_RELEASE: u8 = 4;
 
 /// Internal pending-op markers for the GC's downstream requests —
 /// outside the admin opcode space so drains can demux them.
@@ -375,6 +438,8 @@ const GC_OP_RELEASE: u8 = 0xF6;
 const GC_OP_ROOTS: u8 = 0xF7;
 const GC_OP_MAP_ROOT: u8 = 0xF8;
 const GC_OP_MAP_LEAF: u8 = 0xF9;
+/// The raw body plane's reservation, proof and release.
+const RAW_OP_NS: u8 = 0xFA;
 
 /// Which inventory a GC pass is walking.
 pub const GC_PHASE_BODY: u8 = 0;
@@ -784,6 +849,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         && s.gc_q_len == 0
         && s.ticks.is_multiple_of(s.gc_interval)
         && s.putfiles.iter().all(|p| p.in_use == 0)
+        && s.raw.stage == RAW_IDLE
     {
         gc_kick(s, syscalls);
     }
@@ -820,6 +886,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
             super::admin::OP_PUT_FILE => handle_admin_put_file(s, syscalls, bytes),
             super::admin::OP_GET_FILE => handle_admin_get_file(s, syscalls, bytes),
             super::admin::OP_DELETE_FILE => handle_admin_delete_file(s, syscalls, bytes),
+            super::admin::OP_RETAIN => handle_admin_retain(s, syscalls, bytes),
             super::admin::OP_LIST_FILES => handle_admin_list_files(s, syscalls, bytes),
             super::admin::OP_PUT_FILE_OPEN => handle_put_file_open(s, syscalls, bytes),
             super::admin::OP_PUT_FILE_CHUNK => handle_put_file_chunk(s, syscalls, bytes),
@@ -924,9 +991,12 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                 GC_OP_ROOTS => {
                     gc_apply_roots(s, syscalls, ns_resp);
                 }
-                super::admin::OP_PUT_FILE | super::admin::OP_DELETE_FILE => {
+                super::admin::OP_PUT_FILE
+                | super::admin::OP_DELETE_FILE
+                | super::admin::OP_RETAIN => {
                     handle_composed_ns_response(s, syscalls, entry, ns_resp);
                 }
+                RAW_OP_NS => raw_ns_answered(s, syscalls, ns_resp),
                 super::admin::OP_BIND => {
                     let status = ns_write_status(ns_resp, super::ns_wire::OP_BIND);
                     emit_bind_status(s, syscalls, entry.correlation_id, status, ns_fence(ns_resp));
@@ -1029,11 +1099,17 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                     } else {
                         (super::admin::STATUS_NAK, 0)
                     };
+                    let policy = super::admin::Policy {
+                        key_ref: &entry.kept_ref[..entry.kept_ref_len as usize],
+                        retain_until_ms: entry.kept_until,
+                        hold: entry.kept_hold != 0,
+                    };
                     if let Ok(n) = super::admin::encode_stat_file_ack(
                         &mut s.scratch,
                         entry.correlation_id,
                         status,
                         size,
+                        &policy,
                     ) {
                         reply_staged(s, syscalls, n);
                     }
@@ -1045,6 +1121,9 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
                 GC_OP_DELETE => gc_apply_delete(s, syscalls, body_resp),
                 GC_OP_MAP_ROOT => gc_apply_map_root(s, syscalls, body_resp),
                 GC_OP_MAP_LEAF => gc_apply_map_leaf(s, syscalls, body_resp),
+                super::admin::OP_DELETE_BODY | super::admin::OP_PUT_BODY_KEYED => {
+                    raw_body_answered(s, syscalls, body_resp)
+                }
                 _ => emit_body_admin_response(s, syscalls, entry, body_resp),
             }
             if !oversize {
@@ -1108,6 +1187,7 @@ unsafe fn handle_admin_bind(s: &mut ModuleState, syscalls: &super::SyscallTable,
         stamp_ms: stamp_now(s, syscalls),
         size: req.size,
         content_type: req.content_type,
+        ..super::ns_wire::BindMeta::NONE
     };
     let n = match super::ns_wire::encode_bind(
         &mut s.scratch,
@@ -1165,6 +1245,8 @@ fn ns_write_status(ns_resp: &[u8], ok_op: u8) -> u8 {
         // The id is reserved by a sweep proving it unreferenced: a
         // moment's refusal, which the caller retries.
         Some(super::ns_wire::NAK_RESERVED_BYTE) => super::admin::STATUS_BUSY,
+        // The binding's retention or hold refuses the change, whoever asks.
+        Some(super::ns_wire::NAK_RETAINED) => super::admin::STATUS_RETAINED,
         _ => super::admin::STATUS_NAK,
     }
 }
@@ -1353,6 +1435,7 @@ unsafe fn handle_volume_response(
                 super::ns_wire::VOLUME_CONFLICT => super::admin::STATUS_CONFLICT,
                 super::ns_wire::VOLUME_LEASE_LOST => super::admin::STATUS_LEASE_LOST,
                 super::ns_wire::VOLUME_RESERVED => super::admin::STATUS_BUSY,
+                super::ns_wire::VOLUME_RETAINED => super::admin::STATUS_RETAINED,
                 _ => super::admin::STATUS_NAK,
             };
             (status, revision)
@@ -1409,6 +1492,11 @@ fn admin_binding<'a>(b: &super::ns_wire::Binding<'a>) -> super::admin::AdminBind
         stamp_ms: b.meta.stamp_ms,
         size: b.meta.size,
         content_type: b.meta.content_type,
+        policy: super::admin::Policy {
+            key_ref: b.meta.key_ref,
+            retain_until_ms: b.meta.retain_until_ms,
+            hold: b.meta.hold,
+        },
     }
 }
 
@@ -1501,8 +1589,10 @@ unsafe fn handle_admin_put_body(s: &mut ModuleState, syscalls: &super::SyscallTa
     s.forwarded = s.forwarded.wrapping_add(1);
 }
 
-/// Raw keyed body write. Body-plane forward of
-/// OP_PUT_KEYED; ack is status-only (the key is the caller's).
+/// Raw keyed body write: the bytes under a key the caller names, which
+/// may be a bound object's digest. Held until the namespace has proven no
+/// retained binding names that digest. The ack is status-only (the key is
+/// the caller's).
 unsafe fn handle_admin_put_body_keyed(
     s: &mut ModuleState,
     syscalls: &super::SyscallTable,
@@ -1515,35 +1605,21 @@ unsafe fn handle_admin_put_body_keyed(
             return;
         }
     };
-    if s.body_req_chan < 0 {
-        emit_admin_status_nak(s, syscalls, super::admin::OP_PUT_BODY_KEYED, cid);
+    if s.body_req_chan < 0 || body.len() > super::body_wire::MAX_BODY {
+        emit_admin_status_nak(
+            s,
+            syscalls,
+            super::admin::OP_PUT_BODY_KEYED,
+            cid,
+            super::admin::STATUS_NAK,
+        );
         return;
     }
-    let mut key_arr = [0u8; super::admin::DIGEST_LEN];
-    key_arr.copy_from_slice(key);
-    let n = match super::body_wire::encode_put_keyed_req(&mut s.scratch, &key_arr, body) {
-        Ok(n) => n,
-        Err(_) => {
-            emit_admin_status_nak(s, syscalls, super::admin::OP_PUT_BODY_KEYED, cid);
-            return;
-        }
-    };
-    if !forward_body(
-        s,
-        syscalls,
-        cid,
-        super::admin::OP_PUT_BODY_KEYED,
-        u16::MAX,
-        n,
-    ) {
-        emit_admin_status_nak(s, syscalls, super::admin::OP_PUT_BODY_KEYED, cid);
-        s.apply_errors = s.apply_errors.wrapping_add(1);
-        return;
-    }
-    s.forwarded = s.forwarded.wrapping_add(1);
+    raw_begin(s, syscalls, super::admin::OP_PUT_BODY_KEYED, cid, key, body);
 }
 
-/// Raw body delete by key/digest. Fans out downstream via the router.
+/// Raw body delete by digest, held the same way. Fans out downstream via
+/// the router.
 unsafe fn handle_admin_delete_body(
     s: &mut ModuleState,
     syscalls: &super::SyscallTable,
@@ -1557,24 +1633,175 @@ unsafe fn handle_admin_delete_body(
         }
     };
     if s.body_req_chan < 0 {
-        emit_admin_status_nak(s, syscalls, super::admin::OP_DELETE_BODY, cid);
+        emit_admin_status_nak(
+            s,
+            syscalls,
+            super::admin::OP_DELETE_BODY,
+            cid,
+            super::admin::STATUS_NAK,
+        );
         return;
     }
-    let mut key_arr = [0u8; super::admin::DIGEST_LEN];
-    key_arr.copy_from_slice(key);
-    let n = match super::body_wire::encode_delete_req(&mut s.scratch, &key_arr) {
+    raw_begin(s, syscalls, super::admin::OP_DELETE_BODY, cid, key, &[]);
+}
+
+/// Hold a raw body request and take the digest's reservation. A sweep
+/// holds reservations of its own, which one release would drop, so the raw
+/// plane waits its turn.
+unsafe fn raw_begin(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    op: u8,
+    cid: u32,
+    key: &[u8],
+    body: &[u8],
+) {
+    if s.raw.stage != RAW_IDLE || s.gc_q_len != 0 || s.gc_inflight != 0 {
+        emit_admin_status_nak(s, syscalls, op, cid, super::admin::STATUS_BUSY);
+        return;
+    }
+    let now = stamp_now(s, syscalls);
+    let mut k = [0u8; 32];
+    heapless_copy::put(&mut k, key);
+    let oid = gc_object_id(&k);
+    let n = match super::ns_wire::encode_gc_reserve_req(&mut s.scratch, &oid, now) {
         Ok(n) => n,
         Err(_) => {
-            emit_admin_status_nak(s, syscalls, super::admin::OP_DELETE_BODY, cid);
+            emit_admin_status_nak(s, syscalls, op, cid, super::admin::STATUS_NAK);
             return;
         }
     };
-    if !forward_body(s, syscalls, cid, super::admin::OP_DELETE_BODY, u16::MAX, n) {
-        emit_admin_status_nak(s, syscalls, super::admin::OP_DELETE_BODY, cid);
-        s.apply_errors = s.apply_errors.wrapping_add(1);
+    if !forward_ns(s, syscalls, PendingDownstream::new(cid, RAW_OP_NS, 0), n) {
+        emit_admin_status_nak(s, syscalls, op, cid, super::admin::STATUS_BUSY);
         return;
     }
+    let r = &mut s.raw;
+    r.stage = RAW_RESERVE;
+    r.op = op;
+    r.correlation_id = cid;
+    r.key = k;
+    r.now = now;
+    r.status = super::admin::STATUS_NAK;
+    r.existed = 0;
+    r.body_len = body.len() as u32;
+    heapless_copy::put(&mut r.body, body);
+}
+
+/// Ask for a page of the proof.
+unsafe fn raw_check(s: &mut ModuleState, syscalls: &super::SyscallTable, cursor: u32) {
+    let oid = gc_object_id(&s.raw.key);
+    let cid = s.raw.correlation_id;
+    let sent = match super::ns_wire::encode_retained_req(&mut s.scratch, cursor, &oid, s.raw.now) {
+        Ok(n) => forward_ns(s, syscalls, PendingDownstream::new(cid, RAW_OP_NS, 0), n),
+        Err(_) => false,
+    };
+    if !sent {
+        s.raw.status = super::admin::STATUS_BUSY;
+        raw_release(s, syscalls);
+    }
+}
+
+/// Release the reservation; the answer follows the namespace's.
+unsafe fn raw_release(s: &mut ModuleState, syscalls: &super::SyscallTable) {
+    s.raw.stage = RAW_RELEASE;
+    let oid = gc_object_id(&s.raw.key);
+    let cid = s.raw.correlation_id;
+    let sent = match super::ns_wire::encode_gc_release_req(&mut s.scratch, &oid) {
+        Ok(n) => forward_ns(s, syscalls, PendingDownstream::new(cid, RAW_OP_NS, 0), n),
+        Err(_) => false,
+    };
+    if !sent {
+        raw_finish(s, syscalls);
+    }
+}
+
+/// Answer the raw request.
+unsafe fn raw_finish(s: &mut ModuleState, syscalls: &super::SyscallTable) {
+    let (op, cid, status, existed) = (
+        s.raw.op,
+        s.raw.correlation_id,
+        s.raw.status,
+        s.raw.existed != 0,
+    );
+    s.raw.stage = RAW_IDLE;
+    let n = if op == super::admin::OP_DELETE_BODY {
+        super::admin::encode_admin_delete_body_ack(&mut s.scratch, cid, status, existed)
+    } else {
+        super::admin::encode_admin_put_body_keyed_ack(&mut s.scratch, cid, status)
+    };
+    match n {
+        Ok(n) => reply_staged(s, syscalls, n),
+        Err(_) => s.apply_errors = s.apply_errors.wrapping_add(1),
+    }
+}
+
+/// The namespace answered a stage of the raw request.
+unsafe fn raw_ns_answered(s: &mut ModuleState, syscalls: &super::SyscallTable, ns_resp: &[u8]) {
+    match s.raw.stage {
+        RAW_RESERVE => match super::ns_wire::decode_gc_reserve_resp(ns_resp) {
+            Ok(true) => {
+                s.raw.stage = RAW_CHECK;
+                raw_check(s, syscalls, 0);
+            }
+            // No reservation, and so no proof that would hold.
+            _ => {
+                s.raw.status = super::admin::STATUS_BUSY;
+                raw_finish(s, syscalls);
+            }
+        },
+        RAW_CHECK => match super::ns_wire::decode_retained_resp(ns_resp) {
+            Ok((false, next)) if next != 0 => raw_check(s, syscalls, next),
+            Ok((false, _)) => raw_forward(s, syscalls),
+            Ok((true, _)) => {
+                s.raw.status = super::admin::STATUS_RETAINED;
+                raw_release(s, syscalls);
+            }
+            // Not proven: nothing is destroyed on doubt.
+            Err(_) => {
+                s.raw.status = super::admin::STATUS_BUSY;
+                raw_release(s, syscalls);
+            }
+        },
+        RAW_RELEASE => raw_finish(s, syscalls),
+        _ => s.apply_errors = s.apply_errors.wrapping_add(1),
+    }
+}
+
+/// Nothing retained names the digest, and the reservation keeps it so:
+/// forward the held request.
+unsafe fn raw_forward(s: &mut ModuleState, syscalls: &super::SyscallTable) {
+    let (op, cid, key) = (s.raw.op, s.raw.correlation_id, s.raw.key);
+    let n = if op == super::admin::OP_DELETE_BODY {
+        super::body_wire::encode_delete_req(&mut s.scratch, &key)
+    } else {
+        let body: &[u8] = &*(&s.raw.body[..s.raw.body_len as usize] as *const [u8]);
+        super::body_wire::encode_put_keyed_req(&mut s.scratch, &key, body)
+    };
+    let sent = match n {
+        Ok(n) => forward_body(s, syscalls, cid, op, u16::MAX, n),
+        Err(_) => false,
+    };
+    if !sent {
+        s.raw.status = super::admin::STATUS_BUSY;
+        raw_release(s, syscalls);
+        return;
+    }
+    s.raw.stage = RAW_BODY;
     s.forwarded = s.forwarded.wrapping_add(1);
+}
+
+/// The body plane answered the raw request.
+unsafe fn raw_body_answered(s: &mut ModuleState, syscalls: &super::SyscallTable, body_resp: &[u8]) {
+    let op = super::body_wire::peek_opcode(body_resp).unwrap_or(0xFF);
+    if s.raw.op == super::admin::OP_DELETE_BODY && op == super::body_wire::OP_DELETE {
+        if let Ok(existed) = super::body_wire::decode_delete_resp(body_resp) {
+            s.raw.status = super::admin::STATUS_OK;
+            s.raw.existed = u8::from(existed);
+        }
+    } else if s.raw.op == super::admin::OP_PUT_BODY_KEYED && op == super::body_wire::OP_PUT_KEYED {
+        s.raw.status = super::admin::STATUS_OK;
+    }
+    raw_release(s, syscalls);
 }
 
 /// Status-only NAK for the keyed-body ops.
@@ -1583,16 +1810,12 @@ unsafe fn emit_admin_status_nak(
     syscalls: &super::SyscallTable,
     op: u8,
     cid: u32,
+    status: u8,
 ) {
     let n = if op == super::admin::OP_DELETE_BODY {
-        super::admin::encode_admin_delete_body_ack(
-            &mut s.scratch,
-            cid,
-            super::admin::STATUS_NAK,
-            false,
-        )
+        super::admin::encode_admin_delete_body_ack(&mut s.scratch, cid, status, false)
     } else {
-        super::admin::encode_admin_put_body_keyed_ack(&mut s.scratch, cid, super::admin::STATUS_NAK)
+        super::admin::encode_admin_put_body_keyed_ack(&mut s.scratch, cid, status)
     };
     if let Ok(n) = n {
         reply_staged(s, syscalls, n);
@@ -1672,48 +1895,6 @@ unsafe fn emit_body_admin_response(
                         s.apply_errors = s.apply_errors.wrapping_add(1);
                         return;
                     }
-                }
-            };
-            reply_staged(s, syscalls, resp_n);
-        }
-        super::admin::OP_PUT_BODY_KEYED => {
-            let status = if op == super::body_wire::OP_PUT_KEYED {
-                super::admin::STATUS_OK
-            } else {
-                super::admin::STATUS_NAK
-            };
-            let resp_n = match super::admin::encode_admin_put_body_keyed_ack(
-                &mut s.scratch,
-                entry.correlation_id,
-                status,
-            ) {
-                Ok(n) => n,
-                Err(_) => {
-                    s.apply_errors = s.apply_errors.wrapping_add(1);
-                    return;
-                }
-            };
-            reply_staged(s, syscalls, resp_n);
-        }
-        super::admin::OP_DELETE_BODY => {
-            let (status, existed) = if op == super::body_wire::OP_DELETE {
-                match super::body_wire::decode_delete_resp(body_resp) {
-                    Ok(e) => (super::admin::STATUS_OK, e),
-                    Err(_) => (super::admin::STATUS_NAK, false),
-                }
-            } else {
-                (super::admin::STATUS_NAK, false)
-            };
-            let resp_n = match super::admin::encode_admin_delete_body_ack(
-                &mut s.scratch,
-                entry.correlation_id,
-                status,
-                existed,
-            ) {
-                Ok(n) => n,
-                Err(_) => {
-                    s.apply_errors = s.apply_errors.wrapping_add(1);
-                    return;
                 }
             };
             reply_staged(s, syscalls, resp_n);
@@ -2204,7 +2385,7 @@ unsafe fn gc_begin_current(s: &mut ModuleState, syscalls: &super::SyscallTable) 
     // A composed write in flight owns the window between its body
     // landing and its bind committing. Its bind would be refused by
     // our own reservation, so do not take one.
-    if s.putfiles.iter().any(|p| p.in_use != 0) {
+    if s.putfiles.iter().any(|p| p.in_use != 0) || s.raw.stage != RAW_IDLE {
         s.gc_kept = s.gc_kept.wrapping_add(1);
         gc_skip_current(s, syscalls);
         return;
@@ -2700,7 +2881,13 @@ unsafe fn handle_put_file_open(s: &mut ModuleState, syscalls: &super::SyscallTab
     let nak = |s: &mut ModuleState, syscalls: &super::SyscallTable, cid: u32| {
         refuse(s, syscalls, cid, super::admin::STATUS_NAK)
     };
-    let target = WriteTarget::new(req.namespace_root, req.path, &req.cond, req.content_type);
+    let target = WriteTarget::new(
+        req.namespace_root,
+        req.path,
+        &req.cond,
+        &req.policy,
+        req.content_type,
+    );
     let (Some(target), true, true) = (target, s.body_req_chan >= 0, req.digest.len() == 32) else {
         nak(s, syscalls, req.correlation_id);
         return;
@@ -2978,7 +3165,13 @@ unsafe fn emit_pathread_nak(
     status: u8,
 ) {
     let n = if admin_op == super::admin::OP_STAT_FILE {
-        super::admin::encode_stat_file_ack(&mut s.scratch, cid, status, 0)
+        super::admin::encode_stat_file_ack(
+            &mut s.scratch,
+            cid,
+            status,
+            0,
+            &super::admin::Policy::NONE,
+        )
     } else {
         super::admin::encode_read_file_range_ack(&mut s.scratch, cid, status, None)
     };
@@ -3027,6 +3220,17 @@ unsafe fn handle_pathread_lookup_response(
             return;
         }
     };
+    // What the store keeps with the object rides with the stat to its body
+    // answer. `resolve_read` found a binding, so this one decodes.
+    let mut kept_ref = [0u8; super::limits::KEY_REF_MAX];
+    let (mut kept_ref_len, mut kept_until, mut kept_hold) = (0u8, 0u64, 0u8);
+    if let Ok(super::ns_wire::DecodedLookupResp::Found(b)) =
+        super::ns_wire::decode_lookup_resp(ns_resp)
+    {
+        kept_ref_len = heapless_copy::put(&mut kept_ref, b.meta.key_ref) as u8;
+        kept_until = b.meta.retain_until_ms;
+        kept_hold = u8::from(b.meta.hold);
+    }
     let n = if entry.admin_op == super::admin::OP_STAT_FILE {
         super::body_wire::encode_head_req(&mut s.scratch, &digest)
     } else {
@@ -3054,6 +3258,16 @@ unsafe fn handle_pathread_lookup_response(
             super::admin::STATUS_NAK,
         );
         return;
+    }
+    let cid = s.body_cid_next;
+    for e in s.body_pending.iter_mut() {
+        if e.in_use != 0 && e.body_cid == cid {
+            e.kept_until = kept_until;
+            e.kept_hold = kept_hold;
+            e.kept_ref_len = kept_ref_len;
+            e.kept_ref = kept_ref;
+            break;
+        }
     }
     s.forwarded = s.forwarded.wrapping_add(1);
 }
@@ -3129,8 +3343,13 @@ unsafe fn handle_admin_put_file(s: &mut ModuleState, syscalls: &super::SyscallTa
         emit_putfile_nak(s, syscalls, req.correlation_id);
         return;
     }
-    let Some(target) = WriteTarget::new(req.namespace_root, req.path, &req.cond, req.content_type)
-    else {
+    let Some(target) = WriteTarget::new(
+        req.namespace_root,
+        req.path,
+        &req.cond,
+        &req.policy,
+        req.content_type,
+    ) else {
         emit_putfile_nak(s, syscalls, req.correlation_id);
         return;
     };
@@ -3200,7 +3419,13 @@ unsafe fn handle_admin_delete_file(
         emit_delete_file_status(s, syscalls, cid, super::admin::STATUS_NAK);
         return;
     }
-    let Some(target) = WriteTarget::new(req.namespace_root, req.path, &req.cond, &[]) else {
+    let Some(target) = WriteTarget::new(
+        req.namespace_root,
+        req.path,
+        &req.cond,
+        &super::admin::Policy::NONE,
+        &[],
+    ) else {
         emit_delete_file_status(s, syscalls, cid, super::admin::STATUS_NAK);
         return;
     };
@@ -3223,6 +3448,66 @@ unsafe fn handle_admin_delete_file(
         target,
     };
     composed_lookup(s, syscalls, slot_idx);
+}
+
+/// Retain: read the key's binding, then change its retention or hold on
+/// condition that it has not moved. The namespace decides whether the
+/// change is allowed, in log order.
+unsafe fn handle_admin_retain(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) {
+    let req = match super::admin::decode_admin_retain(bytes) {
+        Ok(r) => r,
+        Err(_) => {
+            s.apply_errors = s.apply_errors.wrapping_add(1);
+            return;
+        }
+    };
+    let cid = req.correlation_id;
+    let any = super::admin::WriteCond {
+        mode: super::admin::WRITE_ANY,
+        expect: &[],
+    };
+    let policy = super::admin::Policy {
+        key_ref: &[],
+        retain_until_ms: req.retain_until_ms,
+        hold: false,
+    };
+    let (Some(target), Some(slot_idx)) = (
+        WriteTarget::new(req.namespace_root, req.path, &any, &policy, &[]),
+        allocate_putfile_slot(s),
+    ) else {
+        emit_retain_status(s, syscalls, cid, super::admin::STATUS_BUSY);
+        s.apply_errors = s.apply_errors.wrapping_add(1);
+        return;
+    };
+    let mut target = target;
+    target.hold = req.hold;
+    s.putfiles[slot_idx as usize] = PendingPutFile {
+        in_use: 1,
+        stage: PUTFILE_STAGE_LOOKUP,
+        op: super::admin::OP_RETAIN,
+        correlation_id: cid,
+        kind: 0,
+        digest: [0u8; 32],
+        body_len: 0,
+        cur_rev: 0,
+        described: 0,
+        attempts: 0,
+        target,
+    };
+    composed_lookup(s, syscalls, slot_idx);
+}
+
+unsafe fn emit_retain_status(
+    s: &mut ModuleState,
+    syscalls: &super::SyscallTable,
+    correlation_id: u32,
+    status: u8,
+) {
+    if let Ok(n) =
+        super::admin::encode_admin_retain_ack(&mut s.scratch, correlation_id, status, &[])
+    {
+        reply_staged(s, syscalls, n);
+    }
 }
 
 unsafe fn emit_delete_file_status(
@@ -3312,11 +3597,11 @@ unsafe fn handle_composed_ns_response(
     let slot_idx = i as u16;
     match s.putfiles[i].stage {
         PUTFILE_STAGE_LOOKUP => composed_decide(s, syscalls, slot_idx, ns_resp),
-        PUTFILE_STAGE_BIND | PUTFILE_STAGE_UNBIND => {
-            let ok_op = if s.putfiles[i].stage == PUTFILE_STAGE_BIND {
-                super::ns_wire::OP_BIND
-            } else {
-                super::ns_wire::OP_UNBIND
+        PUTFILE_STAGE_BIND | PUTFILE_STAGE_UNBIND | PUTFILE_STAGE_RETAIN => {
+            let ok_op = match s.putfiles[i].stage {
+                PUTFILE_STAGE_BIND => super::ns_wire::OP_BIND,
+                PUTFILE_STAGE_UNBIND => super::ns_wire::OP_UNBIND,
+                _ => super::ns_wire::OP_RETAIN,
             };
             match ns_resp.first().copied() {
                 // Another writer landed between the read and the write:
@@ -3354,6 +3639,7 @@ unsafe fn composed_decide(
     let i = slot_idx as usize;
     let (op, mode) = (s.putfiles[i].op, s.putfiles[i].target.mode);
     let delete = op == super::admin::OP_DELETE_FILE;
+    let retain = op == super::admin::OP_RETAIN;
     let (cur, refusal) = match super::ns_wire::decode_lookup_resp(ns_resp) {
         Ok(super::ns_wire::DecodedLookupResp::Found(b)) => {
             let refusal = match mode {
@@ -3366,7 +3652,7 @@ unsafe fn composed_decide(
             (b.revision, refusal)
         }
         Ok(super::ns_wire::DecodedLookupResp::NotFound { floor }) => {
-            let refusal = if delete {
+            let refusal = if delete || retain {
                 Some(super::admin::STATUS_NOT_FOUND)
             } else if mode == super::admin::WRITE_IF {
                 Some(super::admin::STATUS_CONFLICT)
@@ -3389,7 +3675,9 @@ unsafe fn composed_decide(
         return;
     }
     s.putfiles[i].cur_rev = cur;
-    if delete {
+    if retain {
+        composed_retain(s, syscalls, slot_idx);
+    } else if delete {
         composed_unbind(s, syscalls, slot_idx);
     } else if s.putfiles[i].described == 0 {
         emit_putfile_object_stage(s, syscalls, slot_idx);
@@ -3485,6 +3773,9 @@ unsafe fn composed_bind(s: &mut ModuleState, syscalls: &super::SyscallTable, slo
         stamp_ms,
         size: slot.body_len,
         content_type: slot.target.content_type(),
+        key_ref: slot.target.key_ref(),
+        retain_until_ms: slot.target.retain_until_ms,
+        hold: slot.target.hold != 0,
     };
     let n = match super::ns_wire::encode_bind(
         &mut s.scratch,
@@ -3513,6 +3804,7 @@ unsafe fn composed_bind(s: &mut ModuleState, syscalls: &super::SyscallTable, slo
 /// Unbind the key at the revision after the one read, on condition
 /// that it still holds that one; the key is left tombstoned there.
 unsafe fn composed_unbind(s: &mut ModuleState, syscalls: &super::SyscallTable, slot_idx: u16) {
+    let stamp_ms = stamp_now(s, syscalls);
     let slot = &mut s.putfiles[slot_idx as usize];
     slot.stage = PUTFILE_STAGE_UNBIND;
     let slot = *slot;
@@ -3521,6 +3813,7 @@ unsafe fn composed_unbind(s: &mut ModuleState, syscalls: &super::SyscallTable, s
         slot.target.root(),
         slot.target.path(),
         slot.cur_rev + 1,
+        stamp_ms,
         super::ns_wire::COND_REVISION,
         slot.cur_rev,
     ) {
@@ -3531,6 +3824,36 @@ unsafe fn composed_unbind(s: &mut ModuleState, syscalls: &super::SyscallTable, s
         }
     };
     let entry = PendingDownstream::new(slot.correlation_id, super::admin::OP_DELETE_FILE, slot_idx);
+    if !forward_ns(s, syscalls, entry, n) {
+        composed_finish(s, syscalls, slot_idx, super::admin::STATUS_BUSY, &[]);
+        s.apply_errors = s.apply_errors.wrapping_add(1);
+    }
+}
+
+/// Change the key's retention or hold at the revision after the one read,
+/// on condition that it still holds that one.
+unsafe fn composed_retain(s: &mut ModuleState, syscalls: &super::SyscallTable, slot_idx: u16) {
+    let stamp_ms = stamp_now(s, syscalls);
+    let slot = &mut s.putfiles[slot_idx as usize];
+    slot.stage = PUTFILE_STAGE_RETAIN;
+    let slot = *slot;
+    let rec = super::ns_wire::DecodedRetain {
+        namespace_root: slot.target.root(),
+        path: slot.target.path(),
+        revision: slot.cur_rev + 1,
+        stamp_ms,
+        expect: slot.cur_rev,
+        retain_until_ms: slot.target.retain_until_ms,
+        hold: slot.target.hold,
+    };
+    let n = match super::ns_wire::encode_retain(&mut s.scratch, &rec) {
+        Ok(n) => n,
+        Err(_) => {
+            composed_finish(s, syscalls, slot_idx, super::admin::STATUS_NAK, &[]);
+            return;
+        }
+    };
+    let entry = PendingDownstream::new(slot.correlation_id, super::admin::OP_RETAIN, slot_idx);
     if !forward_ns(s, syscalls, entry, n) {
         composed_finish(s, syscalls, slot_idx, super::admin::STATUS_BUSY, &[]);
         s.apply_errors = s.apply_errors.wrapping_add(1);
@@ -3548,7 +3871,9 @@ unsafe fn composed_finish(
 ) {
     let slot = s.putfiles[slot_idx as usize];
     free_putfile_slot(s, slot_idx);
-    let n = if slot.op == super::admin::OP_DELETE_FILE {
+    let n = if slot.op == super::admin::OP_RETAIN {
+        super::admin::encode_admin_retain_ack(&mut s.scratch, slot.correlation_id, status, fence)
+    } else if slot.op == super::admin::OP_DELETE_FILE {
         super::admin::encode_admin_delete_file_ack(
             &mut s.scratch,
             slot.correlation_id,

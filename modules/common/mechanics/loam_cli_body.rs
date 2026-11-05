@@ -114,6 +114,7 @@ const C_LS: u8 = 3;
 const C_PUT: u8 = 4;
 const C_GET: u8 = 5;
 const C_RM: u8 = 6;
+const C_RETAIN: u8 = 30;
 const C_VCREATE: u8 = 7;
 const C_VDELETE: u8 = 8;
 const C_VREAD: u8 = 9;
@@ -159,6 +160,10 @@ pub struct ModuleState {
     pub if_at: i8,
     pub type_at: i8,
     pub if_absent: u8,
+    pub key_ref_at: i8,
+    pub until_at: i8,
+    pub hold_set: u8,
+    pub hold_clear: u8,
     // sessions
     pub clients: [ac::Client; 2],
     pub nclients: u8,
@@ -421,6 +426,11 @@ fn say_status(s: &mut ModuleState, st: u8) {
         say(s, b"forbidden: no capability presented covers it")
     } else if st == aw::STATUS_EXISTS {
         say(s, b"exists")
+    } else if st == aw::STATUS_RETAINED {
+        say(
+            s,
+            b"retained: its retention or legal hold refuses this, whoever asks",
+        )
     } else {
         say(s, b"refused")
     }
@@ -479,6 +489,10 @@ fn parse(s: &mut ModuleState) -> bool {
     s.to_cap_at = -1;
     s.if_at = -1;
     s.type_at = -1;
+    s.key_ref_at = -1;
+    s.until_at = -1;
+    s.hold_set = 0;
+    s.hold_clear = 0;
     // Options are taken out; what is left, in order, is the command.
     let mut kept = [(0u16, 0u16); MAX_ARGS];
     let mut nk = 0;
@@ -498,11 +512,25 @@ fn parse(s: &mut ModuleState) -> bool {
             Some(&mut s.if_at)
         } else if eq(word, b"--type") {
             Some(&mut s.type_at)
+        } else if eq(word, b"--key-ref") {
+            Some(&mut s.key_ref_at)
+        } else if eq(word, b"--retain-until") {
+            Some(&mut s.until_at)
         } else {
             None
         };
         if eq(word, b"--if-absent") {
             s.if_absent = 1;
+            k += 1;
+            continue;
+        }
+        if eq(word, b"--hold") {
+            s.hold_set = 1;
+            k += 1;
+            continue;
+        }
+        if eq(word, b"--no-hold") {
+            s.hold_clear = 1;
             k += 1;
             continue;
         }
@@ -534,6 +562,8 @@ fn parse(s: &mut ModuleState) -> bool {
         &mut s.to_cap_at,
         &mut s.if_at,
         &mut s.type_at,
+        &mut s.key_ref_at,
+        &mut s.until_at,
     ] {
         if *p <= -2 {
             let src = (-2 - *p) as usize;
@@ -598,6 +628,8 @@ fn help(s: &mut ModuleState) {
           \x20 lookup  <root> <path>\n\
           \x20 ls      <root> [prefix]\n\
           \x20 put     <root> <path> <file> [--if-absent | --if <object-id>] [--type <content-type>]\n\
+          \x20         [--key-ref <name>] [--retain-until <ms>] [--hold]\n\
+          \x20 retain  <root> <path> [--retain-until <ms>] [--hold | --no-hold]\n\
           \x20 get     <root> <path> <file>\n\
           \x20 rm      <root> <path> [--if <object-id>]\n\
           \x20 volume create <root> <path> <size> <extent-size>\n\
@@ -1065,6 +1097,8 @@ unsafe fn start(s: &mut ModuleState) -> bool {
         (C_GET, 1)
     } else if eq(c0, b"rm") {
         (C_RM, 1)
+    } else if eq(c0, b"retain") {
+        (C_RETAIN, 1)
     } else if eq(c0, b"volume") && eq(c1, b"create") {
         (C_VCREATE, 2)
     } else if eq(c0, b"volume") && eq(c1, b"delete") {
@@ -1093,7 +1127,7 @@ unsafe fn start(s: &mut ModuleState) -> bool {
         return true;
     }
     let need = match cmd {
-        C_LOOKUP | C_RM | C_VDELETE | C_SRESTORE => 2,
+        C_LOOKUP | C_RM | C_RETAIN | C_VDELETE | C_SRESTORE => 2,
         C_LS | C_SDELETE => 1,
         C_PUT | C_GET | C_SCREATE => 3,
         C_VCREATE => 4,
@@ -1282,6 +1316,7 @@ unsafe fn command(s: &mut ModuleState, answered: bool) {
         C_PUT => cmd_put(s, answered),
         C_GET => cmd_get(s, answered),
         C_RM => cmd_rm(s, answered),
+        C_RETAIN => cmd_retain(s, answered),
         C_VCREATE => cmd_vcreate(s, answered),
         C_VDELETE => cmd_vdelete(s, answered),
         C_VREAD => cmd_vread(s, answered),
@@ -1362,6 +1397,12 @@ unsafe fn cmd_lookup(s: &mut ModuleState, answered: bool) {
             say(s, b.content_type);
             say(s, b"\nstamp_ms ");
             say_u64(s, b.stamp_ms);
+            say(s, b"\nkey_ref ");
+            say(s, b.policy.key_ref);
+            say(s, b"\nretain_until_ms ");
+            say_u64(s, b.policy.retain_until_ms);
+            say(s, b"\nlegal_hold ");
+            say_u64(s, b.policy.hold as u64);
             say(s, b"\n");
             finish(s, 0);
         }
@@ -1509,6 +1550,62 @@ unsafe fn cmd_rm(s: &mut ModuleState, answered: bool) {
     }
 }
 
+/// `--retain-until`'s value: 0 when absent, `None` when it is not digits or
+/// does not fit.
+fn until_arg(s: &ModuleState) -> Option<u64> {
+    let Some(v) = opt(s, s.until_at) else {
+        return Some(0);
+    };
+    if v.is_empty() {
+        return None;
+    }
+    let mut n = 0u64;
+    let mut i = 0;
+    while i < v.len() {
+        let c = v[i];
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add((c - b'0') as u64)?;
+        i += 1;
+    }
+    Some(n)
+}
+
+unsafe fn cmd_retain(s: &mut ModuleState, answered: bool) {
+    let (root, path) = key_args(s);
+    if !answered {
+        let Some(until) = until_arg(s) else {
+            return fail(s, b"--retain-until takes milliseconds since the epoch");
+        };
+        let hold = if s.hold_set != 0 && s.hold_clear != 0 {
+            return fail(s, b"--hold and --no-hold are one or the other");
+        } else if s.hold_set != 0 {
+            aw::RETAIN_HOLD_SET
+        } else if s.hold_clear != 0 {
+            aw::RETAIN_HOLD_CLEAR
+        } else {
+            aw::RETAIN_HOLD_LEAVE
+        };
+        if until == 0 && hold == aw::RETAIN_HOLD_LEAVE {
+            return fail(s, b"retain changes --retain-until, --hold or --no-hold");
+        }
+        let cid = next_cid(s);
+        return match aw::encode_admin_retain(&mut s.req, cid, root, path, until, hold) {
+            Ok(n) => ask(s, 0, n),
+            Err(_) => fail(s, b"the key is not one the wire carries"),
+        };
+    }
+    match aw::decode_admin_retain_ack(answer(s)) {
+        Ok((_, aw::STATUS_OK, _)) => {
+            say(s, b"kept\n");
+            finish(s, 0);
+        }
+        Ok((_, st, _)) => fail_status(s, b"retain", st),
+        Err(_) => fail(s, b"the node's answer does not decode"),
+    }
+}
+
 // ── put ────────────────────────────────────────────────────────────────────
 
 /// `put` stages. The file is read twice — once for the digest and size,
@@ -1539,6 +1636,14 @@ unsafe fn cmd_put(s: &mut ModuleState, answered: bool) {
             aw::WRITE_ANY
         },
         expect,
+    };
+    let Some(retain_until_ms) = until_arg(s) else {
+        return fail(s, b"--retain-until takes milliseconds since the epoch");
+    };
+    let policy = aw::Policy {
+        key_ref: &*(opt(s, s.key_ref_at).unwrap_or(&[]) as *const [u8]),
+        retain_until_ms,
+        hold: s.hold_set != 0,
     };
     loop {
         match s.st {
@@ -1591,7 +1696,7 @@ unsafe fn cmd_put(s: &mut ModuleState, answered: bool) {
                 let cid = next_cid(s);
                 let d = s.digest;
                 return match aw::encode_put_file_open(
-                    &mut s.req, cid, root, path, 0, &cond, ctype, &d, s.size,
+                    &mut s.req, cid, root, path, 0, &cond, &policy, ctype, &d, s.size,
                 ) {
                     Ok(m) => ask(s, 0, m),
                     Err(_) => fail(s, b"the key, condition or type is not one the wire carries"),
@@ -1611,7 +1716,7 @@ unsafe fn cmd_put(s: &mut ModuleState, answered: bool) {
                 s.st = PUT_DONE;
                 let cid = next_cid(s);
                 return match aw::encode_admin_put_file(
-                    &mut s.req, cid, root, path, 0, &cond, ctype, body,
+                    &mut s.req, cid, root, path, 0, &cond, &policy, ctype, body,
                 ) {
                     Ok(m) => ask(s, 0, m),
                     Err(_) => fail(s, b"the key, condition or type is not one the wire carries"),
@@ -2834,6 +2939,7 @@ unsafe fn mv_open(s: &mut ModuleState) {
         key,
         s.kind,
         &cond,
+        &aw::Policy::NONE,
         ctype,
         &d,
         s.entry_size,

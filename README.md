@@ -138,7 +138,7 @@ arena sizing, snapshots, erasure coding, and block volumes.
 | Module | Surface | What it does |
 |---|---|---|
 | `namespace_router` | `storage.namespace` | Path bindings — BIND / RENAME / UNBIND / LOOKUP / LIST, WAL-backed over a compacted snapshot file. It answers the canonical surface by provider dispatch, including `SUBSCRIBE` / `CHANGES`, which is what a level-triggered consumer reconciles against. `LIST` is served on the channel wire rather than by dispatch, being cursor-paged |
-| `object_provider` | `storage.object` | Objects named `bucket/key` as files under namespace root `bucket`, each caller acting under the capability it presented. wave's `s3_serve` speaks S3 in front of it |
+| `object_provider` | `storage.object` | Objects named `bucket/key` as files under namespace root `bucket`, each caller acting under the capability it presented, each object keeping a key reference, a retention and a legal hold that a delete or overwrite answers to. wave's `s3_serve` speaks S3 in front of it |
 | `loam_volume` | `storage.block` | One Loam volume as a block device: reads through the committed extent map, stages writes, and completes a flush after the fenced commit. Holds the volume's writer lease, so one instance writes a volume at a time |
 | `admin_gate` | — (internal) | The admin plane's session layer: TLS and in-graph sessions, capabilities presented and verified against the mesh roots, every request admitted by scope and permission |
 | `admin_router` | — (internal) | The admin op surface; demuxes the file and body lifecycle and runs the orphan-body GC |

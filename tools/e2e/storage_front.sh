@@ -21,7 +21,11 @@
 #   - with a read-only capability a write is 403 while reads are served;
 #   - a capability that does not chain to the node's mesh root is refused
 #     by the gate, the front says so, and every request is 403;
-#   - with no capability given, every request is 403.
+#   - with no capability given, every request is 403;
+#   - what a PUT states is kept: HEAD returns key-ref, retain-until and
+#     legal-hold, DELETE and PUT over a retained or held object are 423,
+#     PATCH extends and clears, shortening is 423, GET still reads, and a
+#     restart of the node keeps all of it.
 #
 #   tools/e2e/storage_front.sh
 set -euo pipefail
@@ -83,6 +87,45 @@ expect 404 "$(req "$URL/docs/small")" "GET after DELETE"
 expect 200 "$(OUT="$W/list" req "$URL/?list")" "a listing"
 [ "$(cat "$W/list")" = "docs/large" ] || fail "the listing is not the names below the scope: $(cat "$W/list")"
 pass "the listing names docs/large, below the scope"
+
+echo "storage_front: key reference, retention and legal hold"
+UNTIL=$(( ($(date +%s) + 3600) * 1000 ))
+# hdr <name> <url> — one response header's value from a HEAD.
+hdr() {
+  curl -m 30 -s -I "$2" | tr -d '\r' | awk -v h="$(echo "$1" | tr 'A-Z' 'a-z'):" 'tolower($1)==h{print $2}'
+}
+expect 200 "$(req -X PUT --data-binary @"$W/small" -H "key-ref: sealer-1" -H "retain-until: $UNTIL" "$URL/worm/a")" "PUT with retain-until and key-ref"
+expect "$UNTIL" "$(hdr retain-until "$URL/worm/a")" "HEAD returns retain-until"
+expect sealer-1 "$(hdr key-ref "$URL/worm/a")" "HEAD returns key-ref"
+expect 423 "$(req -X DELETE "$URL/worm/a")" "DELETE of a retained object"
+expect 423 "$(req -X PUT --data-binary @"$W/large" "$URL/worm/a")" "a streamed PUT over a retained object"
+expect 423 "$(req -X PUT --data-binary @"$W/small" "$URL/worm/a")" "a single PUT over a retained object"
+expect 423 "$(req -X PATCH -H "content-length: 0" -H "retain-until: $((UNTIL - 1))" "$URL/worm/a")" "PATCH that shortens"
+expect 200 "$(req -X PATCH -H "content-length: 0" -H "retain-until: $UNTIL" "$URL/worm/a")" "PATCH naming the value held"
+expect 200 "$(req -X PATCH -H "content-length: 0" -H "retain-until: $((UNTIL + 5000))" -H "legal-hold: on" "$URL/worm/a")" "PATCH that extends and holds"
+expect "$((UNTIL + 5000))" "$(hdr retain-until "$URL/worm/a")" "the extension is reported"
+expect on "$(hdr legal-hold "$URL/worm/a")" "the hold is reported"
+expect 200 "$(OUT="$W/worm.back" req "$URL/worm/a")" "GET of a retained object"
+cmp -s "$W/small" "$W/worm.back" || fail "the retained object came back different"
+pass "the retained object reads back exact"
+expect 404 "$(req -X PATCH -H "content-length: 0" -H "legal-hold: on" "$URL/worm/absent")" "PATCH of an absent name"
+expect 200 "$(req -X PUT --data-binary @"$W/small" -H "legal-hold: on" "$URL/worm/held")" "PUT under a hold"
+expect 423 "$(req -X DELETE "$URL/worm/held")" "DELETE of a held object"
+expect 200 "$(req -X PATCH -H "content-length: 0" -H "legal-hold: off" "$URL/worm/held")" "PATCH clears the hold"
+expect 204 "$(req -X DELETE "$URL/worm/held")" "DELETE once it is clear"
+PAST=$(( ($(date +%s) - 3600) * 1000 ))
+expect 200 "$(req -X PUT --data-binary @"$W/small" -H "retain-until: $PAST" "$URL/worm/past")" "PUT with a retention already passed"
+expect 204 "$(req -X DELETE "$URL/worm/past")" "DELETE past its retention"
+
+echo "storage_front: a restart keeps them"
+graph_stop "$FRONT"
+front rw2 alpha/ "$RW" rw
+expect "$((UNTIL + 5000))" "$(hdr retain-until "$URL/worm/a")" "retain-until after a restart"
+expect sealer-1 "$(hdr key-ref "$URL/worm/a")" "key-ref after a restart"
+expect on "$(hdr legal-hold "$URL/worm/a")" "the hold after a restart"
+expect 423 "$(req -X DELETE "$URL/worm/a")" "DELETE after a restart"
+expect 200 "$(req -X PATCH -H "content-length: 0" -H "legal-hold: off" "$URL/worm/a")" "the hold clears after a restart"
+expect 423 "$(req -X DELETE "$URL/worm/a")" "retention stands with the hold gone"
 graph_stop "$FRONT"
 
 echo "storage_front: a front scoped beta/ over the same node"

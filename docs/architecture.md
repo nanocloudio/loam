@@ -96,7 +96,7 @@ claim rather than being padded into the shape of one.
 `admin_router` fronts the public PICs. External admin clients speak
 [`loam_admin_wire.rs`](../modules/common/mechanics/loam_admin_wire.rs)
 — the whole file lifecycle (`BIND`, `PUT_FILE`, `GET_FILE`,
-`DELETE_FILE`, `LIST_FILES`, `STAT_FILE`, with revision-gated
+`DELETE_FILE`, `LIST_FILES`, `STAT_FILE`, `RETAIN`, with revision-gated
 overwrite), the streaming form for anything past the 60 KiB
 single-shot cap (`PUT_FILE_OPEN` / `_CHUNK` / `_COMMIT` and
 `READ_FILE_RANGE`), `LOOKUP` (a path's object id, revision and kind

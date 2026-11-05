@@ -11,6 +11,7 @@
 //   record  [root_len u8][root MAX_ROOT][path_len u16][path MAX_PATH]
 //           [revision u64][kind u8][oid_len u8][oid MAX_OID]
 //           [stamp_ms u64][size u64][ctype_len u8][ctype CONTENT_TYPE_MAX]
+//           [key_ref_len u8][key_ref KEY_REF_MAX][retain_until_ms u64][hold u8]
 //
 // The key and metadata ceilings come from `loam_limits.rs`, so
 // REC_SIZE is per capacity profile rather than a number stated here. A snapshot is therefore a node-local artefact
@@ -22,7 +23,7 @@
 //
 // Crash safety via ALTERNATING GENERATIONS: compaction writes to
 // whichever of `<wal>.snapA` / `<wal>.snapB` holds the OLDER
-// generation; open picks the valid file (size == 16 + count*348)
+// generation; open picks the valid file (size == 16 + count*REC_SIZE)
 // with the higher generation. A torn write leaves the other
 // generation intact, and WAL replay is revision-gated, so any
 // (snapshot, wal-tail) pairing replays to a correct arena.
@@ -52,12 +53,28 @@ const FS_OPEN_CREATE: u32 = 0x0909;
 pub const SNAP_MAGIC: u32 = u32::from_le_bytes(*b"LSNP");
 pub const SNAP_HDR: usize = 16;
 /// Key and metadata ceilings, from the single register in `loam_limits.rs`.
-pub use super::limits::{CONTENT_TYPE_MAX, MAX_OBJECT_ID as MAX_OID, MAX_PATH, MAX_ROOT};
+pub use super::limits::{
+    CONTENT_TYPE_MAX, KEY_REF_MAX, MAX_OBJECT_ID as MAX_OID, MAX_PATH, MAX_ROOT,
+};
 
 /// Derived, not chosen: the fixed record width that makes the file
 /// binary-searchable. Moves when any ceiling above moves.
-pub const REC_SIZE: usize =
-    1 + MAX_ROOT + 2 + MAX_PATH + 8 + 1 + 1 + MAX_OID + 8 + 8 + 1 + CONTENT_TYPE_MAX;
+pub const REC_SIZE: usize = 1
+    + MAX_ROOT
+    + 2
+    + MAX_PATH
+    + 8
+    + 1
+    + 1
+    + MAX_OID
+    + 8
+    + 8
+    + 1
+    + CONTENT_TYPE_MAX
+    + 1
+    + KEY_REF_MAX
+    + 8
+    + 1;
 
 pub use super::hash::key_cmp;
 
@@ -82,6 +99,10 @@ pub struct SnapRecord {
     pub size: u64,
     pub ctype_len: u8,
     pub ctype: [u8; CONTENT_TYPE_MAX],
+    pub key_ref_len: u8,
+    pub key_ref: [u8; KEY_REF_MAX],
+    pub retain_until_ms: u64,
+    pub hold: u8,
 }
 
 impl SnapRecord {
@@ -99,6 +120,10 @@ impl SnapRecord {
             size: 0,
             ctype_len: 0,
             ctype: [0; CONTENT_TYPE_MAX],
+            key_ref_len: 0,
+            key_ref: [0; KEY_REF_MAX],
+            retain_until_ms: 0,
+            hold: 0,
         }
     }
 
@@ -116,6 +141,11 @@ impl SnapRecord {
 
     pub fn content_type(&self) -> &[u8] {
         &self.ctype[..(self.ctype_len as usize).min(CONTENT_TYPE_MAX)]
+    }
+
+    /// The name of the key that sealed the record's object.
+    pub fn key_ref(&self) -> &[u8] {
+        &self.key_ref[..(self.key_ref_len as usize).min(KEY_REF_MAX)]
     }
 
     /// This record's key against `(root, path)`.
@@ -145,6 +175,12 @@ impl SnapRecord {
         o += 16;
         out[o] = self.ctype_len;
         out[o + 1..o + 1 + CONTENT_TYPE_MAX].copy_from_slice(&self.ctype);
+        o += 1 + CONTENT_TYPE_MAX;
+        out[o] = self.key_ref_len;
+        out[o + 1..o + 1 + KEY_REF_MAX].copy_from_slice(&self.key_ref);
+        o += 1 + KEY_REF_MAX;
+        out[o..o + 8].copy_from_slice(&self.retain_until_ms.to_le_bytes());
+        out[o + 8] = self.hold;
         true
     }
 
@@ -172,6 +208,15 @@ impl SnapRecord {
         r.ctype_len = src[o];
         r.ctype
             .copy_from_slice(&src[o + 1..o + 1 + CONTENT_TYPE_MAX]);
+        o += 1 + CONTENT_TYPE_MAX;
+        r.key_ref_len = src[o];
+        r.key_ref.copy_from_slice(&src[o + 1..o + 1 + KEY_REF_MAX]);
+        o += 1 + KEY_REF_MAX;
+        r.retain_until_ms = u64::from_le_bytes(src[o..o + 8].try_into().ok()?);
+        r.hold = src[o + 8];
+        if r.key_ref_len as usize > KEY_REF_MAX || r.hold > 1 {
+            return None;
+        }
         if r.root_len as usize > MAX_ROOT
             || r.path_len as usize > MAX_PATH
             || r.oid_len as usize > MAX_OID

@@ -222,6 +222,15 @@ presentation, requests wait; a presentation it refuses is logged by
 the front, and every request is then 403. With no capability given,
 the front presents none and every request through it is 403.
 
+**Retention.** A `PUT` with `key-ref`, `retain-until` (milliseconds since
+the Unix epoch) or `legal-hold: on` keeps them with the object, and
+`GET` and `HEAD` return them. While the time has not passed or the hold
+stands, a `DELETE` and a `PUT` over the object are 423 and `GET` still
+reads. `PATCH` with `retain-until` extends, and with `legal-hold: on` or
+`off` sets or clears the hold; shortening is 423. Time is the node's:
+with no wall clock, a retention never passes. What this keeps and what
+it refuses are in [Retention and legal hold](durability.md#retention-and-legal-hold).
+
 The front authenticates nobody: whatever is wired to `request_in` acts
 with the front's capability. Inside a graph the wiring is the trust
 boundary — the includer decides what reaches the front, and gives it
@@ -279,6 +288,20 @@ $L rm tenant /docs/report.txt
 The node's certificate is checked against the host's trusted CAs, or
 those in the bundle `FLUXOR_CA_BUNDLE` names, and must name the host
 dialled.
+
+The applet states them on a write and changes them afterwards, and
+`lookup` prints them:
+
+```sh
+loam --capability cap put acme /report report.pdf --key-ref k1 --retain-until 1893456000000
+loam --capability cap retain acme /report --retain-until 1924992000000
+loam --capability cap retain acme /report --hold
+loam --capability cap retain acme /report --no-hold
+```
+
+An operator's capability changes none of what retention decides: `rm`
+and `put` over a retained object are refused, and so are the raw body
+plane's delete and keyed write of its digest.
 
 ## Block volumes over NBD
 

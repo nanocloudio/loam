@@ -253,6 +253,61 @@ one metadata front door needs the reservation to be a replicated
 decision rather than local state; single-front-door deployments are
 what the sweep supports.
 
+## Retention and legal hold
+
+A binding keeps three things beside its object: a key reference, opaque
+and at most 64 bytes, naming the key that sealed the bytes; a time before
+which it refuses change; and a legal hold, which refuses change until it
+is cleared. They travel in the bind record, the snapshot record and every
+lookup and listing answer.
+
+**Decided in log order.** A bind over a retained or held binding, an
+unbind, and a rename from or onto one answer `NAK_RETAINED` where the record
+is applied, against the binding wherever it lives, arena or snapshot, after
+the record's revision and condition. So a write that lost a race or failed
+its precondition answers that first. The time compared is the record's
+`stamp_ms`, which the router writes when it admits the record; nothing at
+apply reads a clock, so every replica and every replay reaches the same
+verdict. A record stamped 0, from a platform with no wall clock, has passed
+no time: a retention there stands until the platform has one.
+
+**A retain is a record too.** It extends retention, sets or clears the hold,
+and leaves the object, mtime and key reference alone. It names a revision and
+takes the binding to it when it changes anything, as every record that
+changes a binding does. A binding at one revision therefore has one retention,
+which is what lets a log replay over a snapshot generation later than some of
+its records: a record at or below the key's revision finds its own effect, or
+a later one, in place. A value earlier than the one held is refused whole, a
+hold change with it. One that changes nothing succeeds and moves nothing.
+
+**A rotation carries what the generation does not cover.** The merge writes
+keys in order, and the rotation that ends it replaces the log. A key written
+after the merge passed it is in neither unless the new log holds it, so the
+new log opens with a `OP_BINDING_RESTORE` record for each arena entry the
+generation does not cover, alongside the lease table. This holds for every
+write, not only retention. Crash outcomes stay two: the old log, or the new
+one already holding them.
+
+**What else was checked.** Nothing that removes a binding or its bytes stands
+outside this:
+
+| Path | How retention holds |
+|---|---|
+| `DELETE`, `DELETE_FILE`, `RENAME` records | Refused in `apply_op` |
+| `PUT`, `PUT_FILE`, a streamed commit, raw `BIND` | Refused in `apply_op`, at the commit for a stream |
+| `storage.namespace` `BIND`, `DELETE`, `RENAME` | The surface applies inside the call, with no record to carry a stamp: judged at the clock the router stamps from |
+| `VOLUME` commit | A root laid over a retained object is refused `VOLUME_RETAINED`; a retain of a volume binding is refused as fenced |
+| Raw `DELETE_BODY`, `PUT_BODY_KEYED` | The request waits under a reservation of the digest, which keeps out any bind naming it, until a paged proof says no retained binding names it; otherwise `STATUS_RETAINED` |
+| Orphan sweep | Deletes only what no binding names, retained or not |
+| Arena eviction | Drops only what the snapshot record holds, fields included |
+| TTL (`expired_page`) | Never offers a retained binding |
+
+The admin plane has no override. Its capabilities decide who may ask, and
+retention decides what the answer is.
+
+Not kept: a snapshot's clone and an export are new objects at new names, and
+do not carry the source's key reference or retention.
+
 ## Synchronous replication
 
 **Every selected replica must acknowledge a body write before the

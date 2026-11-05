@@ -67,18 +67,22 @@ impl NamespaceKindCode {
 /// at the wire, so a key that reaches this state machine always
 /// fits inline.
 pub use super::limits::{
-    CONTENT_TYPE_MAX, MAX_OBJECT_ID, MAX_PATH as MAX_LIST_PATH, MAX_ROOT as MAX_LIST_ROOT,
+    CONTENT_TYPE_MAX, KEY_REF_MAX, MAX_OBJECT_ID, MAX_PATH as MAX_LIST_PATH,
+    MAX_ROOT as MAX_LIST_ROOT,
 };
 
 /// What a binding records besides its target: when its writer was
-/// admitted, the size of what it bound, and its content type. All three
-/// arrive in the record, so every replica and every replay stores the
-/// same values.
+/// admitted, the size of what it bound, its content type, the name of the
+/// key that sealed it, and its retention and hold. All of it arrives in
+/// the record, so every replica and every replay stores the same values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Meta<'a> {
     pub stamp_ms: u64,
     pub size: u64,
     pub content_type: &'a [u8],
+    pub key_ref: &'a [u8],
+    pub retain_until_ms: u64,
+    pub hold: bool,
 }
 
 impl Meta<'_> {
@@ -86,7 +90,18 @@ impl Meta<'_> {
         stamp_ms: 0,
         size: 0,
         content_type: &[],
+        key_ref: &[],
+        retain_until_ms: 0,
+        hold: false,
     };
+}
+
+/// Whether a binding with this retention and hold refuses change at `now`,
+/// a time the record being judged carries. A hold refuses until it is
+/// cleared; retention until `now` has passed it. A record stamped 0, from a
+/// platform with no wall clock, has passed nothing.
+pub fn retained_at(retain_until_ms: u64, hold: bool, now: u64) -> bool {
+    hold || (retain_until_ms != 0 && now <= retain_until_ms)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,14 +151,11 @@ pub struct BindingSlot {
     /// Object lock. While set, this binding refuses rebind and
     /// deletion.
     ///
-    /// GOVERNANCE mode, not time-based retention: an explicit
-    /// `set_lock(.., false)` clears it, and there is no
-    /// retain-until. That is deliberate — a PIC has no clock it
-    /// should be asserting into a durability record, and a retention
-    /// window enforced against a caller-supplied "now" is only as
-    /// strong as the caller's clock, which is not a property worth
-    /// claiming. What this DOES defend is the failure that actually
-    /// happens: an accidental overwrite or a runaway delete loop.
+    /// GOVERNANCE mode, an in-arena guard against an accidental overwrite
+    /// or a runaway delete loop: an explicit `set_lock(.., false)` clears
+    /// it, and no record sets it. Retention and legal hold are the durable
+    /// fields below, judged against the stamp a record carries, since a
+    /// PIC has no clock it should be asserting into a durability record.
     pub locked: u8,
     /// Position of this slot's LAST mutation in the arena's change
     /// stream — a single monotone counter across every key, stamped
@@ -162,6 +174,10 @@ pub struct BindingSlot {
     pub size: u64,
     pub ctype_bytes: [u8; CONTENT_TYPE_MAX],
     pub ctype_len: u8,
+    pub key_ref_bytes: [u8; KEY_REF_MAX],
+    pub key_ref_len: u8,
+    pub retain_until_ms: u64,
+    pub hold: u8,
 }
 
 /// `kind` marking a deletion that must mask an on-disk snapshot
@@ -192,6 +208,10 @@ impl BindingSlot {
             size: 0,
             ctype_bytes: [0u8; CONTENT_TYPE_MAX],
             ctype_len: 0,
+            key_ref_bytes: [0u8; KEY_REF_MAX],
+            key_ref_len: 0,
+            retain_until_ms: 0,
+            hold: 0,
         }
     }
 
@@ -200,13 +220,28 @@ impl BindingSlot {
         &self.ctype_bytes[..(self.ctype_len as usize).min(CONTENT_TYPE_MAX)]
     }
 
+    /// The name of the key that sealed the binding's object.
+    pub fn key_ref(&self) -> &[u8] {
+        &self.key_ref_bytes[..(self.key_ref_len as usize).min(KEY_REF_MAX)]
+    }
+
     /// The binding's metadata.
     pub fn meta(&self) -> Meta<'_> {
         Meta {
             stamp_ms: self.stamp_ms,
             size: self.size,
             content_type: self.content_type(),
+            key_ref: self.key_ref(),
+            retain_until_ms: self.retain_until_ms,
+            hold: self.hold != 0,
         }
+    }
+
+    /// A live binding that refuses change at `now`.
+    pub fn retained_at(&self, now: u64) -> bool {
+        self.occupied
+            && self.kind != KIND_TOMBSTONE
+            && retained_at(self.retain_until_ms, self.hold != 0, now)
     }
 
     fn set_meta(&mut self, m: &Meta<'_>) {
@@ -215,6 +250,11 @@ impl BindingSlot {
         let n = m.content_type.len().min(CONTENT_TYPE_MAX);
         self.ctype_bytes[..n].copy_from_slice(&m.content_type[..n]);
         self.ctype_len = n as u8;
+        let n = m.key_ref.len().min(KEY_REF_MAX);
+        self.key_ref_bytes[..n].copy_from_slice(&m.key_ref[..n]);
+        self.key_ref_len = n as u8;
+        self.retain_until_ms = m.retain_until_ms;
+        self.hold = u8::from(m.hold);
     }
 
     /// Hash-narrowed, byte-decided key equality. The hashes are a
@@ -427,7 +467,9 @@ impl<const N: usize> PicNamespaceState<N> {
         revision: u64,
         meta: &Meta<'_>,
     ) -> Result<ApplyOk, ApplyError> {
-        if !key_fits(namespace_root, path, object_id) || meta.content_type.len() > CONTENT_TYPE_MAX
+        if !key_fits(namespace_root, path, object_id)
+            || meta.content_type.len() > CONTENT_TYPE_MAX
+            || meta.key_ref.len() > KEY_REF_MAX
         {
             return Err(ApplyError::KeyTooLong);
         }
@@ -540,7 +582,9 @@ impl<const N: usize> PicNamespaceState<N> {
         revision: u64,
         meta: &Meta<'_>,
     ) -> Result<ApplyOk, ApplyError> {
-        if !key_fits(namespace_root, path, object_id) || meta.content_type.len() > CONTENT_TYPE_MAX
+        if !key_fits(namespace_root, path, object_id)
+            || meta.content_type.len() > CONTENT_TYPE_MAX
+            || meta.key_ref.len() > KEY_REF_MAX
         {
             return Err(ApplyError::KeyTooLong);
         }
@@ -773,11 +817,11 @@ impl<const N: usize> PicNamespaceState<N> {
     /// the caller does the deleting, because the caller is the one
     /// that knows whether the deletion should replicate.
     ///
-    /// A LOCKED binding never appears, whatever its expiry. Lock
-    /// beats TTL: a retention hold that a lifecycle rule could
-    /// silently overrule would not be a hold. That is also S3's
-    /// rule, and it is the safe direction — the failure of keeping
-    /// data too long is recoverable and the other is not.
+    /// A LOCKED, retained or held binding never appears, whatever its
+    /// expiry. Lock and retention beat TTL: a retention hold that a
+    /// lifecycle rule could silently overrule would not be a hold. That is
+    /// also S3's rule, and it is the safe direction — the failure of
+    /// keeping data too long is recoverable and the other is not.
     pub fn expired_page(
         &self,
         now: u64,
@@ -792,6 +836,7 @@ impl<const N: usize> PicNamespaceState<N> {
             if s.occupied
                 && s.kind != KIND_TOMBSTONE
                 && s.locked == 0
+                && !s.retained_at(now)
                 && s.expires_at != 0
                 && s.expires_at <= now
             {
@@ -807,11 +852,13 @@ impl<const N: usize> PicNamespaceState<N> {
         }
     }
 
-    /// Has this binding expired as of `now`? False for a locked one,
-    /// for the reason in `expired_page`.
+    /// Has this binding expired as of `now`? False for a locked or
+    /// retained one, for the reason in `expired_page`.
     pub fn is_expired(&self, namespace_root: &[u8], path: &[u8], now: u64) -> bool {
         self.lookup(namespace_root, path)
-            .map(|s| s.locked == 0 && s.expires_at != 0 && s.expires_at <= now)
+            .map(|s| {
+                s.locked == 0 && !s.retained_at(now) && s.expires_at != 0 && s.expires_at <= now
+            })
             .unwrap_or(false)
     }
 

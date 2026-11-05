@@ -54,6 +54,8 @@ pub const OP_VOLUME: u8 = 0x50;
 /// Resolve a path to its binding — object id, revision and kind —
 /// without reading the body.
 pub const OP_LOOKUP: u8 = 0x51;
+/// Change a live key's retention or legal hold.
+pub const OP_RETAIN: u8 = 0x52;
 
 pub const STATUS_OK: u8 = 0x01;
 pub const STATUS_NAK: u8 = 0xFF;
@@ -118,6 +120,10 @@ pub const STATUS_FORBIDDEN: u8 = 0x08;
 /// To `GET_BODY`: the body is held, but is larger than one answer — it
 /// is read by range through a binding that names it.
 pub const STATUS_EXISTS: u8 = 0x09;
+/// The object's retention or legal hold refuses the change. No authority
+/// overrides it, the admin plane's included: the remedy is waiting out the
+/// retention, or clearing the hold.
+pub const STATUS_RETAINED: u8 = 0x0A;
 
 /// How a composed write or delete decides against the key's current
 /// binding. The router reads the binding just before it binds and binds
@@ -145,7 +151,7 @@ impl WriteCond<'_> {
 }
 
 /// Longest content type a write carries.
-pub use super::limits::CONTENT_TYPE_MAX;
+pub use super::limits::{CONTENT_TYPE_MAX, KEY_REF_MAX};
 
 fn check_cond(c: &WriteCond<'_>) -> Result<(), WireError> {
     if c.mode > WRITE_IF
@@ -157,11 +163,67 @@ fn check_cond(c: &WriteCond<'_>) -> Result<(), WireError> {
     Ok(())
 }
 
+/// What a write asks the store to keep with its object: the name of the key
+/// that sealed it, opaque and at most `KEY_REF_MAX` bytes; a time before
+/// which it refuses change, 0 for none; and a legal hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Policy<'a> {
+    pub key_ref: &'a [u8],
+    pub retain_until_ms: u64,
+    pub hold: bool,
+}
+
+impl Policy<'_> {
+    pub const NONE: Policy<'static> = Policy {
+        key_ref: &[],
+        retain_until_ms: 0,
+        hold: false,
+    };
+}
+
+/// `Policy`'s bytes besides its `key_ref`, in a request's fixed header.
+const POLICY_HDR: usize = 1 + 8 + 1;
+
+fn check_policy(p: &Policy<'_>) -> Result<(), WireError> {
+    if p.key_ref.len() > KEY_REF_MAX {
+        return Err(WireError::StringTooLong {
+            len: p.key_ref.len(),
+            max: KEY_REF_MAX,
+        });
+    }
+    Ok(())
+}
+
+/// Put `[key_ref_len:u8][retain_until_ms:u64][hold:u8]` at `dst`'s front.
+fn put_policy_hdr(dst: &mut [u8], p: &Policy<'_>) {
+    dst[0] = p.key_ref.len() as u8;
+    dst[1..9].copy_from_slice(&p.retain_until_ms.to_le_bytes());
+    dst[9] = u8::from(p.hold);
+}
+
+/// `(key_ref_len, retain_until_ms, hold)` from a header's policy bytes.
+fn take_policy_hdr(src: &[u8]) -> Result<(usize, u64, bool), WireError> {
+    let len = src[0] as usize;
+    if len > KEY_REF_MAX {
+        return Err(WireError::StringTooLong {
+            len,
+            max: KEY_REF_MAX,
+        });
+    }
+    let hold = match src[9] {
+        0 => false,
+        1 => true,
+        observed => return Err(WireError::BadOpcode { observed }),
+    };
+    Ok((len, u64::from_le_bytes(src[1..9].try_into().unwrap()), hold))
+}
+
 /// The largest request: a single-frame PUT_FILE of a whole body under
 /// the longest key, expected object id and content type. What a
 /// receiver assembling requests from a stream must hold, and past which
 /// a request is refused.
-pub const REQUEST_MAX: usize = 17
+pub const REQUEST_MAX: usize = PUT_FILE_HDR
+    + KEY_REF_MAX
     + MAX_ROOT
     + MAX_PATH
     + MAX_OBJECT_ID
@@ -176,7 +238,17 @@ pub const RESPONSE_MAX: usize = 10 + super::body_wire::MAX_BODY;
 pub const LIST_PAGE_MAX: usize = 16;
 const _: () = assert!(
     8 + LIST_PAGE_MAX
-        * (2 + MAX_PATH + 8 + 1 + 1 + MAX_OBJECT_ID + 8 + 8 + 1 + super::limits::CONTENT_TYPE_MAX)
+        * (2 + MAX_PATH
+            + 8
+            + 1
+            + 1
+            + MAX_OBJECT_ID
+            + 8
+            + 8
+            + 1
+            + super::limits::CONTENT_TYPE_MAX
+            + POLICY_HDR
+            + KEY_REF_MAX)
         <= RESPONSE_MAX
 );
 
@@ -667,7 +739,7 @@ pub fn decode_admin_get_body_ack(src: &[u8]) -> Result<(u32, u8, Option<&[u8]>),
 // (`WriteCond`); a failed one is `STATUS_EXISTS` (ABSENT) or
 // `STATUS_CONFLICT` (IF).
 
-const PUT_FILE_HDR: usize = 1 + 4 + 2 + 2 + 1 + 1 + 1 + 1 + 4;
+const PUT_FILE_HDR: usize = 1 + 4 + 2 + 2 + 1 + 1 + 1 + 1 + 4 + POLICY_HDR;
 
 #[allow(
     clippy::too_many_arguments,
@@ -680,11 +752,13 @@ pub fn encode_admin_put_file(
     path: &[u8],
     kind: u8,
     cond: &WriteCond<'_>,
+    policy: &Policy<'_>,
     content_type: &[u8],
     body: &[u8],
 ) -> Result<usize, WireError> {
     check_key(namespace_root, path, &[])?;
     check_cond(cond)?;
+    check_policy(policy)?;
     if content_type.len() > CONTENT_TYPE_MAX {
         return Err(WireError::StringTooLong {
             len: content_type.len(),
@@ -696,6 +770,7 @@ pub fn encode_admin_put_file(
         + path.len()
         + cond.expect.len()
         + content_type.len()
+        + policy.key_ref.len()
         + body.len();
     if dst.len() < needed {
         return Err(WireError::BufferTooSmall {
@@ -712,8 +787,16 @@ pub fn encode_admin_put_file(
     dst[11] = cond.expect.len() as u8;
     dst[12] = content_type.len() as u8;
     dst[13..17].copy_from_slice(&(body.len() as u32).to_le_bytes());
+    put_policy_hdr(&mut dst[17..PUT_FILE_HDR], policy);
     let mut at = PUT_FILE_HDR;
-    for part in [namespace_root, path, cond.expect, content_type, body] {
+    for part in [
+        namespace_root,
+        path,
+        cond.expect,
+        content_type,
+        policy.key_ref,
+        body,
+    ] {
         dst[at..at + part.len()].copy_from_slice(part);
         at += part.len();
     }
@@ -727,6 +810,7 @@ pub struct DecodedAdminPutFile<'a> {
     pub path: &'a [u8],
     pub kind: u8,
     pub cond: WriteCond<'a>,
+    pub policy: Policy<'a>,
     pub content_type: &'a [u8],
     pub body: &'a [u8],
 }
@@ -746,7 +830,8 @@ pub fn decode_admin_put_file(src: &[u8]) -> Result<DecodedAdminPutFile<'_>, Wire
     let expect_len = src[11] as usize;
     let ct_len = src[12] as usize;
     let body_len = u32::from_le_bytes(src[13..17].try_into().unwrap()) as usize;
-    let total = PUT_FILE_HDR + ns_len + path_len + expect_len + ct_len + body_len;
+    let (ref_len, retain_until_ms, hold) = take_policy_hdr(&src[17..PUT_FILE_HDR])?;
+    let total = PUT_FILE_HDR + ns_len + path_len + expect_len + ct_len + ref_len + body_len;
     if src.len() < total {
         return Err(WireError::Truncated);
     }
@@ -760,6 +845,7 @@ pub fn decode_admin_put_file(src: &[u8]) -> Result<DecodedAdminPutFile<'_>, Wire
     let path = take(path_len);
     let expect = take(expect_len);
     let content_type = take(ct_len);
+    let key_ref = take(ref_len);
     let body = take(body_len);
     check_key(ns, path, &[])?;
     let cond = WriteCond { mode, expect };
@@ -776,6 +862,11 @@ pub fn decode_admin_put_file(src: &[u8]) -> Result<DecodedAdminPutFile<'_>, Wire
         path,
         kind,
         cond,
+        policy: Policy {
+            key_ref,
+            retain_until_ms,
+            hold,
+        },
         content_type,
         body,
     })
@@ -1395,7 +1486,8 @@ pub fn decode_admin_list_files_ack(
 //                  [ns][path][expect]       (expect pins, as GetFile)
 //   ReadFileRangeAck [op=0x4A][cid][status][len:u32][bytes]
 //   StatFile       [op=0x4B][cid][ns_len:u16][path_len:u16][ns][path]
-//   StatFileAck    [op=0x4B][cid][status][size:u64]
+//   StatFileAck    [op=0x4B][cid][status][size:u64][key_ref_len:u8]
+//                  [retain_until_ms:u64][hold:u8][key_ref]
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedPutFileOpen<'a> {
@@ -1404,6 +1496,7 @@ pub struct DecodedPutFileOpen<'a> {
     pub path: &'a [u8],
     pub kind: u8,
     pub cond: WriteCond<'a>,
+    pub policy: Policy<'a>,
     pub content_type: &'a [u8],
     pub digest: &'a [u8],
     pub total_len: u64,
@@ -1420,12 +1513,14 @@ pub fn encode_put_file_open(
     path: &[u8],
     kind: u8,
     cond: &WriteCond<'_>,
+    policy: &Policy<'_>,
     content_type: &[u8],
     digest: &[u8; DIGEST_LEN],
     total_len: u64,
 ) -> Result<usize, WireError> {
     check_key(namespace_root, path, &[])?;
     check_cond(cond)?;
+    check_policy(policy)?;
     if content_type.len() > CONTENT_TYPE_MAX {
         return Err(WireError::StringTooLong {
             len: content_type.len(),
@@ -1436,7 +1531,8 @@ pub fn encode_put_file_open(
         + namespace_root.len()
         + path.len()
         + cond.expect.len()
-        + content_type.len();
+        + content_type.len()
+        + policy.key_ref.len();
     if dst.len() < needed {
         return Err(WireError::BufferTooSmall {
             needed,
@@ -1452,16 +1548,23 @@ pub fn encode_put_file_open(
     dst[11] = cond.expect.len() as u8;
     dst[12] = content_type.len() as u8;
     dst[13..13 + DIGEST_LEN].copy_from_slice(digest);
-    dst[13 + DIGEST_LEN..PUT_FILE_OPEN_HDR].copy_from_slice(&total_len.to_le_bytes());
+    dst[13 + DIGEST_LEN..13 + DIGEST_LEN + 8].copy_from_slice(&total_len.to_le_bytes());
+    put_policy_hdr(&mut dst[13 + DIGEST_LEN + 8..PUT_FILE_OPEN_HDR], policy);
     let mut at = PUT_FILE_OPEN_HDR;
-    for part in [namespace_root, path, cond.expect, content_type] {
+    for part in [
+        namespace_root,
+        path,
+        cond.expect,
+        content_type,
+        policy.key_ref,
+    ] {
         dst[at..at + part.len()].copy_from_slice(part);
         at += part.len();
     }
     Ok(needed)
 }
 
-const PUT_FILE_OPEN_HDR: usize = 1 + 4 + 2 + 2 + 1 + 1 + 1 + 1 + DIGEST_LEN + 8;
+const PUT_FILE_OPEN_HDR: usize = 1 + 4 + 2 + 2 + 1 + 1 + 1 + 1 + DIGEST_LEN + 8 + POLICY_HDR;
 
 pub fn decode_put_file_open(src: &[u8]) -> Result<DecodedPutFileOpen<'_>, WireError> {
     if src.len() < PUT_FILE_OPEN_HDR {
@@ -1474,7 +1577,9 @@ pub fn decode_put_file_open(src: &[u8]) -> Result<DecodedPutFileOpen<'_>, WireEr
     let path_len = u16::from_le_bytes([src[7], src[8]]) as usize;
     let expect_len = src[11] as usize;
     let ct_len = src[12] as usize;
-    if src.len() < PUT_FILE_OPEN_HDR + ns_len + path_len + expect_len + ct_len {
+    let (ref_len, retain_until_ms, hold) =
+        take_policy_hdr(&src[13 + DIGEST_LEN + 8..PUT_FILE_OPEN_HDR])?;
+    if src.len() < PUT_FILE_OPEN_HDR + ns_len + path_len + expect_len + ct_len + ref_len {
         return Err(WireError::Truncated);
     }
     let mut at = PUT_FILE_OPEN_HDR;
@@ -1487,6 +1592,7 @@ pub fn decode_put_file_open(src: &[u8]) -> Result<DecodedPutFileOpen<'_>, WireEr
     let path = take(path_len);
     let expect = take(expect_len);
     let content_type = take(ct_len);
+    let key_ref = take(ref_len);
     check_key(ns, path, &[])?;
     let cond = WriteCond {
         mode: src[10],
@@ -1505,9 +1611,18 @@ pub fn decode_put_file_open(src: &[u8]) -> Result<DecodedPutFileOpen<'_>, WireEr
         path,
         kind: src[9],
         cond,
+        policy: Policy {
+            key_ref,
+            retain_until_ms,
+            hold,
+        },
         content_type,
         digest: &src[13..13 + DIGEST_LEN],
-        total_len: u64::from_le_bytes(src[13 + DIGEST_LEN..PUT_FILE_OPEN_HDR].try_into().unwrap()),
+        total_len: u64::from_le_bytes(
+            src[13 + DIGEST_LEN..13 + DIGEST_LEN + 8]
+                .try_into()
+                .unwrap(),
+        ),
     })
 }
 
@@ -1796,8 +1911,10 @@ pub fn encode_stat_file_ack(
     correlation_id: u32,
     status: u8,
     size: u64,
+    policy: &Policy<'_>,
 ) -> Result<usize, WireError> {
-    let needed = 1 + 4 + 1 + 8;
+    check_policy(policy)?;
+    let needed = STAT_ACK_HDR + policy.key_ref.len();
     if dst.len() < needed {
         return Err(WireError::BufferTooSmall {
             needed,
@@ -1808,11 +1925,31 @@ pub fn encode_stat_file_ack(
     dst[1..5].copy_from_slice(&correlation_id.to_le_bytes());
     dst[5] = status;
     dst[6..14].copy_from_slice(&size.to_le_bytes());
+    put_policy_hdr(&mut dst[14..STAT_ACK_HDR], policy);
+    dst[STAT_ACK_HDR..needed].copy_from_slice(policy.key_ref);
     Ok(needed)
 }
 
+const STAT_ACK_HDR: usize = 1 + 4 + 1 + 8 + POLICY_HDR;
+
+/// What a stat answer says the store keeps with the object.
+pub fn decode_stat_file_policy(src: &[u8]) -> Result<Policy<'_>, WireError> {
+    if src.len() < STAT_ACK_HDR {
+        return Err(WireError::Truncated);
+    }
+    let (ref_len, retain_until_ms, hold) = take_policy_hdr(&src[14..STAT_ACK_HDR])?;
+    let key_ref = src
+        .get(STAT_ACK_HDR..STAT_ACK_HDR + ref_len)
+        .ok_or(WireError::Truncated)?;
+    Ok(Policy {
+        key_ref,
+        retain_until_ms,
+        hold,
+    })
+}
+
 pub fn decode_stat_file_ack(src: &[u8]) -> Result<(u32, u8, u64), WireError> {
-    if src.len() < 14 {
+    if src.len() < STAT_ACK_HDR {
         return Err(WireError::Truncated);
     }
     if src[0] != OP_STAT_FILE {
@@ -1861,16 +1998,24 @@ pub fn request_len(src: &[u8]) -> Result<usize, WireError> {
         OP_BIND => Ok(BIND_HDR + u16_at(5)? + u16_at(7)? + u16_at(9)? + u8_at(28)?),
         OP_PUT_BODY => Ok(9 + u32_at(5)?),
         OP_GET_BODY => Ok(5 + DIGEST_LEN),
-        OP_PUT_FILE => {
-            Ok(PUT_FILE_HDR + u16_at(5)? + u16_at(7)? + u8_at(11)? + u8_at(12)? + u32_at(13)?)
-        }
+        OP_PUT_FILE => Ok(PUT_FILE_HDR
+            + u16_at(5)?
+            + u16_at(7)?
+            + u8_at(11)?
+            + u8_at(12)?
+            + u8_at(17)?
+            + u32_at(13)?),
         OP_GET_FILE => Ok(10 + u16_at(5)? + u16_at(7)? + u8_at(9)?),
         OP_DELETE_FILE => Ok(11 + u16_at(5)? + u16_at(7)? + u8_at(10)?),
         OP_STAT_FILE | OP_LOOKUP => Ok(9 + u16_at(5)? + u16_at(7)?),
         OP_LIST_FILES => Ok(12 + u16_at(5)? + u16_at(7)? + u16_at(9)?),
-        OP_PUT_FILE_OPEN => {
-            Ok(PUT_FILE_OPEN_HDR + u16_at(5)? + u16_at(7)? + u8_at(11)? + u8_at(12)?)
-        }
+        OP_PUT_FILE_OPEN => Ok(PUT_FILE_OPEN_HDR
+            + u16_at(5)?
+            + u16_at(7)?
+            + u8_at(11)?
+            + u8_at(12)?
+            + u8_at(13 + DIGEST_LEN + 8)?),
+        OP_RETAIN => Ok(RETAIN_HDR + u16_at(5)? + u16_at(7)?),
         OP_PUT_FILE_CHUNK => Ok(10 + u32_at(6)?),
         OP_PUT_FILE_COMMIT => Ok(6),
         OP_READ_FILE_RANGE => Ok(22 + u16_at(17)? + u16_at(19)? + u8_at(21)?),
@@ -1894,11 +2039,11 @@ pub fn response_len(src: &[u8]) -> Result<usize, WireError> {
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
     };
     match op {
-        OP_BIND | OP_DELETE_FILE => fenced_len(src, 6),
+        OP_BIND | OP_DELETE_FILE | OP_RETAIN => fenced_len(src, 6),
         OP_PUT_FILE_CHUNK | OP_PUT_BODY_KEYED => Ok(6),
         OP_DELETE_BODY => Ok(7),
         OP_PUT_FILE_OPEN => Ok(7),
-        OP_STAT_FILE => Ok(14),
+        OP_STAT_FILE => Ok(STAT_ACK_HDR + *src.get(14).ok_or(WireError::Truncated)? as usize),
         OP_LEASE => Ok(LEASE_ACK_LEN),
         OP_VOLUME => Ok(14),
         OP_PUT_BODY => Ok(if status()? == STATUS_OK {
@@ -1963,7 +2108,8 @@ pub fn refusal(frame: &[u8], status: u8, out: &mut [u8]) -> usize {
         OP_PUT_FILE_OPEN => encode_put_file_open_ack(out, cid, status, 0),
         OP_PUT_FILE_CHUNK => encode_put_file_chunk_ack(out, cid, status),
         OP_READ_FILE_RANGE => encode_read_file_range_ack(out, cid, status, None),
-        OP_STAT_FILE => encode_stat_file_ack(out, cid, status, 0),
+        OP_STAT_FILE => encode_stat_file_ack(out, cid, status, 0, &Policy::NONE),
+        OP_RETAIN => encode_admin_retain_ack(out, cid, status, &[]),
         OP_PUT_BODY_KEYED => encode_admin_put_body_keyed_ack(out, cid, status),
         OP_DELETE_BODY => encode_admin_delete_body_ack(out, cid, status, false),
         OP_LEASE => encode_admin_lease_ack(out, cid, status, 0, 0),
@@ -2101,6 +2247,16 @@ pub fn request_scope(frame: &[u8]) -> Option<(Scope<'_>, Need)> {
                 Need::Write,
             )
         }
+        OP_RETAIN => {
+            let r = decode_admin_retain(frame).ok()?;
+            (
+                Scope::Key {
+                    root: r.namespace_root,
+                    path: r.path,
+                },
+                Need::Write,
+            )
+        }
         OP_PUT_FILE_OPEN => {
             let r = decode_put_file_open(frame).ok()?;
             (
@@ -2157,6 +2313,132 @@ pub fn request_scope(frame: &[u8]) -> Option<(Scope<'_>, Need)> {
         }
         _ => return None,
     })
+}
+
+// ── AdminRetain ───────────────────────────────────────────────────
+//
+//   Retain     [op=0x52][cid:u32][ns_len:u16][path_len:u16]
+//              [retain_until_ms:u64][hold:u8][ns][path]
+//   RetainAck  [op=0x52][cid:u32][status:u8][fence_len:u8][fence]
+//
+// `retain_until_ms` 0 leaves retention as it is, and otherwise only
+// extends it. `hold` is `RETAIN_HOLD_*`. A request changing neither is
+// malformed. Status: `STATUS_OK` (kept, durable at the fence, including a
+// value already held), `STATUS_NOT_FOUND`, `STATUS_RETAINED` (it would
+// shorten retention; nothing changed), `STATUS_BUSY`, `STATUS_NAK`.
+
+const RETAIN_HDR: usize = 1 + 4 + 2 + 2 + 8 + 1;
+
+/// `storage.object`'s `hold`, which the object provider asserts equal.
+pub const RETAIN_HOLD_LEAVE: u8 = 0;
+pub const RETAIN_HOLD_SET: u8 = 1;
+pub const RETAIN_HOLD_CLEAR: u8 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedAdminRetain<'a> {
+    pub correlation_id: u32,
+    pub namespace_root: &'a [u8],
+    pub path: &'a [u8],
+    pub retain_until_ms: u64,
+    pub hold: u8,
+}
+
+pub fn encode_admin_retain(
+    dst: &mut [u8],
+    correlation_id: u32,
+    namespace_root: &[u8],
+    path: &[u8],
+    retain_until_ms: u64,
+    hold: u8,
+) -> Result<usize, WireError> {
+    check_key(namespace_root, path, &[])?;
+    if hold > RETAIN_HOLD_CLEAR || (retain_until_ms == 0 && hold == RETAIN_HOLD_LEAVE) {
+        return Err(WireError::BadOpcode { observed: hold });
+    }
+    let needed = RETAIN_HDR + namespace_root.len() + path.len();
+    if dst.len() < needed {
+        return Err(WireError::BufferTooSmall {
+            needed,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = OP_RETAIN;
+    dst[1..5].copy_from_slice(&correlation_id.to_le_bytes());
+    dst[5..7].copy_from_slice(&(namespace_root.len() as u16).to_le_bytes());
+    dst[7..9].copy_from_slice(&(path.len() as u16).to_le_bytes());
+    dst[9..17].copy_from_slice(&retain_until_ms.to_le_bytes());
+    dst[17] = hold;
+    let at = RETAIN_HDR + namespace_root.len();
+    dst[RETAIN_HDR..at].copy_from_slice(namespace_root);
+    dst[at..needed].copy_from_slice(path);
+    Ok(needed)
+}
+
+pub fn decode_admin_retain(src: &[u8]) -> Result<DecodedAdminRetain<'_>, WireError> {
+    if src.len() < RETAIN_HDR {
+        return Err(WireError::Truncated);
+    }
+    if src[0] != OP_RETAIN {
+        return Err(WireError::BadOpcode { observed: src[0] });
+    }
+    let ns_len = u16::from_le_bytes([src[5], src[6]]) as usize;
+    let path_len = u16::from_le_bytes([src[7], src[8]]) as usize;
+    let retain_until_ms = u64::from_le_bytes(src[9..17].try_into().unwrap());
+    let hold = src[17];
+    if hold > RETAIN_HOLD_CLEAR || (retain_until_ms == 0 && hold == RETAIN_HOLD_LEAVE) {
+        return Err(WireError::BadOpcode { observed: hold });
+    }
+    if src.len() < RETAIN_HDR + ns_len + path_len {
+        return Err(WireError::Truncated);
+    }
+    let ns = &src[RETAIN_HDR..RETAIN_HDR + ns_len];
+    let path = &src[RETAIN_HDR + ns_len..RETAIN_HDR + ns_len + path_len];
+    check_key(ns, path, &[])?;
+    Ok(DecodedAdminRetain {
+        correlation_id: u32::from_le_bytes(src[1..5].try_into().unwrap()),
+        namespace_root: ns,
+        path,
+        retain_until_ms,
+        hold,
+    })
+}
+
+pub fn encode_admin_retain_ack(
+    dst: &mut [u8],
+    correlation_id: u32,
+    status: u8,
+    fence: &[u8],
+) -> Result<usize, WireError> {
+    let needed = 7 + fence.len();
+    if fence.len() > ACK_FENCE_MAX || dst.len() < needed {
+        return Err(WireError::BufferTooSmall {
+            needed,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = OP_RETAIN;
+    dst[1..5].copy_from_slice(&correlation_id.to_le_bytes());
+    dst[5] = status;
+    dst[6] = fence.len() as u8;
+    dst[7..needed].copy_from_slice(fence);
+    Ok(needed)
+}
+
+/// `(cid, status, fence)`.
+pub fn decode_admin_retain_ack(src: &[u8]) -> Result<(u32, u8, &[u8]), WireError> {
+    if src.len() < 7 {
+        return Err(WireError::Truncated);
+    }
+    if src[0] != OP_RETAIN {
+        return Err(WireError::BadOpcode { observed: src[0] });
+    }
+    let len = src[6] as usize;
+    let fence = src.get(7..7 + len).ok_or(WireError::Truncated)?;
+    Ok((
+        u32::from_le_bytes(src[1..5].try_into().unwrap()),
+        src[5],
+        fence,
+    ))
 }
 
 // ── AdminLease (volume writer lease) ──────────────────────────────
@@ -2624,12 +2906,23 @@ pub struct AdminBinding<'a> {
     pub stamp_ms: u64,
     pub size: u64,
     pub content_type: &'a [u8],
+    /// What the store keeps with it.
+    pub policy: Policy<'a>,
 }
 
 /// `[revision:u64][kind][oid_len:u8][oid][stamp:u64][size:u64]
-/// [ctype_len:u8][ctype]`
+/// [ctype_len:u8][ctype][key_ref_len:u8][retain_until_ms:u64][hold:u8]
+/// [key_ref]`
 fn binding_tail_len(b: &AdminBinding<'_>) -> usize {
-    8 + 1 + 1 + b.object_id.len() + 8 + 8 + 1 + b.content_type.len()
+    8 + 1
+        + 1
+        + b.object_id.len()
+        + 8
+        + 8
+        + 1
+        + b.content_type.len()
+        + POLICY_HDR
+        + b.policy.key_ref.len()
 }
 
 fn put_binding_tail(dst: &mut [u8], b: &AdminBinding<'_>) -> usize {
@@ -2644,7 +2937,11 @@ fn put_binding_tail(dst: &mut [u8], b: &AdminBinding<'_>) -> usize {
     at += 16;
     dst[at] = b.content_type.len() as u8;
     dst[at + 1..at + 1 + b.content_type.len()].copy_from_slice(b.content_type);
-    at + 1 + b.content_type.len()
+    at += 1 + b.content_type.len();
+    put_policy_hdr(&mut dst[at..at + POLICY_HDR], &b.policy);
+    at += POLICY_HDR;
+    dst[at..at + b.policy.key_ref.len()].copy_from_slice(b.policy.key_ref);
+    at + b.policy.key_ref.len()
 }
 
 fn take_binding_tail(src: &[u8]) -> Option<(AdminBinding<'_>, usize)> {
@@ -2659,6 +2956,10 @@ fn take_binding_tail(src: &[u8]) -> Option<(AdminBinding<'_>, usize)> {
     at += 16;
     let ct_len = *src.get(at)? as usize;
     let content_type = src.get(at + 1..at + 1 + ct_len)?;
+    at += 1 + ct_len;
+    let (ref_len, retain_until_ms, hold) = take_policy_hdr(src.get(at..at + POLICY_HDR)?).ok()?;
+    at += POLICY_HDR;
+    let key_ref = src.get(at..at + ref_len)?;
     Some((
         AdminBinding {
             revision,
@@ -2667,8 +2968,13 @@ fn take_binding_tail(src: &[u8]) -> Option<(AdminBinding<'_>, usize)> {
             stamp_ms,
             size,
             content_type,
+            policy: Policy {
+                key_ref,
+                retain_until_ms,
+                hold,
+            },
         },
-        at + 1 + ct_len,
+        at + ref_len,
     ))
 }
 
@@ -2678,7 +2984,9 @@ fn binding_tail_record_len(src: &[u8]) -> Result<usize, WireError> {
     let oid_len = *src.get(9).ok_or(WireError::Truncated)? as usize;
     let ct_at = 10 + oid_len + 16;
     let ct_len = *src.get(ct_at).ok_or(WireError::Truncated)? as usize;
-    Ok(ct_at + 1 + ct_len)
+    let policy_at = ct_at + 1 + ct_len;
+    let ref_len = *src.get(policy_at).ok_or(WireError::Truncated)? as usize;
+    Ok(policy_at + POLICY_HDR + ref_len)
 }
 
 pub fn encode_admin_lookup_ack(
@@ -2689,7 +2997,10 @@ pub fn encode_admin_lookup_ack(
 ) -> Result<usize, WireError> {
     let tail = match binding {
         Some(b) if status == STATUS_OK => {
-            if b.object_id.len() > MAX_OBJECT_ID || b.content_type.len() > CONTENT_TYPE_MAX {
+            if b.object_id.len() > MAX_OBJECT_ID
+                || b.content_type.len() > CONTENT_TYPE_MAX
+                || b.policy.key_ref.len() > KEY_REF_MAX
+            {
                 return Err(WireError::StringTooLong {
                     len: b.object_id.len().max(b.content_type.len()),
                     max: MAX_OBJECT_ID,
