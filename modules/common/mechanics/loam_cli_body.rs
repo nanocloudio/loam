@@ -164,6 +164,8 @@ pub struct ModuleState {
     pub until_at: i8,
     pub hold_set: u8,
     pub hold_clear: u8,
+    /// `--keep-retention`: a new name takes the entry's retention and hold.
+    pub keep_retention: u8,
     // sessions
     pub clients: [ac::Client; 2],
     pub nclients: u8,
@@ -223,6 +225,12 @@ pub struct ModuleState {
     pub entry_size: u64,
     pub ctype: [u8; 128],
     pub ctype_len: u8,
+    /// The entry in hand's key reference, retention and hold: what a
+    /// listing answered or a manifest record stated.
+    pub entry_key_ref: [u8; aw::KEY_REF_MAX],
+    pub entry_key_ref_len: u8,
+    pub entry_retain_until: u64,
+    pub entry_hold: bool,
     // the volume-bind sub-flow
     pub vb: u8,
     pub vb_client: u8,
@@ -493,6 +501,7 @@ fn parse(s: &mut ModuleState) -> bool {
     s.until_at = -1;
     s.hold_set = 0;
     s.hold_clear = 0;
+    s.keep_retention = 0;
     // Options are taken out; what is left, in order, is the command.
     let mut kept = [(0u16, 0u16); MAX_ARGS];
     let mut nk = 0;
@@ -526,6 +535,11 @@ fn parse(s: &mut ModuleState) -> bool {
         }
         if eq(word, b"--hold") {
             s.hold_set = 1;
+            k += 1;
+            continue;
+        }
+        if eq(word, b"--keep-retention") {
+            s.keep_retention = 1;
             k += 1;
             continue;
         }
@@ -636,9 +650,10 @@ fn help(s: &mut ModuleState) {
           \x20 volume delete <root> <path>\n\
           \x20 volume read   <root> <path> <offset> <length> <file>\n\
           \x20 snapshot create  <src-root> <snap-root> <manifest-file>\n\
-          \x20 snapshot restore <manifest-file> <dst-root>\n\
+          \x20 snapshot restore <manifest-file> <dst-root> [--keep-retention]\n\
           \x20 snapshot delete  <snap-root>\n\
           \x20 export <manifest-file> <dst-root> --to <host:port> --to-capability <file>\n\
+          \x20        [--keep-retention]\n\
           The capability file holds one fxcap1. chain per line, presented\n\
           to the node before anything else.\n",
     );
@@ -1464,6 +1479,10 @@ fn next_entry(s: &mut ModuleState) -> bool {
     let (mut kind, mut rev, mut digest, mut size) = (0u8, 0u64, [0u8; 32], 0u64);
     let mut ctype = [0u8; 128];
     let mut ctype_len = 0usize;
+    let mut key_ref = [0u8; aw::KEY_REF_MAX];
+    let mut key_ref_len = 0usize;
+    let mut retain_until_ms = 0u64;
+    let mut hold = false;
     let _ = aw::decode_admin_list_files_ack(page, |path, b| {
         if i == want && path.len() <= PATH_MAX && b.content_type.len() <= 128 {
             put(&mut key, path);
@@ -1474,6 +1493,10 @@ fn next_entry(s: &mut ModuleState) -> bool {
             size = b.size;
             put(&mut ctype, b.content_type);
             ctype_len = b.content_type.len();
+            put(&mut key_ref, b.policy.key_ref);
+            key_ref_len = b.policy.key_ref.len();
+            retain_until_ms = b.policy.retain_until_ms;
+            hold = b.policy.hold;
             found = true;
         }
         i += 1;
@@ -1490,6 +1513,10 @@ fn next_entry(s: &mut ModuleState) -> bool {
     s.entry_size = size;
     s.ctype = ctype;
     s.ctype_len = ctype_len as u8;
+    s.entry_key_ref = key_ref;
+    s.entry_key_ref_len = key_ref_len as u8;
+    s.entry_retain_until = retain_until_ms;
+    s.entry_hold = hold;
     put(&mut s.after, &key[..key_len]);
     s.after_len = key_len as u16;
     true
@@ -2547,6 +2574,10 @@ unsafe fn mf_next(s: &mut ModuleState) -> Mf {
                 s.entry_size = e.size;
                 put(&mut s.ctype, e.content_type);
                 s.ctype_len = e.content_type.len() as u8;
+                put(&mut s.entry_key_ref, e.key_ref);
+                s.entry_key_ref_len = e.key_ref.len() as u8;
+                s.entry_retain_until = e.retain_until_ms;
+                s.entry_hold = e.hold;
                 mf_consume(s, n);
                 s.mf_seen += 1;
                 return Mf::Got;
@@ -2581,6 +2612,7 @@ unsafe fn bind_entry(s: &mut ModuleState, k: usize, root: &[u8]) {
     let cid = next_cid(s);
     let key: &[u8] = &*(&s.key[..s.key_len as usize] as *const [u8]);
     let ctype: &[u8] = &*(&s.ctype[..s.ctype_len as usize] as *const [u8]);
+    let key_ref = entry_key_ref(s);
     match aw::encode_admin_bind(
         &mut s.req,
         cid,
@@ -2591,10 +2623,62 @@ unsafe fn bind_entry(s: &mut ModuleState, k: usize, root: &[u8]) {
         1,
         s.entry_size,
         ctype,
+        key_ref,
     ) {
         Ok(n) => ask(s, k, n),
         Err(_) => fail(s, b"an entry is not one the wire carries"),
     }
+}
+
+/// The entry in hand's key reference.
+unsafe fn entry_key_ref(s: &ModuleState) -> &'static [u8] {
+    &*(&s.entry_key_ref[..s.entry_key_ref_len as usize] as *const [u8])
+}
+
+/// Does the lookup just answered show the name already holding the entry
+/// in hand? A bind at revision 1 is refused once a retain has moved the
+/// name past it, though the name is exactly what the command wants, so a
+/// refused bind asks this before it calls the name someone else's.
+unsafe fn holds_entry(s: &ModuleState) -> bool {
+    match aw::decode_admin_lookup_ack(answer(s)) {
+        Ok((_, aw::STATUS_OK, Some(b))) => {
+            b.kind == s.kind && digest_of(b.object_id) == Some(s.entry_digest)
+        }
+        _ => false,
+    }
+}
+
+/// With `--keep-retention`, ask session `k` to give the entry just bound
+/// under `root` the retention and hold its source held. False when there
+/// is nothing to ask: no flag, nothing retained, or a volume, whose
+/// binding changes only by a fenced commit.
+///
+/// A record of its own rather than part of the bind. A bind at the
+/// revision the name already holds changes nothing, so it could not give
+/// retention to a clone made without it; a retain can, and asking again
+/// changes nothing. A crash between the two leaves the new name
+/// unretained until the command is run again, and the source still
+/// retained.
+unsafe fn keep_retention(s: &mut ModuleState, k: usize, root: &[u8]) -> bool {
+    let hold = if s.entry_hold {
+        aw::RETAIN_HOLD_SET
+    } else {
+        aw::RETAIN_HOLD_LEAVE
+    };
+    if s.keep_retention == 0
+        || s.kind == KIND_VOLUME
+        || (s.entry_retain_until == 0 && hold == aw::RETAIN_HOLD_LEAVE)
+    {
+        return false;
+    }
+    let cid = next_cid(s);
+    let key: &[u8] = &*(&s.key[..s.key_len as usize] as *const [u8]);
+    let until = s.entry_retain_until;
+    match aw::encode_admin_retain(&mut s.req, cid, root, key, until, hold) {
+        Ok(n) => ask(s, k, n),
+        Err(_) => fail(s, b"an entry is not one the wire carries"),
+    }
+    true
 }
 
 /// The status binding the last entry answered.
@@ -2674,6 +2758,9 @@ unsafe fn cmd_screate(s: &mut ModuleState, answered: bool) {
                     kind: s.kind,
                     size: s.entry_size,
                     content_type: &*(&s.ctype[..s.ctype_len as usize] as *const [u8]),
+                    key_ref: entry_key_ref(s),
+                    retain_until_ms: s.entry_retain_until,
+                    hold: s.entry_hold,
                 };
                 let Ok(n) = mw::encode_record(&mut r, &e) else {
                     return fail(s, b"an entry is not one a manifest carries");
@@ -2773,6 +2860,10 @@ const SR_OPEN: u8 = 0;
 const SR_BOUND: u8 = 1;
 /// The next record being read.
 const SR_NEXT: u8 = 2;
+/// The entry's retention was asked for.
+const SR_KEPT: u8 = 3;
+/// A refused bind asked what the name holds.
+const SR_CHECK: u8 = 4;
 
 unsafe fn cmd_srestore(s: &mut ModuleState, answered: bool) {
     let file: &[u8] = &*(carg(s, 0).unwrap_or(&[]) as *const [u8]);
@@ -2792,8 +2883,43 @@ unsafe fn cmd_srestore(s: &mut ModuleState, answered: bool) {
                     return;
                 }
                 let st = bind_status(s, plain);
+                if st == aw::STATUS_CONFLICT && plain {
+                    s.st = SR_CHECK;
+                    let key: &[u8] = &*(&s.key[..s.key_len as usize] as *const [u8]);
+                    return send_lookup(s, 0, dst, key);
+                }
                 if st != aw::STATUS_OK {
                     return fail_status(s, b"restore bind", st);
+                }
+                if keep_retention(s, 0, dst) {
+                    s.st = SR_KEPT;
+                    return;
+                }
+                s.count += 1;
+                s.st = SR_NEXT;
+            }
+            SR_CHECK => {
+                if !answered {
+                    return;
+                }
+                if !holds_entry(s) {
+                    return fail_status(s, b"restore bind", aw::STATUS_CONFLICT);
+                }
+                if keep_retention(s, 0, dst) {
+                    s.st = SR_KEPT;
+                    return;
+                }
+                s.count += 1;
+                s.st = SR_NEXT;
+            }
+            SR_KEPT => {
+                if !answered {
+                    return;
+                }
+                match aw::decode_admin_retain_ack(answer(s)) {
+                    Ok((_, aw::STATUS_OK, _)) => {}
+                    Ok((_, st, _)) => return fail_status(s, b"restore retain", st),
+                    Err(_) => return fail(s, b"the node's answer does not decode"),
                 }
                 s.count += 1;
                 s.st = SR_NEXT;
@@ -2929,6 +3055,7 @@ unsafe fn mv_open(s: &mut ModuleState) {
         mode: aw::WRITE_ABSENT,
         expect: &[],
     };
+    let key_ref = entry_key_ref(s);
     let cid = next_cid(s);
     s.off = 0;
     s.mv = MV_OPEN;
@@ -2939,7 +3066,10 @@ unsafe fn mv_open(s: &mut ModuleState) {
         key,
         s.kind,
         &cond,
-        &aw::Policy::NONE,
+        &aw::Policy {
+            key_ref,
+            ..aw::Policy::NONE
+        },
         ctype,
         &d,
         s.entry_size,
@@ -3168,6 +3298,10 @@ const EX_NEXT: u8 = 7;
 const EX_REOPEN: u8 = 8;
 /// Pass two's next record being read.
 const EX_BIND_NEXT: u8 = 9;
+/// The entry's retention was asked for at the destination.
+const EX_KEPT: u8 = 10;
+/// A refused bind asked what the destination's name holds.
+const EX_CHECK: u8 = 11;
 
 unsafe fn cmd_export(s: &mut ModuleState, answered: bool) {
     let file: &[u8] = &*(carg(s, 0).unwrap_or(&[]) as *const [u8]);
@@ -3247,6 +3381,32 @@ unsafe fn cmd_export(s: &mut ModuleState, answered: bool) {
                 Mf::Got => s.st = EX_BIND_NEXT,
                 Mf::Wait | Mf::End => return,
             },
+            EX_CHECK => {
+                if !answered {
+                    return;
+                }
+                if !holds_entry(s) {
+                    return fail_status(s, b"export bind", aw::STATUS_CONFLICT);
+                }
+                if keep_retention(s, 1, dst) {
+                    s.st = EX_KEPT;
+                    return;
+                }
+                s.count += 1;
+                s.st = EX_BIND_NEXT;
+            }
+            EX_KEPT => {
+                if !answered {
+                    return;
+                }
+                match aw::decode_admin_retain_ack(answer(s)) {
+                    Ok((_, aw::STATUS_OK, _)) => {}
+                    Ok((_, st, _)) => return fail_status(s, b"export retain", st),
+                    Err(_) => return fail(s, b"the node's answer does not decode"),
+                }
+                s.count += 1;
+                s.st = EX_BIND_NEXT;
+            }
             EX_BIND_NEXT => {
                 return match mf_next(s) {
                     Mf::Got => {
@@ -3280,8 +3440,17 @@ unsafe fn cmd_export(s: &mut ModuleState, answered: bool) {
                     return;
                 }
                 let st = bind_status(s, plain);
+                if st == aw::STATUS_CONFLICT && plain {
+                    s.st = EX_CHECK;
+                    let key: &[u8] = &*(&s.key[..s.key_len as usize] as *const [u8]);
+                    return send_lookup(s, 1, dst, key);
+                }
                 if st != aw::STATUS_OK {
                     return fail_status(s, b"export bind", st);
+                }
+                if keep_retention(s, 1, dst) {
+                    s.st = EX_KEPT;
+                    return;
                 }
                 s.count += 1;
                 s.st = EX_BIND_NEXT;

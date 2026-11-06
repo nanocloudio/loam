@@ -137,10 +137,12 @@ larger than one record streams: `object_provider` spools it under
 `spool_dir` and writes it as one `PUT_FILE` stream, and reads come
 back in ranges pinned to the object they started on. State is in the
 WALs and the body directory, so a restart replays to the same
-contents. The service leaves the node's orphan sweep off; a graph that
-includes the `loam-node` stack turns it on with `gc_interval`
-(steps; 0 is off), which sweeps orphaned bodies and unbound object
-descriptors — see [durability.md](durability.md).
+contents. `gc_interval` (steps between sweep pages; 10000 here, 0 is
+off) sets the node's orphan sweep, which collects bodies no binding
+names and unbound object descriptors, so a `DELETE` frees its bytes and
+a body left by an interrupted write goes too — see
+[durability.md](durability.md). A graph that includes the `loam-node`
+stack has it off unless it passes the param.
 
 ## A storage node in your own graph
 
@@ -338,8 +340,8 @@ params and `crypt_key`, the key vault entry it encrypts under.
 
 ## Snapshots, clones and export
 
-A snapshot is a manifest — a `(key, digest, kind, size, content
-type)` listing — and nothing more. It pins its bodies by BINDING them
+A snapshot is a manifest — a `(key, digest, kind, size, content type,
+key reference, retention, hold)` listing — and nothing more. It pins its bodies by BINDING them
 under a root the caller names, so they are protected by the same
 reachability answer the orphan GC already computes for ordinary
 bindings: no per-body refcount appears, and the collector needs no
@@ -353,6 +355,15 @@ $L snapshot delete snap-1                            # the GC reclaims the rest
 $L export snap-1.manifest tenant --to node2:7443 --to-capability /etc/loam/node2.cap
 ```
 
+A clone or an export keeps the key reference: it describes the bytes,
+and those bytes are the same bytes. Retention and hold describe the
+source's name, so a new name is free of them unless `snapshot restore`
+or `export` is given `--keep-retention`. That is asked of the new name
+after its bind, so running the command again finishes one a crash
+interrupted, and gives retention to a clone made without it. A
+snapshot's own names never take retention: the source is protected
+already, and `snapshot delete` has to work.
+
 Each manifest entry carries its binding's kind, so a volume restores
 as a volume — the GC walks the maps of volume bindings only.
 
@@ -362,9 +373,10 @@ every page and extent its root reaches — sends only those, then
 binds the manifest's entries, so deduplication is free and a second
 export of the same manifest sends nothing. A body moves whole when it
 fits one admin answer; a larger file is read by range from the
-source and written to the destination as a streamed file. The manifest is encryption-agnostic and its
-digests are over plaintext, so it means the same thing on both sides
-whatever keys each cluster holds.
+source and written to the destination as a streamed file. A manifest's digests are over the bytes
+loam stores, which are ciphertext when the writer sealed them, so an
+export moves sealed bytes without any key. The key reference names the
+key they need; the destination has to be able to resolve that name.
 
 ## Body plane across nodes
 

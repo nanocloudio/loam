@@ -14,8 +14,8 @@
 # key (wave's credentials format); the capabilities verify against
 # `mesh_roots`, which the S3 server and the admin plane share. The node's
 # parameters (`mesh_roots`, the WALs, `body_dir`, `spool_dir`) pass to the
-# stack's own; the node's orphan sweep is left off. Its params are the
-# graph's (linux.yaml).
+# stack's own, `gc_interval` among them, and the sweep is on by default so
+# a DELETE frees its bytes. Its params are the graph's (linux.yaml).
 [workload]
 name = "loam-s3"
 version = "0.1.0"

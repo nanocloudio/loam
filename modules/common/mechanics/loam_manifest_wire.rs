@@ -1,4 +1,4 @@
-// Snapshot manifest — the `(key, digest, kind)` listing that describes
+// Snapshot manifest — the `(key, digest, kind, ...)` listing that describes
 // what a snapshot contains.
 //
 // This file owns the bytes and nothing else: no I/O, no allocation,
@@ -24,14 +24,18 @@
 //
 //   header  [magic u32 "LMAN"][count u32][root_len u16][root]
 //   record  [digest 32][key_len u16][kind u8][size u64][ctype_len u8]
-//           [key][ctype]                                   × count
+//           [key_ref_len u8][retain_until_ms u64][hold u8]
+//           [key][ctype][key_ref]                          × count
 //
-// A record carries what its binding records — kind, size, content type —
-// so a restore binds each entry as what it was, and a clone reads back
-// exactly as its source did. `kind` matters most. It matters for a volume: its entry is the digest of
-// its map root, and the orphan GC walks the maps of VOLUME bindings
-// only — a volume restored as a plain file would have its extents
-// collected.
+// A record carries what its binding records, so a restore binds each
+// entry as what it was and a clone reads back exactly as its source did.
+// `kind` matters most for a volume: its entry is the digest of its map
+// root, and the orphan GC walks the maps of VOLUME bindings only — a
+// volume restored as a plain file would have its extents collected.
+//
+// The key reference describes the bytes, so every copy of them keeps it.
+// Retention and hold describe the source's name: the record states them,
+// and whoever restores or exports chooses whether a new name takes them.
 //
 // Little-endian throughout, like every other loam wire.
 //
@@ -52,7 +56,7 @@ pub const DIGEST_LEN: usize = 32;
 pub const HEADER: usize = 4 + 4 + 2;
 
 /// Fixed part of a record, before the key and content-type bytes.
-pub const REC_HEADER: usize = DIGEST_LEN + 2 + 1 + 8 + 1;
+pub const REC_HEADER: usize = DIGEST_LEN + 2 + 1 + 8 + 1 + 1 + 8 + 1;
 
 /// A plain file's kind (`loam_wire::KIND_FILE`). Restated so this
 /// wire stays includable on its own.
@@ -93,6 +97,8 @@ pub enum ManifestError {
     TooManyEntries { count: usize, max: u32 },
     /// A record carries a kind no binding can have.
     BadKind { observed: u8 },
+    /// A record's hold is neither set nor clear.
+    BadHold { observed: u8 },
 }
 
 /// One manifest record: a key, the digest it was bound to, and what the
@@ -104,6 +110,9 @@ pub struct Entry<'a> {
     pub kind: u8,
     pub size: u64,
     pub content_type: &'a [u8],
+    pub key_ref: &'a [u8],
+    pub retain_until_ms: u64,
+    pub hold: bool,
 }
 
 /// Exact encoded size for `root` and `entries`. A caller allocates
@@ -113,7 +122,7 @@ pub struct Entry<'a> {
 pub fn encoded_len(root: &[u8], entries: &[Entry<'_>]) -> usize {
     let mut n = HEADER + root.len();
     for e in entries {
-        n += REC_HEADER + e.key.len() + e.content_type.len();
+        n += REC_HEADER + e.key.len() + e.content_type.len() + e.key_ref.len();
     }
     n
 }
@@ -148,9 +157,11 @@ pub fn encode(out: &mut [u8], root: &[u8], entries: &[Entry<'_>]) -> Result<usiz
     Ok(o)
 }
 
-/// The largest record: the longest key and content type.
-pub const RECORD_MAX: usize =
-    REC_HEADER + super::limits::MAX_PATH + super::limits::CONTENT_TYPE_MAX;
+/// The largest record: the longest key, content type and key reference.
+pub const RECORD_MAX: usize = REC_HEADER
+    + super::limits::MAX_PATH
+    + super::limits::CONTENT_TYPE_MAX
+    + super::limits::KEY_REF_MAX;
 
 /// The largest header: the longest root.
 pub const HEADER_MAX: usize = HEADER + super::limits::MAX_ROOT;
@@ -166,6 +177,12 @@ fn check_record(e: &Entry<'_>) -> Result<(), ManifestError> {
         return Err(ManifestError::TooLong {
             len: e.content_type.len(),
             max: super::limits::CONTENT_TYPE_MAX,
+        });
+    }
+    if e.key_ref.len() > super::limits::KEY_REF_MAX {
+        return Err(ManifestError::TooLong {
+            len: e.key_ref.len(),
+            max: super::limits::KEY_REF_MAX,
         });
     }
     if e.kind > LAST_KIND {
@@ -206,7 +223,7 @@ pub fn encode_header(out: &mut [u8], root: &[u8], count: u32) -> Result<usize, M
 /// Write one record; its length.
 pub fn encode_record(out: &mut [u8], e: &Entry<'_>) -> Result<usize, ManifestError> {
     check_record(e)?;
-    let needed = REC_HEADER + e.key.len() + e.content_type.len();
+    let needed = REC_HEADER + e.key.len() + e.content_type.len() + e.key_ref.len();
     if out.len() < needed {
         return Err(ManifestError::BufferTooSmall {
             needed,
@@ -219,8 +236,11 @@ pub fn encode_record(out: &mut [u8], e: &Entry<'_>) -> Result<usize, ManifestErr
     out[o + 2] = e.kind;
     out[o + 3..o + 11].copy_from_slice(&e.size.to_le_bytes());
     out[o + 11] = e.content_type.len() as u8;
+    out[o + 12] = e.key_ref.len() as u8;
+    out[o + 13..o + 21].copy_from_slice(&e.retain_until_ms.to_le_bytes());
+    out[o + 21] = e.hold as u8;
     o = REC_HEADER;
-    for part in [e.key, e.content_type] {
+    for part in [e.key, e.content_type, e.key_ref] {
         let mut i = 0;
         while i < part.len() {
             out[o + i] = part[i];
@@ -259,6 +279,10 @@ pub fn read_record(src: &[u8]) -> Result<Option<(Entry<'_>, usize)>, ManifestErr
     let mut size = [0u8; 8];
     size.copy_from_slice(&src[o + 3..o + 11]);
     let ct_len = src[o + 11] as usize;
+    let ref_len = src[o + 12] as usize;
+    let mut retain = [0u8; 8];
+    retain.copy_from_slice(&src[o + 13..o + 21]);
+    let hold = src[o + 21];
     if key_len > super::limits::MAX_PATH {
         return Err(ManifestError::TooLong {
             len: key_len,
@@ -271,10 +295,19 @@ pub fn read_record(src: &[u8]) -> Result<Option<(Entry<'_>, usize)>, ManifestErr
             max: super::limits::CONTENT_TYPE_MAX,
         });
     }
+    if ref_len > super::limits::KEY_REF_MAX {
+        return Err(ManifestError::TooLong {
+            len: ref_len,
+            max: super::limits::KEY_REF_MAX,
+        });
+    }
+    if hold > 1 {
+        return Err(ManifestError::BadHold { observed: hold });
+    }
     if kind > LAST_KIND {
         return Err(ManifestError::BadKind { observed: kind });
     }
-    let n = REC_HEADER + key_len + ct_len;
+    let n = REC_HEADER + key_len + ct_len + ref_len;
     if src.len() < n {
         return Ok(None);
     }
@@ -284,7 +317,10 @@ pub fn read_record(src: &[u8]) -> Result<Option<(Entry<'_>, usize)>, ManifestErr
             digest,
             kind,
             size: u64::from_le_bytes(size),
-            content_type: &src[REC_HEADER + key_len..n],
+            content_type: &src[REC_HEADER + key_len..REC_HEADER + key_len + ct_len],
+            key_ref: &src[REC_HEADER + key_len + ct_len..n],
+            retain_until_ms: u64::from_le_bytes(retain),
+            hold: hold != 0,
         },
         n,
     )))

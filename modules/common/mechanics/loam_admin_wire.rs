@@ -11,7 +11,8 @@
 //   AdminBind          [op:u8=0x40][cid:u32]
 //                      [ns_len:u16][path_len:u16][oid_len:u16]
 //                      [kind:u8][revision:u64][size:u64][ctype_len:u8]
-//                      [ns:ns_len][path:path_len][oid:oid_len][ctype]
+//                      [key_ref_len:u8]
+//                      [ns:ns_len][path:path_len][oid:oid_len][ctype][key_ref]
 //
 //                      `size` and the content type are what the binding
 //                      records of the object it names, as a write
@@ -348,7 +349,7 @@ fn fenced_len(src: &[u8], fixed: usize) -> Result<usize, WireError> {
 
 // ── AdminBind ──────────────────────────────────────────────────────
 
-const BIND_HDR: usize = 1 + 4 + 2 + 2 + 2 + 1 + 8 + 8 + 1;
+const BIND_HDR: usize = 1 + 4 + 2 + 2 + 2 + 1 + 8 + 8 + 1 + 1;
 
 #[allow(
     clippy::too_many_arguments,
@@ -364,6 +365,7 @@ pub fn encode_admin_bind(
     revision: u64,
     size: u64,
     content_type: &[u8],
+    key_ref: &[u8],
 ) -> Result<usize, WireError> {
     check_key(namespace_root, path, object_id)?;
     if content_type.len() > CONTENT_TYPE_MAX {
@@ -372,8 +374,18 @@ pub fn encode_admin_bind(
             max: CONTENT_TYPE_MAX,
         });
     }
-    let needed =
-        BIND_HDR + namespace_root.len() + path.len() + object_id.len() + content_type.len();
+    if key_ref.len() > KEY_REF_MAX {
+        return Err(WireError::StringTooLong {
+            len: key_ref.len(),
+            max: KEY_REF_MAX,
+        });
+    }
+    let needed = BIND_HDR
+        + namespace_root.len()
+        + path.len()
+        + object_id.len()
+        + content_type.len()
+        + key_ref.len();
     if dst.len() < needed {
         return Err(WireError::BufferTooSmall {
             needed,
@@ -389,8 +401,9 @@ pub fn encode_admin_bind(
     dst[12..20].copy_from_slice(&revision.to_le_bytes());
     dst[20..28].copy_from_slice(&size.to_le_bytes());
     dst[28] = content_type.len() as u8;
+    dst[29] = key_ref.len() as u8;
     let mut cursor = BIND_HDR;
-    for part in [namespace_root, path, object_id, content_type] {
+    for part in [namespace_root, path, object_id, content_type, key_ref] {
         dst[cursor..cursor + part.len()].copy_from_slice(part);
         cursor += part.len();
     }
@@ -407,6 +420,10 @@ pub struct DecodedAdminBind<'a> {
     pub revision: u64,
     pub size: u64,
     pub content_type: &'a [u8],
+    /// The key that sealed the bytes this name now holds. A bind names
+    /// bytes that already exist, so what sealed them comes with it.
+    /// Retention does not: that is a `RETAIN`, on the name.
+    pub key_ref: &'a [u8],
 }
 
 pub fn decode_admin_bind(src: &[u8]) -> Result<DecodedAdminBind<'_>, WireError> {
@@ -430,7 +447,14 @@ pub fn decode_admin_bind(src: &[u8]) -> Result<DecodedAdminBind<'_>, WireError> 
             max: CONTENT_TYPE_MAX,
         });
     }
-    let total = BIND_HDR + ns_len + path_len + oid_len + ct_len;
+    let ref_len = src[29] as usize;
+    if ref_len > KEY_REF_MAX {
+        return Err(WireError::StringTooLong {
+            len: ref_len,
+            max: KEY_REF_MAX,
+        });
+    }
+    let total = BIND_HDR + ns_len + path_len + oid_len + ct_len + ref_len;
     if src.len() < total {
         return Err(WireError::Truncated);
     }
@@ -442,6 +466,8 @@ pub fn decode_admin_bind(src: &[u8]) -> Result<DecodedAdminBind<'_>, WireError> 
     let oid = &src[at..at + oid_len];
     at += oid_len;
     let content_type = &src[at..at + ct_len];
+    at += ct_len;
+    let key_ref = &src[at..at + ref_len];
     check_key(ns, path, oid)?;
     Ok(DecodedAdminBind {
         correlation_id,
@@ -452,6 +478,7 @@ pub fn decode_admin_bind(src: &[u8]) -> Result<DecodedAdminBind<'_>, WireError> 
         revision,
         size,
         content_type,
+        key_ref,
     })
 }
 
@@ -1995,7 +2022,7 @@ pub fn request_len(src: &[u8]) -> Result<usize, WireError> {
         src.get(at).map(|b| *b as usize).ok_or(WireError::Truncated)
     };
     match op {
-        OP_BIND => Ok(BIND_HDR + u16_at(5)? + u16_at(7)? + u16_at(9)? + u8_at(28)?),
+        OP_BIND => Ok(BIND_HDR + u16_at(5)? + u16_at(7)? + u16_at(9)? + u8_at(28)? + u8_at(29)?),
         OP_PUT_BODY => Ok(9 + u32_at(5)?),
         OP_GET_BODY => Ok(5 + DIGEST_LEN),
         OP_PUT_FILE => Ok(PUT_FILE_HDR

@@ -10,7 +10,9 @@
 #   - the bundle refuses to run without a required parameter;
 #   - an object's life: PUT (a single record, a 256 KiB body and a streamed
 #     multi-megabyte body), GET identical, HEAD's length, a range, the listing, a
-#     conditional create refused when the key exists, DELETE, then 404;
+#     conditional create refused when the key exists, DELETE, then 404,
+#     and the orphan sweep frees the deleted object's body while the
+#     others' stay;
 #   - refusals: an unsigned request, a key whose capability does not
 #     reach the bucket;
 #   - wave's traffic driver passes (payload forms, multipart, listings,
@@ -37,7 +39,7 @@ PORT=$(free_port)
 
 params=(--param "port=$PORT" --param "credentials=$W/credentials" --param "mesh_roots=$MESH"
   --param "ns_wal=$W/ns.wal" --param "obj_wal=$W/obj.wal" --param "body_dir=$W/bodies"
-  --param "spool_dir=$W/spool" --param max_object_mib=64 --param part_min_kib=64)
+  --param "spool_dir=$W/spool" --param gc_interval=100 --param max_object_mib=64 --param part_min_kib=64)
 
 # A required parameter left out is refused before anything runs.
 if (cd "$ROOT" && timeout 120 fluxor run "$BUNDLE" --param "port=$PORT") >"$W/refused.log" 2>&1; then
@@ -100,6 +102,19 @@ expect 403 "$(s3 "${B[@]}" "$URL/alpha/docs/small")" "a key whose capability doe
 
 expect 204 "$(s3 "${A[@]}" -X DELETE "$URL/alpha/docs/small")" "DELETE"
 expect 404 "$(s3 "${A[@]}" "$URL/alpha/docs/small")" "GET after DELETE"
+
+# Bodies are named for their digest, so the sweep's work is visible on disk.
+small_body="$W/bodies/$(sha256sum "$W/small" | cut -d' ' -f1)"
+large_body="$W/bodies/$(sha256sum "$W/large" | cut -d' ' -f1)"
+[ -f "$large_body" ] || fail "no body at $large_body: the test's idea of the layout is wrong"
+for _ in $(seq 300); do
+  [ -e "$small_body" ] || break
+  sleep 0.2
+done
+[ ! -e "$small_body" ] || fail "the orphan sweep did not free the deleted object's body"
+pass "the orphan sweep frees a deleted object's body"
+[ -f "$large_body" ] || fail "the orphan sweep took a body a binding still names"
+pass "the orphan sweep leaves a bound object's body"
 
 
 echo "s3_service: stopped and run again on the same state"

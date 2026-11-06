@@ -300,13 +300,25 @@ outside this:
 | Raw `DELETE_BODY`, `PUT_BODY_KEYED` | The request waits under a reservation of the digest, which keeps out any bind naming it, until a paged proof says no retained binding names it; otherwise `STATUS_RETAINED` |
 | Orphan sweep | Deletes only what no binding names, retained or not |
 | Arena eviction | Drops only what the snapshot record holds, fields included |
-| TTL (`expired_page`) | Never offers a retained binding |
+| TTL (`expired_page`) | Never offers a retained binding. No module drives this yet, and the admin plane has no way to set an expiry |
 
 The admin plane has no override. Its capabilities decide who may ask, and
 retention decides what the answer is.
 
-Not kept: a snapshot's clone and an export are new objects at new names, and
-do not carry the source's key reference or retention.
+**Copies.** A snapshot's clone and an export are new names over the same
+bytes. They keep the key reference, which describes those bytes. They take
+retention and hold only with `--keep-retention`, as a retain after the bind;
+a snapshot's own names never do. Either way the manifest records all three,
+and the source's own retention is untouched.
+
+**When to set it.** Retention refuses deletion of whatever it covers, finished
+or not, and when it ends nothing removes the object: the orphan sweep leaves
+anything a binding names. A job of several writes that might be abandoned
+writes first and retains once it has succeeded, so what it leaves behind stays
+deletable; a crash between the two leaves that object unretained until the
+retain is retried. A writer whose object must be protected from the moment it
+exists sets retention on the write, and accepts that a failed job's objects
+stay until their retention ends and someone deletes them.
 
 ## Synchronous replication
 

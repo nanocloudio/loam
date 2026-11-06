@@ -1176,9 +1176,9 @@ kind = "module"
 name = "s3_serve"
 project = "wave"
 target = "aarch64"
-digest = "sha256:f6886b830e8803523d3be75ff6eda3c9f36e7dc6ebabf4a9f12a4af14c162c9d"
+digest = "sha256:78102e21a45eb4cb0efa470d1d62a6ad4460a7c8210a31c204939dbb64d415f5"
 reference = "aarch64/s3_serve:0.0.1"
-content = "sha256:4407eaacfa99b959265b8e59f7b801ba3530af41049248e1b883a711fd03d9a3"
+content = "sha256:173d76695cb699ff95fed2051399f7c63a0efc013bcd7b66a68683cd94263f70"
 
 [[artifact]]
 kind = "module"
@@ -1248,9 +1248,9 @@ kind = "runtime"
 name = "fluxor"
 project = "fluxor"
 target = "aarch64-unknown-linux-gnu"
-digest = "sha256:ba4e75c802c8ff535e89366a3fd857fbc4fd633328cfac84a295d3b0c75d865d"
+digest = "sha256:58196ebcb25894255e184c680c4cfa10acb13f7ac0bbe3834c474edf96c959f4"
 reference = "fluxor/run/fluxor-aarch64-unknown-linux-gnu:0.0.1"
-content = "sha256:6e40a2bbc490f6e6add19a5737cc02c57d6915b110ba99108a50acaa68ebf050"
+content = "sha256:70c11c5d3e9c29203e1329619b9cc176679b03914a44a0c0d6cebc4d32dd174e"
 
 [[artifact]]
 kind = "runtime"
@@ -1289,9 +1289,9 @@ content = "sha256:979df3c633b1bfc8b270354a4b319e9a2c347163ed32fa74925785a79dba57
 kind = "source"
 name = "wave-common"
 project = "wave"
-digest = "sha256:c039649e287b53f9aa1f2655b6c8e8a2d58cb40e465ce1a862c541dc40204634"
+digest = "sha256:f88222662b906cba30e632b10d1a2cd18eda9d644fefba0ae57d28165290eba6"
 reference = "wave/src/wave-common:0.0.1"
-content = "sha256:17c3cfa03a0cca61ca6b456e04c40d3046c9bc93aa4becd15f4d213e4af59fc6"
+content = "sha256:18063e1c89b8a36c559011df9ff42b1adf88581f4c3aa51122daa66a21f40214"
 
 [catalog]
 digest = "sha256:9f7feaf747112a403449c700772080301730b4fb5d92ee1424a473b82cf33283"

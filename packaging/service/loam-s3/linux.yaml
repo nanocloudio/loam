@@ -73,6 +73,12 @@ params:
     required: true
     example: /var/lib/loam/spool
     description: Directory streamed writes are spooled in until they commit
+  gc_interval:
+    type: integer
+    default: 10000
+    min: 0
+    max: 4294967295
+    description: Steps between orphan-sweep pages, which collect bodies no binding names, about one a second by default; 0 leaves the sweep off, and a DELETE then never frees its bytes
 
 include:
   - stack: ../../stack/loam-node.yaml
@@ -83,6 +89,7 @@ include:
       obj_wal: "${param:obj_wal}"
       body_dir: "${param:body_dir}"
       spool_dir: "${param:spool_dir}"
+      gc_interval: ${param:gc_interval}
 
 modules:
   - name: http

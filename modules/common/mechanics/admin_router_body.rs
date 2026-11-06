@@ -1187,6 +1187,7 @@ unsafe fn handle_admin_bind(s: &mut ModuleState, syscalls: &super::SyscallTable,
         stamp_ms: stamp_now(s, syscalls),
         size: req.size,
         content_type: req.content_type,
+        key_ref: req.key_ref,
         ..super::ns_wire::BindMeta::NONE
     };
     let n = match super::ns_wire::encode_bind(
