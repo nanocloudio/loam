@@ -1,8 +1,8 @@
 // What remains of `namespace.change` once subscriptions stopped pushing.
 //
-// A `namespace::SUBSCRIBE` (0x1305) is a doorbell: the provider rings the
+// A `namespace::SUBSCRIBE` is a doorbell: the provider rings the
 // subscriber's own kernel event and writes nothing to any channel, and
-// the subscriber reads what changed with `namespace::CHANGES` (0x1307).
+// the subscriber reads what changed with `namespace::CHANGES`.
 // The page, its records and its tokens are fluxor's, encoded and decoded
 // through the contract's own codecs
 // (`contracts::storage::namespace::{subscribe, take, changes}`), so no

@@ -41,14 +41,14 @@
 
 use core::convert::TryInto;
 
-const FS_OPEN: u32 = 0x0900;
-const FS_READ: u32 = 0x0901;
-const FS_SEEK: u32 = 0x0902;
-const FS_CLOSE: u32 = 0x0903;
-const FS_STAT: u32 = 0x0904;
-const FS_FSYNC: u32 = 0x0905;
-const FS_WRITE: u32 = 0x0906;
-const FS_OPEN_CREATE: u32 = 0x0909;
+const FS_OPEN: u32 = crate::abi::registry::fs::OPEN;
+const FS_READ: u32 = crate::abi::registry::fs::READ;
+const FS_SEEK: u32 = crate::abi::registry::fs::SEEK;
+const FS_CLOSE: u32 = crate::abi::registry::fs::CLOSE;
+const FS_STAT: u32 = crate::abi::registry::fs::STAT;
+const FS_FSYNC: u32 = crate::abi::registry::fs::FSYNC;
+const FS_WRITE: u32 = crate::abi::registry::fs::WRITE;
+const FS_OPEN_CREATE: u32 = crate::abi::registry::fs::OPEN_CREATE;
 
 pub const SNAP_MAGIC: u32 = u32::from_le_bytes(*b"LSNP");
 pub const SNAP_HDR: usize = 16;

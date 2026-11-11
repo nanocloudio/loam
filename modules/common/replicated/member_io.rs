@@ -42,7 +42,7 @@
 use super::body_frame::{Inbox, Pull, Sender, RECORD_MAX};
 
 /// `TIMER::MILLIS`: monotonic milliseconds.
-const TIMER_MILLIS: u32 = 0x0602;
+const TIMER_MILLIS: u32 = crate::abi::registry::timer::MILLIS;
 
 /// The monotonic clock, in milliseconds.
 pub unsafe fn now_ms(sys: &super::SyscallTable) -> u64 {

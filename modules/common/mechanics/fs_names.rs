@@ -35,12 +35,12 @@
 /// this file names no type from its includer's module tree.
 pub type ProviderCall = unsafe extern "C" fn(i32, u32, *mut u8, usize) -> i32;
 
-pub const FS_OPEN: u32 = 0x0900;
-pub const FS_CLOSE: u32 = 0x0903;
-pub const FS_UNLINK: u32 = 0x090A;
-pub const FS_RENAME: u32 = 0x090D;
-pub const FS_FSYNC_NAME: u32 = 0x0912;
-pub const FS_CAPS: u32 = 0x09FF;
+pub const FS_OPEN: u32 = crate::abi::registry::fs::OPEN;
+pub const FS_CLOSE: u32 = crate::abi::registry::fs::CLOSE;
+pub const FS_UNLINK: u32 = crate::abi::registry::fs::UNLINK;
+pub const FS_RENAME: u32 = crate::abi::registry::fs::RENAME;
+pub const FS_FSYNC_NAME: u32 = crate::abi::registry::fs::FSYNC_NAME;
+pub const FS_CAPS: u32 = crate::abi::registry::fs::CAPS;
 
 /// `caps::RENAME` — atomic replace, both parent directories durable on
 /// return.

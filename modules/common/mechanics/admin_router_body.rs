@@ -1254,7 +1254,7 @@ fn ns_write_status(ns_resp: &[u8], ok_op: u8) -> u8 {
 
 /// `TIMER::UNIX_MILLIS`: wall-clock milliseconds, 0 when the platform
 /// has none.
-const TIMER_UNIX_MILLIS: u32 = 0x0608;
+const TIMER_UNIX_MILLIS: u32 = crate::abi::registry::timer::UNIX_MILLIS;
 
 /// This server's wall clock as a record stamp, strictly later than the
 /// last one issued; 0 when there is no wall clock.

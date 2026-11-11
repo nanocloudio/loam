@@ -80,22 +80,22 @@ const TAG_B: super::abi::contracts::net::net_proto::RequesterTag = 2;
 pub const STEP_DONE: i32 = 1;
 
 // fs
-const FS_OPEN: u32 = 0x0900;
-const FS_READ: u32 = 0x0901;
-const FS_SEEK: u32 = 0x0902;
-const FS_CLOSE: u32 = 0x0903;
-const FS_FSYNC: u32 = 0x0905;
-const FS_WRITE: u32 = 0x0906;
-const FS_OPEN_CREATE: u32 = 0x0909;
-const FS_UNLINK: u32 = 0x090A;
-const FS_FSYNC_NAME: u32 = 0x0912;
+const FS_OPEN: u32 = super::abi::registry::fs::OPEN;
+const FS_READ: u32 = super::abi::registry::fs::READ;
+const FS_SEEK: u32 = super::abi::registry::fs::SEEK;
+const FS_CLOSE: u32 = super::abi::registry::fs::CLOSE;
+const FS_FSYNC: u32 = super::abi::registry::fs::FSYNC;
+const FS_WRITE: u32 = super::abi::registry::fs::WRITE;
+const FS_OPEN_CREATE: u32 = super::abi::registry::fs::OPEN_CREATE;
+const FS_UNLINK: u32 = super::abi::registry::fs::UNLINK;
+const FS_FSYNC_NAME: u32 = super::abi::registry::fs::FSYNC_NAME;
 /// `EAGAIN`: not now, nothing consumed — ask again on a later step.
 const EAGAIN: i32 = -11;
 /// `EINPROGRESS`: taken, not yet decided — ask the same again on a later
 /// step; that later answer is the decision.
 const EINPROGRESS: i32 = -36;
-const TIMER_MILLIS: u32 = 0x0602;
-const RANDOM: u32 = 0x0C3C;
+const TIMER_MILLIS: u32 = super::abi::registry::timer::MILLIS;
+const RANDOM: u32 = super::abi::registry::kernel::RANDOM_FILL;
 
 /// How the applet reaches the admin plane.
 #[derive(Clone, Copy)]

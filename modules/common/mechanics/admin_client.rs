@@ -181,9 +181,9 @@ pub fn load_chains(c: &mut Client, text: &[u8]) -> bool {
 }
 
 /// `fs` opcodes for reading a capability file.
-const FS_OPEN: u32 = 0x0900;
-const FS_READ: u32 = 0x0901;
-const FS_CLOSE: u32 = 0x0903;
+const FS_OPEN: u32 = super::abi::registry::fs::OPEN;
+const FS_READ: u32 = super::abi::registry::fs::READ;
+const FS_CLOSE: u32 = super::abi::registry::fs::CLOSE;
 /// `EINPROGRESS`: taken, not answered yet — like `EAGAIN`, ask again on
 /// a later step.
 const EINPROGRESS: i32 = -36;

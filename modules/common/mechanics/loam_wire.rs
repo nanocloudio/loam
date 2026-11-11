@@ -63,10 +63,10 @@ use core::convert::TryInto;
 
 // Channel-wire operation set for the `storage.namespace` surface.
 // These are loam's channel encoding of the CANONICAL namespace ops
-// (fluxor `contracts/storage/namespace.rs`): OP_BIND ↔ BIND (0x1308,
-// the op that mints a name), OP_RENAME ↔ RENAME, OP_UNBIND ↔ DELETE, OP_LOOKUP ↔ LOOKUP,
-// OP_LIST ↔ LIST. Same operations, channel-framed rather than
-// provider_call-dispatched; a future wire unification maps 1:1.
+// (fluxor `contracts/storage/namespace.rs`): OP_BIND ↔ BIND (the op
+// that mints a name), OP_RENAME ↔ RENAME, OP_UNBIND ↔ DELETE,
+// OP_LOOKUP ↔ LOOKUP, OP_LIST ↔ LIST. Same operations, channel-framed
+// rather than provider_call-dispatched, and one-to-one.
 pub const OP_BIND: u8 = 1;
 pub const OP_RENAME: u8 = 2;
 pub const OP_UNBIND: u8 = 3;

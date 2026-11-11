@@ -346,7 +346,12 @@ pub unsafe fn module_new_impl(
     // at random too, so instances sharing one admin connection do not
     // collide.
     let mut seed = [0u8; aw::LEASE_HOLDER_LEN + 4];
-    let rc = (sys(s).provider_call)(-1, 0x0C3C, seed.as_mut_ptr(), seed.len());
+    let rc = (sys(s).provider_call)(
+        -1,
+        super::abi::registry::kernel::RANDOM_FILL,
+        seed.as_mut_ptr(),
+        seed.len(),
+    );
     if rc < 0 {
         s.phase = P_FAILED;
         s.fail = EIO;
@@ -453,12 +458,17 @@ unsafe fn sys(s: &ModuleState) -> &super::SyscallTable {
 
 unsafe fn now_ms(s: &ModuleState) -> u64 {
     let mut b = [0u8; 8];
-    (sys(s).provider_call)(-1, 0x0602, b.as_mut_ptr(), 8);
+    (sys(s).provider_call)(-1, super::abi::registry::timer::MILLIS, b.as_mut_ptr(), 8);
     u64::from_le_bytes(b)
 }
 
 unsafe fn log(s: &ModuleState, level: u8, msg: &[u8]) {
-    (sys(s).provider_call)(level as i32, 0x0C40, msg.as_ptr() as *mut u8, msg.len());
+    (sys(s).provider_call)(
+        level as i32,
+        super::abi::registry::kernel::LOG_WRITE,
+        msg.as_ptr() as *mut u8,
+        msg.len(),
+    );
 }
 
 // ── Geometry ────────────────────────────────────────────────────────

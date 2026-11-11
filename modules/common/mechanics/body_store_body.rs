@@ -10,7 +10,7 @@
 // against a missing directory fails with ERR_NO_ROOT.
 //
 // DELETE clears the slot AND unlinks the on-disk file (fs contract
-// UNLINK, 0x090A). A DELETE for a digest with no slot still attempts
+// `UNLINK`). A DELETE for a digest with no slot still attempts
 // the unlink so restarts don't strand orphans: `existed` is true if
 // either the slot or the file was present.
 //
@@ -38,16 +38,16 @@ pub const ROOT_DIR_BUF: usize = 192;
 
 // fluxor `fs` opcodes — duplicated to avoid pulling in another
 // module just for constants.
-const FS_OPEN_CREATE: u32 = 0x0909;
-const FS_OPEN: u32 = 0x0900;
-const FS_READ: u32 = 0x0901;
-const FS_SEEK: u32 = 0x0902;
-const FS_CLOSE: u32 = 0x0903;
-const FS_STAT: u32 = 0x0904;
-const FS_FSYNC: u32 = 0x0905;
-const FS_WRITE: u32 = 0x0906;
-const FS_OPENDIR: u32 = 0x0907;
-const FS_READDIR: u32 = 0x0908;
+const FS_OPEN_CREATE: u32 = crate::abi::registry::fs::OPEN_CREATE;
+const FS_OPEN: u32 = crate::abi::registry::fs::OPEN;
+const FS_READ: u32 = crate::abi::registry::fs::READ;
+const FS_SEEK: u32 = crate::abi::registry::fs::SEEK;
+const FS_CLOSE: u32 = crate::abi::registry::fs::CLOSE;
+const FS_STAT: u32 = crate::abi::registry::fs::STAT;
+const FS_FSYNC: u32 = crate::abi::registry::fs::FSYNC;
+const FS_WRITE: u32 = crate::abi::registry::fs::WRITE;
+const FS_OPENDIR: u32 = crate::abi::registry::fs::OPENDIR;
+const FS_READDIR: u32 = crate::abi::registry::fs::READDIR;
 
 /// Every path this module names: the longest root, `/`, and the longest
 /// entry name it builds — a body's 64 hex digits. Derived, so a root the

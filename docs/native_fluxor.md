@@ -25,7 +25,7 @@ Three modules declare a surface, and each is the one that can answer it:
 | `object_provider` | `storage.object` | `PRESENT` `PUT` `GET` `HEAD` `RANGE_GET` `DELETE` `RETAIN` `LIST` `PUT_STREAMED_*`, by provider dispatch, each under the capability its caller presented | For a write, the namespace's fence for its bind, as the admin plane's answer carries it; `Volatile` for a read |
 | `loam_volume` | `storage.block` | `CAPS` `EXEC` `SUBMIT` `REAP` on its `blocks` channel; `READ`, `WRITE`, `FLUSH`, with `FUA` and `PREFLUSH`. `DISCARD` is not advertised and is refused | `Volatile` for a staged write; `RevisionMonotone` at the volume's committed revision for a flush, a `FUA` write or a `PREFLUSH` |
 
-`LIST` (0x1302) answers one page of names under a prefix, in key
+`LIST` answers one page of names under a prefix, in key
 order after a cursor, through the dispatch; the channel wire's
 `loam_wire::OP_LIST` serves the same name-ordered walk, with each
 binding, to a consumer wired to the module's ports.
@@ -35,11 +35,11 @@ RENAME, DELETE, SUBSCRIBE, CHANGES. The mandatory read ops carry no
 bit, so a consumer reads the bits for what is optional and assumes
 the rest.
 
-`SUBSCRIBE` (0x1305) is a doorbell on the caller's own kernel event:
+`SUBSCRIBE` is a doorbell on the caller's own kernel event:
 the module writes nothing to any consumer channel. A change under the
 prefix sets the subscription's rung bit and signals the event, once
-until `TAKE_RUNG` (0x1309) returns and clears it; the subscriber then
-reads what changed with `CHANGES` (0x1307), one page per call, cut at
+until `TAKE_RUNG` returns and clears it; the subscriber then
+reads what changed with `CHANGES`, one page per call, cut at
 a revision so the window delivered is whole. Every subscription is
 stamped with its opener's owner record and module occupancy, and
 before each signal the module checks that occupancy still stands

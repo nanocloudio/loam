@@ -3021,7 +3021,7 @@ unsafe fn compaction_step(s: &mut ModuleState, syscalls: &super::SyscallTable) {
                 if s.snap_fd >= 0 {
                     let _ = (syscalls.provider_call)(
                         s.snap_fd,
-                        0x0903, /* FS_CLOSE */
+                        super::abi::registry::fs::CLOSE,
                         core::ptr::null_mut(),
                         0,
                     );
@@ -3310,24 +3310,24 @@ pub(super) fn apply_to_arena(
 // store that must be polled cannot be that store.
 
 /// `storage.namespace` contract id.
-pub const CONTRACT_STORAGE_NAMESPACE: u32 = 0x0013;
+pub const CONTRACT_STORAGE_NAMESPACE: u32 = super::abi::registry::storage_namespace::ID as u32;
 
-pub const NS_OP_LOOKUP: u32 = 0x1300;
-pub const NS_OP_STAT: u32 = 0x1301;
-pub const NS_OP_LIST: u32 = 0x1302;
-pub const NS_OP_RENAME: u32 = 0x1303;
-pub const NS_OP_DELETE: u32 = 0x1304;
-pub const NS_OP_SUBSCRIBE: u32 = 0x1305;
-pub const NS_OP_CHANGES: u32 = 0x1307;
-pub const NS_OP_CLOSE: u32 = 0x1306;
-pub const NS_OP_BIND: u32 = 0x1308;
-pub const NS_OP_TAKE_RUNG: u32 = 0x1309;
-pub const NS_OP_CAPS: u32 = 0x13FF;
+pub const NS_OP_LOOKUP: u32 = super::abi::registry::storage_namespace::LOOKUP;
+pub const NS_OP_STAT: u32 = super::abi::registry::storage_namespace::STAT;
+pub const NS_OP_LIST: u32 = super::abi::registry::storage_namespace::LIST;
+pub const NS_OP_RENAME: u32 = super::abi::registry::storage_namespace::RENAME;
+pub const NS_OP_DELETE: u32 = super::abi::registry::storage_namespace::DELETE;
+pub const NS_OP_SUBSCRIBE: u32 = super::abi::registry::storage_namespace::SUBSCRIBE;
+pub const NS_OP_CHANGES: u32 = super::abi::registry::storage_namespace::CHANGES;
+pub const NS_OP_CLOSE: u32 = super::abi::registry::storage_namespace::CLOSE;
+pub const NS_OP_BIND: u32 = super::abi::registry::storage_namespace::BIND;
+pub const NS_OP_TAKE_RUNG: u32 = super::abi::registry::storage_namespace::TAKE_RUNG;
+pub const NS_OP_CAPS: u32 = super::abi::registry::storage_namespace::CAPS;
 
 /// `internal::reconfigure::OWNER_RELEASED`: the kernel tells a provider
 /// that exports `module_observes_owner_release` that an owner is going
 /// away; the argument is its 8-byte owner record.
-pub const OWNER_RELEASED: u32 = 0x0C22;
+pub const OWNER_RELEASED: u32 = super::abi::registry::reconfigure::OWNER_RELEASED;
 
 /// Capability bits this provider sets: BIND(0), RENAME(1), DELETE(2),
 /// SUBSCRIBE(3), CHANGES(4). Every optional op on the surface. The
@@ -3354,7 +3354,7 @@ const E_AGAIN: i32 = -11;
 const E_RETAINED: i32 = super::abi::kernel_abi::errno::ERETAINED;
 /// `TIMER::UNIX_MILLIS`: wall-clock milliseconds, 0 when the platform has
 /// none.
-const TIMER_UNIX_MILLIS: u32 = 0x0608;
+const TIMER_UNIX_MILLIS: u32 = super::abi::registry::timer::UNIX_MILLIS;
 
 /// Whether `path`, in the provider surface's root, is retained now. This
 /// surface applies to the arena inside the call, with no record to carry a
@@ -3538,7 +3538,7 @@ unsafe fn respond(s: &mut ModuleState, syscalls: &super::SyscallTable, byte: u8)
 const CALLER_MODULE: u32 = 10;
 const MODULE_LIVE: u32 = 11;
 const EVENT_OWNER: u32 = 12;
-const EVENT_SIGNAL: u32 = 0x0B01;
+const EVENT_SIGNAL: u32 = super::abi::registry::event::SIGNAL;
 
 /// An 8-byte record from `provider_query(handle, key)`, or `None` when
 /// the kernel answers none. All zero is a record too: module 0 at

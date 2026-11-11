@@ -73,7 +73,7 @@ use super::abi::contracts::mesh::capability as cap;
 use super::abi::contracts::storage::object as obj;
 use super::admin as aw;
 
-pub const CONTRACT_STORAGE_OBJECT: u32 = 0x0014;
+pub const CONTRACT_STORAGE_OBJECT: u32 = super::abi::registry::storage_object::ID as u32;
 
 const GRANTS: usize = super::limits::OBJECT_GRANTS;
 const PENDING: usize = super::limits::OBJECT_PENDING;
@@ -132,14 +132,14 @@ const E_OVERFLOW: i32 = -75;
 const E_RETAINED: i32 = super::abi::kernel_abi::errno::ERETAINED;
 
 // fs
-const FS_READ: u32 = 0x0901;
-const FS_SEEK: u32 = 0x0902;
-const FS_CLOSE: u32 = 0x0903;
-const FS_WRITE: u32 = 0x0906;
-const FS_OPEN_CREATE: u32 = 0x0909;
-const FS_UNLINK: u32 = 0x090A;
+const FS_READ: u32 = super::abi::registry::fs::READ;
+const FS_SEEK: u32 = super::abi::registry::fs::SEEK;
+const FS_CLOSE: u32 = super::abi::registry::fs::CLOSE;
+const FS_WRITE: u32 = super::abi::registry::fs::WRITE;
+const FS_OPEN_CREATE: u32 = super::abi::registry::fs::OPEN_CREATE;
+const FS_UNLINK: u32 = super::abi::registry::fs::UNLINK;
 
-const TIMER_MILLIS: u32 = 0x0602;
+const TIMER_MILLIS: u32 = super::abi::registry::timer::MILLIS;
 const CALLER_OWNER: u32 = super::abi::kernel_abi::query_key::CALLER_OWNER;
 
 // Handles: `[gen:14][kind:4][index:8]` under the contract's tag.

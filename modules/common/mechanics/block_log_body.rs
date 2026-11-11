@@ -38,13 +38,13 @@ pub const LOG_PATH_BUF: usize = 256;
 
 // fluxor fs-contract opcodes — duplicated to keep this body
 // path-includable into multiple consumers.
-const FS_OPEN_CREATE: u32 = 0x0909;
-const FS_READ: u32 = 0x0901;
-const FS_SEEK: u32 = 0x0902;
-const FS_CLOSE: u32 = 0x0903;
-const FS_STAT: u32 = 0x0904;
-const FS_FSYNC: u32 = 0x0905;
-const FS_WRITE: u32 = 0x0906;
+const FS_OPEN_CREATE: u32 = crate::abi::registry::fs::OPEN_CREATE;
+const FS_READ: u32 = crate::abi::registry::fs::READ;
+const FS_SEEK: u32 = crate::abi::registry::fs::SEEK;
+const FS_CLOSE: u32 = crate::abi::registry::fs::CLOSE;
+const FS_STAT: u32 = crate::abi::registry::fs::STAT;
+const FS_FSYNC: u32 = crate::abi::registry::fs::FSYNC;
+const FS_WRITE: u32 = crate::abi::registry::fs::WRITE;
 
 /// `EAGAIN`: not now, nothing consumed. `EINPROGRESS`: taken, not yet
 /// decided. Neither is ever a failure, an end of data or an absence.

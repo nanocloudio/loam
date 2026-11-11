@@ -33,19 +33,19 @@ use super::abi::SyscallTable;
 // fluxor fs-contract opcodes — duplicated here (rather than imported
 // from target/fluxor/fluxor-abi/sdk/contracts/storage/fs.rs) so `wal_io` keeps the same #[path]-
 // inclusion shape every PIC common-body file uses.
-const FS_OPEN: u32 = 0x0900;
-const FS_READ: u32 = 0x0901;
-const FS_SEEK: u32 = 0x0902;
-const FS_CLOSE: u32 = 0x0903;
-const FS_UNLINK: u32 = 0x090A;
-const FS_STAT: u32 = 0x0904;
-const FS_FSYNC: u32 = 0x0905;
-const FS_WRITE: u32 = 0x0906;
-const FS_OPEN_CREATE: u32 = 0x0909;
-const FS_WRITE_ASYNC: u32 = 0x090F;
-const FS_FSYNC_SUBMIT: u32 = 0x0910;
-const FS_FSYNC_POLL: u32 = 0x0911;
-const FS_CAPS: u32 = 0x09FF;
+const FS_OPEN: u32 = super::abi::registry::fs::OPEN;
+const FS_READ: u32 = super::abi::registry::fs::READ;
+const FS_SEEK: u32 = super::abi::registry::fs::SEEK;
+const FS_CLOSE: u32 = super::abi::registry::fs::CLOSE;
+const FS_UNLINK: u32 = super::abi::registry::fs::UNLINK;
+const FS_STAT: u32 = super::abi::registry::fs::STAT;
+const FS_FSYNC: u32 = super::abi::registry::fs::FSYNC;
+const FS_WRITE: u32 = super::abi::registry::fs::WRITE;
+const FS_OPEN_CREATE: u32 = super::abi::registry::fs::OPEN_CREATE;
+const FS_WRITE_ASYNC: u32 = super::abi::registry::fs::WRITE_ASYNC;
+const FS_FSYNC_SUBMIT: u32 = super::abi::registry::fs::FSYNC_SUBMIT;
+const FS_FSYNC_POLL: u32 = super::abi::registry::fs::FSYNC_POLL;
+const FS_CAPS: u32 = super::abi::registry::fs::CAPS;
 
 /// `caps::FSYNC_ASYNC` — the provider implements the pipelined
 /// `WRITE_ASYNC` + `FSYNC_SUBMIT` + `FSYNC_POLL` tier.
