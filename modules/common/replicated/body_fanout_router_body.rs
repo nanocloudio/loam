@@ -82,6 +82,7 @@ const ROUTER_STREAMS: usize = super::limits::ADMIN_STREAMED_PUTFILE;
 use super::member_io::{now_ms, Inflight, MemberPull, Members};
 use super::placement::Fleet;
 use super::placement_wire::MAX_FLEET;
+use fluxor_rt::StepReturn;
 
 /// Member port pairs this router wires.
 pub const MEMBERS: usize = super::limits::ROUTER_MEMBERS;
@@ -327,16 +328,16 @@ unsafe fn free_join(s: &mut ModuleState, idx: u16) {
     }
 }
 
-pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
+pub unsafe fn module_step_impl(state_ptr: *mut u8) -> StepReturn {
     if state_ptr.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let s = &mut *(state_ptr as *mut ModuleState);
     s.ticks = s.ticks.wrapping_add(1);
 
     let syscalls = match s.syscalls.as_ref() {
         Some(t) => t,
-        None => return -1,
+        None => return StepReturn::error(-1),
     };
     s.now_ms = now_ms(syscalls);
 
@@ -465,7 +466,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     }
 
     s.up_tx.flush(syscalls, s.up_out_chan);
-    0
+    StepReturn::Continue
 }
 
 /// New work may be taken: the upstream queue has room for the one

@@ -1,7 +1,7 @@
 #![no_std]
 #![allow(
     dead_code,
-    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+    reason = "mounts the shared bodies and cores from modules/common whole; each shim drives a subset"
 )]
 // Runtime e2e probe: PUT → GET → verify against the body plane.
 // Step 1 sends the PUT; later steps read the answer, send the GET,
@@ -10,16 +10,10 @@
 
 use core::ffi::c_void;
 
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "shared fluxor SDK include; each module uses a subset"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/mechanics/loam_body_wire.rs"]
 mod body_wire;
@@ -48,11 +42,7 @@ unsafe fn fail(sys: &SyscallTable, s: &mut ModuleState, why: &[u8]) {
     s.phase = 3;
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: ModuleState }
 
 #[no_mangle]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
@@ -95,18 +85,18 @@ pub unsafe extern "C" fn module_new(
 /// initialised, and the runtime steps it from one caller at a time.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
         if !s.tx.flush(sys, s.req_out, &s.tx_buf) {
-            return 0;
+            return StepReturn::Continue;
         }
         match s.phase {
             0 => {
                 let Ok(n) = body_wire::encode_put_req(&mut s.tx_buf, BODY) else {
                     fail(sys, s, b"[body_e2e] FAIL encode");
-                    return 0;
+                    return StepReturn::Continue;
                 };
                 s.tx.stage(PUT_CID, n);
                 s.tx.flush(sys, s.req_out, &s.tx_buf);
@@ -114,25 +104,25 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             1 | 2 => {
                 if s.rx.pull(sys, s.resp_in) != body_frame::Pull::Record {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 let want = if s.phase == 1 { PUT_CID } else { GET_CID };
                 if s.rx.cid() != want {
                     fail(sys, s, b"[body_e2e] FAIL cid");
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 if s.phase == 1 {
                     match body_wire::decode_put_resp(s.rx.record()) {
                         Ok(d) => s.digest.copy_from_slice(d),
                         Err(_) => {
                             fail(sys, s, b"[body_e2e] FAIL put-resp");
-                            return 0;
+                            return StepReturn::Continue;
                         }
                     }
                     s.rx.take();
                     let Ok(m) = body_wire::encode_get_req(&mut s.tx_buf, &s.digest) else {
                         fail(sys, s, b"[body_e2e] FAIL get-enc");
-                        return 0;
+                        return StepReturn::Continue;
                     };
                     s.tx.stage(GET_CID, m);
                     s.tx.flush(sys, s.req_out, &s.tx_buf);
@@ -152,6 +142,6 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             _ => {}
         }
-        0
+        StepReturn::Continue
     }
 }

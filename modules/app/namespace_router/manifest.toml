@@ -7,6 +7,8 @@ hardware_targets = ["bcm2712", "linux"]
 # Honest fence class: ReplicatedDurable (via raft_metadata_client) or LocalDurable (WAL-only single node).
 # The channel wire (common/mechanics/loam_wire.rs OP_BIND/OP_RENAME/OP_UNBIND/OP_LOOKUP) carries the same operation set as the canonical namespace contract (fluxor namespace.rs BIND / RENAME / DELETE / LOOKUP); the fused single-round-trip forms are equivalent per the OPEN_CREATE ≡ BIND + OPEN rule.
 provides = ["storage.namespace"]
+provider_contracts = ["storage.namespace"]
+observes_owner_release = true
 
 # Port order matters for the PIC ABI's slot-0 convention:
 # `module_new(in_chan, out_chan, …)` receives the FIRST declared output

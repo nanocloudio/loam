@@ -1,7 +1,7 @@
 #![no_std]
 #![allow(
     dead_code,
-    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+    reason = "mounts the shared bodies and cores from modules/common whole; each shim drives a subset"
 )]
 
 // Loam's ec_body_router PIC module. Step body in
@@ -15,22 +15,12 @@
 
 use core::ffi::c_void;
 
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "shared fluxor SDK include; each module uses a subset"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
+use fluxor_rt::*;
 
-mod sha256 {
-    pub use super::Sha256;
-}
+use fluxor_sdk::crypto::sha256;
 
 #[path = "../../common/mechanics/loam_limits.rs"]
 mod limits;
@@ -70,7 +60,7 @@ const MEMBER_REQ_BASE: u8 = 1;
 const FLEET_EPOCH_IN: u8 = 1;
 
 mod params_def {
-    use super::{p_u32, p_u8, SCHEMA_MAX};
+    use super::{p_u32, p_u8};
 
     pub struct Config {
         pub k: u8,
@@ -78,7 +68,7 @@ mod params_def {
         pub scrub_interval: u32,
     }
 
-    define_params! {
+    fluxor_rt::define_params! {
         Config;
         1, k, u8, 0
             => |s, d, len| { s.k = p_u8(d, len, 0, 0); };
@@ -94,11 +84,7 @@ unsafe fn refuse(sys: &SyscallTable, why: &[u8]) -> i32 {
     -22
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<body::ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: body::ModuleState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -192,6 +178,6 @@ pub unsafe extern "C" fn module_new(
 /// initialised, and the runtime steps it from one caller at a time.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> StepReturn {
     unsafe { body::module_step_impl(state_ptr) }
 }

@@ -30,9 +30,8 @@
 
 use super::abi::SyscallTable;
 
-// fluxor fs-contract opcodes — duplicated here (rather than imported
-// from target/fluxor/fluxor-abi/sdk/contracts/storage/fs.rs) so `wal_io` keeps the same #[path]-
-// inclusion shape every PIC common-body file uses.
+// fluxor fs-contract opcodes, named locally from the registry so `wal_io`
+// keeps the same #[path]-inclusion shape every PIC common-body file uses.
 const FS_OPEN: u32 = super::abi::registry::fs::OPEN;
 const FS_READ: u32 = super::abi::registry::fs::READ;
 const FS_SEEK: u32 = super::abi::registry::fs::SEEK;
@@ -276,7 +275,7 @@ impl Default for WalOpener {
 }
 
 /// FS_STAT into a transient 8-byte buffer; returns the file size
-/// in bytes. Layout per `target/fluxor/fluxor-abi/sdk/contracts/storage/fs.rs:13`:
+/// in bytes. Layout per the fs contract (`fluxor_abi::contracts::storage::fs`):
 /// `[size: u32 LE, mtime: u32 LE]`.
 unsafe fn wal_size(syscalls: &SyscallTable, fd: i32) -> Result<u32, WalReplayError> {
     let mut buf = [0u8; 8];

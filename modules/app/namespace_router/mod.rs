@@ -2,32 +2,25 @@
 // Loam's namespace_router PIC module. The step-body logic lives in
 // `modules/common/mechanics/namespace_pic_body.rs`, path-included below; this
 // file is the thin `#[no_mangle] extern "C"` glue plus the
-// `define_params!` schema that lets the fluxor build tool pack a
+// `fluxor_rt::define_params!` schema that lets the fluxor build tool pack a
 // YAML `params: { wal_path: "..." }` field into the TLV blob the
 // kernel hands to `module_new`.
 #![allow(
     dead_code,
-    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+    reason = "mounts the shared bodies and cores from modules/common whole; each shim drives a subset"
 )]
 use core::ffi::c_void;
 
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "shared fluxor SDK include; each module uses a subset"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
 // Pulls in memset / memcpy / panic helpers the embedded linker
 // needs when the module body initializes fixed-size arrays or uses
 // non-trivial slice indexing. See `fluxor/modules/sdk/runtime.rs`.
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+use fluxor_rt::*;
 
-// `define_params!` macro + TLV/schema constants. Exports `SCHEMA_MAX`
+// `fluxor_rt::define_params!` macro + TLV/schema constants. Exports `SCHEMA_MAX`
 // referenced by the macro-generated `PARAM_SCHEMA` table.
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 #[path = "../../common/mechanics/loam_change_wire.rs"]
 mod change_wire;
@@ -72,9 +65,9 @@ mod body;
 /// Tag 0 is reserved; `0xFF` is the TLV end marker.
 mod params_def {
     use super::body::{ModuleState, WAL_PATH_BUF};
-    use super::{p_u32, SCHEMA_MAX};
+    use super::p_u32;
 
-    define_params! {
+    fluxor_rt::define_params! {
         ModuleState;
         1, wal_path, str, 0
             => |s, d, len| {
@@ -96,13 +89,7 @@ mod params_def {
 // The heap the subscription records come from: the declared figure is
 // the base the manifest's `heap_per_demand` adds the graph's planned
 // subscriptions to (`pack` holds the two equal).
-declare_module_arena_bytes!(body::SUB_ARENA_BASE);
-
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<body::ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: body::ModuleState, arena: body::SUB_ARENA_BASE }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -160,7 +147,7 @@ pub unsafe extern "C" fn module_new(
 /// initialised, and the runtime steps it from one caller at a time.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> StepReturn {
     unsafe { body::module_step_impl(state_ptr) }
 }
 
@@ -169,22 +156,6 @@ pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
 // The loader registers a contract provider by resolving these two
 // symbols. Without them a manifest's `provides = ["storage.namespace"]`
 // advertises a surface nothing can reach.
-
-#[no_mangle]
-#[link_section = ".text.module_provides_contract"]
-pub extern "C" fn module_provides_contract() -> u32 {
-    body::CONTRACT_STORAGE_NAMESPACE
-}
-
-/// Subscribes this provider to `OWNER_RELEASED`: a released owner's
-/// subscriptions and handles are dropped at once (see the body's
-/// `provider_dispatch_impl`). An early reclaim only — a subscription it
-/// misses fails `MODULE_LIVE` before its next signal.
-#[no_mangle]
-#[link_section = ".text.module_observes_owner_release"]
-pub extern "C" fn module_observes_owner_release() -> u32 {
-    1
-}
 
 /// # Safety
 /// The loader passes this module's own state pointer and a caller

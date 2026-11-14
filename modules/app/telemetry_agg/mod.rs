@@ -2,13 +2,8 @@
 
 use core::ffi::c_void;
 
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "shared fluxor SDK include; each module uses a subset"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
+use fluxor_rt::StepReturn;
 
 include!("../../common/mechanics/stub_body.rs");

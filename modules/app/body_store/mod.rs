@@ -1,7 +1,7 @@
 #![no_std]
 #![allow(
     dead_code,
-    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+    reason = "mounts the shared bodies and cores from modules/common whole; each shim drives a subset"
 )]
 
 // Loam's body_store PIC module. Disk-backed content-addressed
@@ -14,18 +14,10 @@
 
 use core::ffi::c_void;
 
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "shared fluxor SDK include; each module uses a subset"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/mechanics/loam_hash.rs"]
 mod hash;
@@ -43,9 +35,7 @@ use wire as body_wire;
 #[path = "../../common/mechanics/body_frame.rs"]
 mod body_frame;
 
-mod sha256 {
-    pub use super::Sha256;
-}
+use fluxor_sdk::crypto::sha256;
 
 #[path = "../../common/mechanics/loam_ec_wire.rs"]
 mod ec_wire;
@@ -59,9 +49,8 @@ mod body;
 
 mod params_def {
     use super::body::{ModuleState, ROOT_DIR_BUF};
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         ModuleState;
         1, root_dir, str, 0
             => |s, d, len| {
@@ -76,11 +65,7 @@ mod params_def {
     }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<body::ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: body::ModuleState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -138,7 +123,7 @@ unsafe fn decode_root_dir_params(state_ptr: *mut u8, params: *const u8, params_l
 /// initialised, and the runtime steps it from one caller at a time.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> StepReturn {
     unsafe {
         let rc = body::module_step_impl(state_ptr);
         let mut line = [0u8; body::TIER_REPORT_LEN];

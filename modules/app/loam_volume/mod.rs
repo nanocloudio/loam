@@ -1,7 +1,7 @@
 #![no_std]
 #![allow(
     dead_code,
-    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+    reason = "mounts the shared bodies and cores from modules/common whole; each shim drives a subset"
 )]
 
 // Loam's loam_volume PIC module: a `storage.block` source over one
@@ -17,22 +17,12 @@
 
 use core::ffi::c_void;
 
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "shared fluxor SDK include; each module uses a subset"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
+use fluxor_rt::*;
 
-mod sha256 {
-    pub use super::Sha256;
-}
+use fluxor_sdk::crypto::sha256;
 
 #[path = "../../common/mechanics/loam_limits.rs"]
 mod limits;
@@ -59,9 +49,8 @@ mod body;
 mod params_def {
     use super::body::{set_path, set_root, ModuleState};
     use super::p_u32;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         ModuleState;
 
         1, root, str, 0
@@ -93,19 +82,7 @@ mod params_def {
     }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<body::ModuleState>() as u32
-}
-
-/// Consumers wait for the lease and the committed root: `Ready` gates
-/// them.
-#[no_mangle]
-#[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 {
-    1
-}
+fluxor_rt::module_facts! { state: body::ModuleState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -207,7 +184,7 @@ unsafe fn parse_extended(s: &mut body::ModuleState, params: *const u8, params_le
 /// initialised, and the runtime steps it from one caller at a time.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> StepReturn {
     unsafe { body::module_step_impl(state_ptr) }
 }
 

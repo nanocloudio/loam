@@ -4,21 +4,14 @@
 // same shape with the block-plane wire and arena.
 #![allow(
     dead_code,
-    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+    reason = "mounts the shared bodies and cores from modules/common whole; each shim drives a subset"
 )]
 use core::ffi::c_void;
 
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "shared fluxor SDK include; each module uses a subset"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/mechanics/loam_hash.rs"]
 mod hash;
@@ -50,9 +43,8 @@ mod body;
 
 mod params_def {
     use super::body::{ModuleState, WAL_PATH_BUF};
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         ModuleState;
         1, wal_path, str, 0
             => |s, d, len| {
@@ -67,11 +59,7 @@ mod params_def {
     }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<body::ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: body::ModuleState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -114,7 +102,7 @@ pub unsafe extern "C" fn module_new(
 /// initialised, and the runtime steps it from one caller at a time.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> StepReturn {
     unsafe { body::module_step_impl(state_ptr) }
 }
 

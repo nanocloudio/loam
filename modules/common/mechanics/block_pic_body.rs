@@ -12,6 +12,8 @@
 // budget is much smaller than the per-binding/per-object PICs.
 // ModuleState size: VolumeSlot(~48B) × 64 + 4 KiB scratch ≈ 7 KiB.
 // Capacity profile — see namespace_pic_body.rs.
+use fluxor_rt::StepReturn;
+
 const ARENA_CAPACITY: usize = super::limits::BLOCK_SLOTS;
 const READ_BUF: usize = 256;
 /// Reassembly capacity for `requests`. Sized to hold a full step's
@@ -334,27 +336,27 @@ unsafe fn resolve_staged(s: &mut ModuleState, syscalls: &super::SyscallTable, du
     }
 }
 
-pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
+pub unsafe fn module_step_impl(state_ptr: *mut u8) -> StepReturn {
     if state_ptr.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let s = &mut *(state_ptr as *mut ModuleState);
     s.ticks = s.ticks.wrapping_add(1);
 
     let syscalls = match s.syscalls.as_ref() {
         Some(t) => t,
-        None => return -1,
+        None => return StepReturn::error(-1),
     };
 
     // The WAL's boot owns the step until it is done: a request taken
     // before the replay finishes would be applied against an arena
     // still missing the log's state. Nothing is read meanwhile.
     if !boot(s, syscalls) {
-        return 0;
+        return StepReturn::Continue;
     }
     if s.boot == BOOT_FAILED && s.boot_reported == 0 {
         s.boot_reported = 1;
-        return BOOT_FAILED_RC;
+        return StepReturn::error(BOOT_FAILED_RC);
     }
 
     // A staged append owns the step until it resolves: the record it
@@ -364,12 +366,12 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     // record it answers has already left `requests` and changed the
     // arena.
     if !s.reply.flush(syscalls.channel_write, s.out_chan) {
-        return 0;
+        return StepReturn::Continue;
     }
 
     if s.wal_staged != 0 {
         match s.appender.poll(syscalls, s.wal_fd) {
-            super::wal::AppendState::Pending => return 0,
+            super::wal::AppendState::Pending => return StepReturn::Continue,
             super::wal::AppendState::Durable => resolve_staged(s, syscalls, true),
             _ => resolve_staged(s, syscalls, false),
         }
@@ -499,7 +501,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         }
         s.req_asm_len = remaining;
     }
-    0
+    StepReturn::Continue
 }
 
 pub(super) fn apply_to_arena(

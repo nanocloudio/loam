@@ -52,7 +52,7 @@ in place, next to the claim it declines to make.
 | `ec_body_router` | Erasure-coded fan-out, reconstructing reads, scrub with re-placement |
 | `placement_router` | Owns fleet membership + broadcasts a FleetEpoch snapshot on every change; consumers cache and compute placement locally via [`common/replicated/loam_placement.rs`](common/replicated/loam_placement.rs) |
 | `body_fanout_router` | Sits between `admin_router` and the `body_store` fleet; all-must-succeed PUT, ranked GET/HEAD fallback with read repair, full-set DELETE, background scrub. A member is a local `body_store` or one on another node, reached through `remote_channel` over mutual TLS; a member that misses an answer's deadline is read last until it answers again |
-| `loam_cli` | The operator applet (`type = "Cli"`), run by `fluxor exec loam -- …`: files, volumes, snapshots and export over the admin wire, through a client-mode `tls` to a node |
+| `loam_cli` | The operator applet, run by `fluxor exec loam -- …`: files, volumes, snapshots and export over the admin wire, through a client-mode `tls` to a node |
 | `telemetry_agg` | An 11-line shim over `stub_body.rs`'s ping/noop/ticks protocol, and the one reserved name in the roster. It is held rather than dropped because the job behind it — metrics, health and readiness — is one a sustained soak cannot run without, so the name will be filled rather than retired. No other placeholder is kept: a reserved name is a cost paid by every reader, the roster, the docs and the tier guard |
 
 ### Replication topology

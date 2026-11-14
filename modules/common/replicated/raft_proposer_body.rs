@@ -23,6 +23,8 @@
 // each logged Propose to the downstream commit path so the
 // producer doesn't have to retry.
 
+use fluxor_rt::StepReturn;
+
 const READ_BUF: usize = 4200; // header + MAX_INNER
 /// Reassembly capacity for `metadata_ops`. Holds one maximal record
 /// plus a read's worth of the next, so a record that straddles reads
@@ -789,16 +791,16 @@ unsafe fn resolve_staged(s: &mut ModuleState, durable: bool) {
     admit_proposal(s, plane, origin, &inner[..inner_len]);
 }
 
-pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
+pub unsafe fn module_step_impl(state_ptr: *mut u8) -> StepReturn {
     if state_ptr.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let s = &mut *(state_ptr as *mut ModuleState);
     s.ticks = s.ticks.wrapping_add(1);
 
     let syscalls = match s.syscalls.as_ref() {
         Some(t) => t,
-        None => return -1,
+        None => return StepReturn::error(-1),
     };
 
     // The WAL's boot owns the step until it is done. A proposal taken
@@ -806,7 +808,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     // taken before the replay finishes would race the replayed ones for
     // pending slots and correlation ids. Nothing is read meanwhile.
     if !boot(state_ptr, syscalls) {
-        return 0;
+        return StepReturn::Continue;
     }
     let s = &mut *(state_ptr as *mut ModuleState);
 
@@ -825,7 +827,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
             .forward_out
             .flush(syscalls.channel_write, s.clustor_out_chan)
     {
-        return 0;
+        return StepReturn::Continue;
     }
 
     // A staged append owns the step until it resolves: the proposal it
@@ -833,7 +835,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     // it, reuse the frame buffer, or be admitted ahead of it.
     if s.wal_staged != 0 {
         match s.appender.poll(syscalls, s.wal_fd) {
-            super::wal::AppendState::Pending => return 0,
+            super::wal::AppendState::Pending => return StepReturn::Continue,
             super::wal::AppendState::Durable => resolve_staged(s, true),
             _ => resolve_staged(s, false),
         }
@@ -1131,5 +1133,5 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         }
     }
 
-    0
+    StepReturn::Continue
 }

@@ -1,7 +1,7 @@
 #![no_std]
 #![allow(
     dead_code,
-    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+    reason = "mounts the shared bodies and cores from modules/common whole; each shim drives a subset"
 )]
 // Bridge: loam_decision_wire ⇄ Clustor replica group.
 //
@@ -29,18 +29,10 @@
 
 use core::ffi::c_void;
 
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "shared fluxor SDK include; each module uses a subset"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/mechanics/loam_limits.rs"]
 mod limits;
@@ -51,9 +43,7 @@ mod reply_out;
 #[path = "../../common/mechanics/loam_decision_wire.rs"]
 mod wire;
 
-mod sha256 {
-    pub use super::Sha256;
-}
+use fluxor_sdk::crypto::sha256;
 
 #[path = "../../common/replicated/commit_proof.rs"]
 mod proof;
@@ -67,7 +57,7 @@ mod facade;
 
 const BUF: usize = 4400;
 
-define_params! {
+fluxor_rt::define_params! {
     ModuleState;
 
     1, witness_quorum, u8, 1
@@ -126,11 +116,7 @@ pub struct ModuleState {
     errors: u32,
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: ModuleState }
 
 #[no_mangle]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
@@ -187,7 +173,7 @@ pub unsafe extern "C" fn module_new(
 /// initialised, and the runtime steps it from one caller at a time.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
@@ -221,7 +207,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // leave the truncated prefix on the wire for the reader to
         // parse across.
         if s.clustor_out >= 0 && !s.out_owed.flush(sys.channel_write, s.clustor_out) {
-            return 0;
+            return StepReturn::Continue;
         }
 
         // ── Proposal path: loam Propose → MSG_CLIENT_PROPOSAL ────────
@@ -370,7 +356,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.asm_len -= off;
             }
         }
-        0
+        StepReturn::Continue
     }
 }
 

@@ -50,6 +50,7 @@
 
 use core::convert::TryInto;
 use core::ffi::c_void;
+use fluxor_rt::StepReturn;
 
 use super::abi::contracts::storage::block::{self as blk, Caps, Cpl, Req};
 use super::abi::fence::Fence;
@@ -1967,13 +1968,13 @@ unsafe fn admin_up(s: &mut ModuleState, t: u64) -> bool {
     super::admin_client::is_ready(&s.client)
 }
 
-pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
+pub unsafe fn module_step_impl(state_ptr: *mut u8) -> StepReturn {
     if state_ptr.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let s = &mut *(state_ptr as *mut ModuleState);
     if s.syscalls.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     if s.phase == P_LEASE && s.job == J_NONE && s.fail == 0 {
         let e = open_error(s);
@@ -1984,14 +1985,14 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     let t = now_ms(s);
     if s.drained != 0 || (s.draining != 0 && s.phase != P_READY && s.job == J_NONE) {
         // Drained, or draining with no lease to give back.
-        return 1;
+        return StepReturn::Done;
     }
     if s.phase != P_FAILED && !admin_up(s, t) {
         return if s.phase == P_FAILED && s.fail_reported == 0 {
             s.fail_reported = 1;
-            s.fail
+            StepReturn::error(s.fail)
         } else {
-            0
+            StepReturn::Continue
         };
     }
     if s.phase != P_FAILED {
@@ -2011,7 +2012,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     if s.phase == P_READY && s.ready_reported == 0 {
         s.ready_reported = 1;
         log(s, 3, b"[loam_volume] ready");
-        return 3;
+        return StepReturn::Ready;
     }
     // An attach that failed is reported once, as the module's own
     // failure. A device that closed after it was ready keeps stepping,
@@ -2019,10 +2020,10 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     if s.phase == P_FAILED && s.fail_reported == 0 {
         s.fail_reported = 1;
         if s.ready_reported == 0 {
-            return s.fail;
+            return StepReturn::error(s.fail);
         }
     }
-    0
+    StepReturn::Continue
 }
 
 /// Begin a drain: admit nothing new, commit what is staged, release the

@@ -66,6 +66,7 @@ use super::abi::contracts::mesh::capability as cap;
 use super::abi::contracts::net::{net_proto, peer_identity};
 use super::abi::contracts::storage::object::grant;
 use super::admin as aw;
+use fluxor_rt::StepReturn;
 
 /// In-graph link port pairs the manifest declares.
 pub const LINKS: usize = 4;
@@ -315,9 +316,9 @@ unsafe fn clock(s: &ModuleState) -> Option<cap::Clock> {
     cap::Clock::from_trusted(&rec)
 }
 
-pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
+pub unsafe fn module_step_impl(state_ptr: *mut u8) -> StepReturn {
     if state_ptr.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let s = &mut *(state_ptr as *mut ModuleState);
     s.ticks = s.ticks.wrapping_add(1);
@@ -334,7 +335,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     }
     flush_request(s);
     flush_answer(s);
-    0
+    StepReturn::Continue
 }
 
 /// Serve every network session with whole frames waiting, while the

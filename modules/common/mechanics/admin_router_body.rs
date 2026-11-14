@@ -28,6 +28,8 @@
 // Buffers derive from the wires' ceilings so nothing the admin surface
 // accepts can truncate on the way through: a read holds the largest
 // request, and `scratch` the largest answer.
+use fluxor_rt::StepReturn;
+
 const READ_BUF: usize = super::admin::REQUEST_MAX;
 const SCRATCH: usize = super::admin::RESPONSE_MAX + 128;
 /// Body frames queued for the body plane while its channel drains: two
@@ -815,23 +817,23 @@ unsafe fn flush_reply(s: &mut ModuleState, syscalls: &super::SyscallTable) -> bo
     true
 }
 
-pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
+pub unsafe fn module_step_impl(state_ptr: *mut u8) -> StepReturn {
     if state_ptr.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let s = &mut *(state_ptr as *mut ModuleState);
     s.ticks = s.ticks.wrapping_add(1);
 
     let syscalls = match s.syscalls.as_ref() {
         Some(t) => t,
-        None => return -1,
+        None => return StepReturn::error(-1),
     };
 
     // An owed answer owns the step until the channel takes it. It
     // lives in `scratch`, which the next request or downstream
     // response would overwrite.
     if !flush_reply(s, syscalls) {
-        return 0;
+        return StepReturn::Continue;
     }
     // Body frames owed to the body plane go out as its channel takes
     // them; work that could forward another is admitted only while a
@@ -1169,7 +1171,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         }
     }
 
-    0
+    StepReturn::Continue
 }
 
 unsafe fn handle_admin_bind(s: &mut ModuleState, syscalls: &super::SyscallTable, bytes: &[u8]) {

@@ -30,6 +30,8 @@
 // requests are served in arrival order, so a parked one holds the
 // requests behind it rather than letting a later answer overtake it.
 
+use fluxor_rt::StepReturn;
+
 const SCRATCH_OUT: usize = super::wire::RECORD_MAX;
 
 // Capacity profile — see namespace_pic_body.rs.
@@ -355,16 +357,16 @@ pub unsafe fn set_root_dir(state_ptr: *mut u8, path: &[u8]) -> bool {
     true
 }
 
-pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
+pub unsafe fn module_step_impl(state_ptr: *mut u8) -> StepReturn {
     if state_ptr.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let s = &mut *(state_ptr as *mut ModuleState);
     s.ticks = s.ticks.wrapping_add(1);
 
     let syscalls = match s.syscalls.as_ref() {
         Some(t) => t,
-        None => return -1,
+        None => return StepReturn::error(-1),
     };
 
     // Owed temporary removals progress whatever else the step does:
@@ -375,7 +377,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     // record lives in `scratch`, which the next request would
     // overwrite.
     if !flush_resp(s) {
-        return 0;
+        return StepReturn::Continue;
     }
 
     let mut handled: u32 = 0;
@@ -443,7 +445,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         handled = handled.wrapping_add(1);
     }
     reap_stale_sessions(s);
-    0
+    StepReturn::Continue
 }
 
 /// Forget the finished request's sequence, so the next one starts

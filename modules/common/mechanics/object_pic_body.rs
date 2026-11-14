@@ -11,6 +11,8 @@
 // WAL replay. See `namespace_pic_body.rs` for the rationale.
 // ModuleState size: ObjectSlot(~48B) × 256 + 4 KiB scratch ≈ 16 KiB.
 // Capacity profile — see namespace_pic_body.rs.
+use fluxor_rt::StepReturn;
+
 const ARENA_CAPACITY: usize = super::limits::OBJECT_SLOTS;
 /// One read holds the largest request record, so a request arriving
 /// one per buffer is never cut.
@@ -357,27 +359,27 @@ pub(super) fn reply_for(fault: ApplyFault) -> u8 {
     }
 }
 
-pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
+pub unsafe fn module_step_impl(state_ptr: *mut u8) -> StepReturn {
     if state_ptr.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let s = &mut *(state_ptr as *mut ModuleState);
     s.ticks = s.ticks.wrapping_add(1);
 
     let syscalls = match s.syscalls.as_ref() {
         Some(t) => t,
-        None => return -1,
+        None => return StepReturn::error(-1),
     };
 
     // The WAL's boot owns the step until it is done: a request taken
     // before the replay finishes would be applied against an arena
     // still missing the log's state. Nothing is read meanwhile.
     if !boot(s, syscalls) {
-        return 0;
+        return StepReturn::Continue;
     }
     if s.boot == BOOT_FAILED && s.boot_reported == 0 {
         s.boot_reported = 1;
-        return BOOT_FAILED_RC;
+        return StepReturn::error(BOOT_FAILED_RC);
     }
 
     // An owed answer owns the step until the channel takes it. The
@@ -385,7 +387,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     // arena, so letting new work overtake it would leave a requester
     // with a mutation and no reply.
     if !s.reply.flush(syscalls.channel_write, s.out_chan) {
-        return 0;
+        return StepReturn::Continue;
     }
 
     // A staged append owns the step until it resolves: the record it
@@ -393,7 +395,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     // it, reuse the frame buffer, or acknowledge ahead of it.
     if s.wal_staged != 0 {
         match s.appender.poll(syscalls, s.wal_fd) {
-            super::wal::AppendState::Pending => return 0,
+            super::wal::AppendState::Pending => return StepReturn::Continue,
             super::wal::AppendState::Durable => resolve_staged(s, syscalls, true),
             _ => resolve_staged(s, syscalls, false),
         }
@@ -539,7 +541,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         }
         s.req_asm_len = remaining;
     }
-    0
+    StepReturn::Continue
 }
 
 /// Serve an OP_OBJ_GET request: look up the slot by id, encode

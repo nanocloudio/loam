@@ -1,7 +1,7 @@
 #![no_std]
 #![allow(
     dead_code,
-    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+    reason = "mounts the shared bodies and cores from modules/common whole; each shim drives a subset"
 )]
 
 // Loam's admin_gate PIC module: terminates every admin session, admits
@@ -12,26 +12,16 @@
 
 use core::ffi::c_void;
 
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "shared fluxor SDK include; each module uses a subset"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::contracts::mesh::capability as cap;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // SHA-256 for scopes and holders, SHA-512 and the field arithmetic
 // Ed25519 needs, and Ed25519 for capability chains: all SDK-owned.
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha384.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
+use fluxor_sdk::crypto::ed25519::*;
+use fluxor_sdk::crypto::sha256::*;
 
 #[path = "../../common/mechanics/loam_limits.rs"]
 mod limits;
@@ -66,7 +56,7 @@ const ROUTER_OUT: u8 = 1;
 const LINK_OUT_BASE: u8 = 2;
 
 mod params_def {
-    use super::{cap, p_u16, SCHEMA_MAX};
+    use super::{cap, p_u16};
 
     pub struct Config {
         pub port: u16,
@@ -108,7 +98,7 @@ mod params_def {
         }
     }
 
-    define_params! {
+    fluxor_rt::define_params! {
         Config;
         1, port, u16, 0
             => |s, d, len| { s.port = p_u16(d, len, 0, 0); };
@@ -122,11 +112,7 @@ unsafe fn refuse(sys: &SyscallTable, why: &[u8]) -> i32 {
     -22
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<body::ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: body::ModuleState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -215,7 +201,7 @@ pub unsafe extern "C" fn module_new(
 /// initialised, and the runtime steps it from one caller at a time.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> StepReturn {
     unsafe { body::module_step_impl(state_ptr) }
 }
 

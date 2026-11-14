@@ -45,6 +45,8 @@
 // Which cap applies is the capacity profile, chosen once in
 // `loam_limits.rs`: a bcm2712 module image is `embedded`, a cargo
 // build takes `--cfg loam_profile` or defaults to `node`.
+use fluxor_rt::StepReturn;
+
 const ARENA_CAPACITY: usize = super::limits::NAMESPACE_SLOTS;
 /// Concurrent `LOOKUP` handles. Bounded like every other arena here:
 /// a provider that can be asked for unlimited handles is a provider
@@ -861,9 +863,9 @@ unsafe fn init_state(
 /// SAFETY: caller must have previously initialized `state_ptr` via
 /// `module_new_impl`; the underlying `super::SyscallTable` must still be
 /// valid.
-pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
+pub unsafe fn module_step_impl(state_ptr: *mut u8) -> StepReturn {
     if state_ptr.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let rc = step_body(state_ptr);
     // Whatever the step applied — a request, a committed record, a
@@ -877,13 +879,13 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
     rc
 }
 
-unsafe fn step_body(state_ptr: *mut u8) -> i32 {
+unsafe fn step_body(state_ptr: *mut u8) -> StepReturn {
     let s = &mut *(state_ptr as *mut ModuleState);
     s.ticks = s.ticks.wrapping_add(1);
 
     let syscalls = match s.syscalls.as_ref() {
         Some(t) => t,
-        None => return -1,
+        None => return StepReturn::error(-1),
     };
 
     // Nothing is taken off any stream until the boot is done: the arena
@@ -891,8 +893,8 @@ unsafe fn step_body(state_ptr: *mut u8) -> i32 {
     if s.boot != BOOT_READY {
         match boot_step(s, syscalls) {
             Ok(true) => {}
-            Ok(false) => return 0,
-            Err(rc) => return rc,
+            Ok(false) => return StepReturn::Continue,
+            Err(rc) => return StepReturn::error(rc),
         }
     }
 
@@ -901,7 +903,7 @@ unsafe fn step_body(state_ptr: *mut u8) -> i32 {
     // arena, so letting new work overtake it would leave a requester
     // with a mutation and no reply.
     if !s.reply.flush(syscalls.channel_write, s.out_chan) {
-        return 0;
+        return StepReturn::Continue;
     }
 
     // A staged append owns the step until it resolves: the record it
@@ -915,13 +917,13 @@ unsafe fn step_body(state_ptr: *mut u8) -> i32 {
             true
         } else {
             match s.appender.poll(syscalls, s.wal_fd) {
-                super::wal::AppendState::Pending => return 0,
+                super::wal::AppendState::Pending => return StepReturn::Continue,
                 super::wal::AppendState::Durable => true,
                 _ => false,
             }
         };
         if !resolve_staged(s, syscalls, durable) {
-            return 0;
+            return StepReturn::Continue;
         }
     }
 
@@ -1169,7 +1171,7 @@ unsafe fn step_body(state_ptr: *mut u8) -> i32 {
     if s.replicated != 0 && !rotating && s.wal_stage == WAL_STAGE_NONE {
         drain_committed(s, syscalls);
     }
-    0
+    StepReturn::Continue
 }
 
 /// Replicated-mode setter, called by the PIC mod.rs after

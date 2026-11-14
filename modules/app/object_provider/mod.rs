@@ -1,7 +1,7 @@
 #![no_std]
 #![allow(
     dead_code,
-    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+    reason = "mounts the shared bodies and cores from modules/common whole; each shim drives a subset"
 )]
 
 // Loam's object_provider PIC module: the canonical `storage.object`
@@ -11,20 +11,13 @@
 
 use core::ffi::c_void;
 
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "shared fluxor SDK include; each module uses a subset"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // SHA-256: content digests for uploads, scope objects for grants.
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
+use fluxor_sdk::crypto::sha256::*;
 
 #[path = "../../common/mechanics/loam_limits.rs"]
 mod limits;
@@ -48,7 +41,7 @@ const SPOOL_DIR_MAX: usize = body::SPOOL_DIR_MAX;
 const VOLUME_MAX: usize = 32;
 
 mod params_def {
-    use super::{SCHEMA_MAX, SPOOL_DIR_MAX, VOLUME_MAX};
+    use super::{SPOOL_DIR_MAX, VOLUME_MAX};
 
     pub struct Config {
         pub spool_dir: [u8; SPOOL_DIR_MAX],
@@ -59,7 +52,7 @@ mod params_def {
         pub too_long: bool,
     }
 
-    define_params! {
+    fluxor_rt::define_params! {
         Config;
         1, spool_dir, str, 0
             => |s, d, len| {
@@ -98,11 +91,7 @@ unsafe fn refuse(sys: &SyscallTable, why: &[u8]) -> i32 {
     -22
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<body::ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: body::ModuleState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -169,7 +158,7 @@ pub unsafe extern "C" fn module_new(
 /// initialised, and the runtime steps it from one caller at a time.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> StepReturn {
     unsafe { body::module_step_impl(state_ptr) }
 }
 
@@ -185,12 +174,6 @@ pub extern "C" fn module_provider_selector(state: *mut u8) -> u32 {
     }
     // SAFETY: the loader passes this module's own initialised state.
     unsafe { (*(state as *const body::ModuleState)).selector }
-}
-
-#[no_mangle]
-#[link_section = ".text.module_provides_contract"]
-pub extern "C" fn module_provides_contract() -> u32 {
-    body::CONTRACT_STORAGE_OBJECT
 }
 
 /// # Safety

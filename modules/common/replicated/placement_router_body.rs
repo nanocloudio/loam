@@ -20,6 +20,8 @@
 // a legal state (epoch advances; consumers cache count=0 and
 // answer "no targets" to upstream PUT attempts).
 
+use fluxor_rt::StepReturn;
+
 const READ_BUF: usize = 64;
 const EMIT_BUF: usize = 64;
 
@@ -219,16 +221,16 @@ unsafe fn apply_fleet_update(s: &mut ModuleState, members: &[u8], domains: &[u8]
     s.updates_applied = s.updates_applied.wrapping_add(1);
 }
 
-pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
+pub unsafe fn module_step_impl(state_ptr: *mut u8) -> StepReturn {
     if state_ptr.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let s = &mut *(state_ptr as *mut ModuleState);
     s.ticks = s.ticks.wrapping_add(1);
 
     let syscalls = match s.syscalls.as_ref() {
         Some(t) => t,
-        None => return -1,
+        None => return StepReturn::error(-1),
     };
 
     // ── 1. Drain incoming FleetUpdate messages. ────────────────
@@ -272,7 +274,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
             Ok(n) => n,
             Err(_) => {
                 s.apply_errors = s.apply_errors.wrapping_add(1);
-                return 0;
+                return StepReturn::Continue;
             }
         };
         let wrote = (syscalls.channel_write)(s.out_chan, s.scratch.as_ptr(), n);
@@ -284,5 +286,5 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         // emitted_current=0 and retry next step.
     }
 
-    0
+    StepReturn::Continue
 }

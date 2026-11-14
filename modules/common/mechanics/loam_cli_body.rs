@@ -53,6 +53,7 @@ use super::admin as aw;
 use super::admin_client as ac;
 use super::manifest as mw;
 use super::map_wire as mp;
+use fluxor_rt::StepReturn;
 
 const MAX_BODY: usize = super::body_wire::MAX_BODY;
 pub const ARGV_MAX: usize = 8192;
@@ -1007,13 +1008,13 @@ fn oid_of(d: &[u8; 32]) -> [u8; 71] {
 
 /// # Safety
 /// `state_ptr` is this module's state, built by `module_new_impl`.
-pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
+pub unsafe fn module_step_impl(state_ptr: *mut u8) -> StepReturn {
     if state_ptr.is_null() {
-        return STEP_DONE;
+        return StepReturn::Done;
     }
     let s = &mut *(state_ptr as *mut ModuleState);
     if s.syscalls.is_null() {
-        return STEP_DONE;
+        return StepReturn::Done;
     }
     let mut b = [0u8; 8];
     (sys(s).provider_call)(-1, TIMER_MILLIS, b.as_mut_ptr(), 8);
@@ -1021,7 +1022,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
 
     if s.done != 0 {
         if !flush_out(s) {
-            return 0;
+            return StepReturn::Continue;
         }
         if s.exit_sent == 0 {
             close_all(s);
@@ -1031,33 +1032,33 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
             if s.exit_chan >= 0 {
                 let code = s.exit_code.to_le_bytes();
                 if (sys(s).channel_write)(s.exit_chan, code.as_ptr(), 4) != 4 {
-                    return 0;
+                    return StepReturn::Continue;
                 }
             }
             s.exit_sent = 1;
         }
-        return STEP_DONE;
+        return StepReturn::Done;
     }
     if s.started == 0 {
         if !start(s) {
-            return 0;
+            return StepReturn::Continue;
         }
         s.started = 1;
         if s.done != 0 {
-            return 0;
+            return StepReturn::Continue;
         }
     }
     if s.nclients < s.want_clients {
         open_sessions(s);
         if s.nclients < s.want_clients || s.done != 0 {
-            return 0;
+            return StepReturn::Continue;
         }
     }
     drive(s);
     if s.out_len as usize > OUT_FLUSH {
         let _ = flush_out(s);
     }
-    0
+    StepReturn::Continue
 }
 
 unsafe fn close_all(s: &mut ModuleState) {

@@ -1,7 +1,7 @@
 #![no_std]
 #![allow(
     dead_code,
-    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+    reason = "mounts the shared bodies and cores from modules/common whole; each shim drives a subset"
 )]
 // Metadata-plane e2e probe: one Propose in, one Committed out,
 // verified. Exercises proposer WAL → clustor_bridge → Raft (WAL,
@@ -9,16 +9,10 @@
 
 use core::ffi::c_void;
 
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "shared fluxor SDK include; each module uses a subset"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/mechanics/loam_decision_wire.rs"]
 mod wire;
@@ -93,11 +87,7 @@ pub struct ModuleState {
     verdict: u8,
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: ModuleState }
 
 #[no_mangle]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
@@ -142,7 +132,7 @@ pub unsafe extern "C" fn module_new(
 /// initialised, and the runtime steps it from one caller at a time.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
@@ -151,7 +141,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             0 => {
                 // Give the group a moment to elect a leader.
                 if s.ticks < 50 {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 let mut inner = [0u8; 256];
                 let inner_len = match encode_probe_bind(&mut inner) {
@@ -159,7 +149,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     None => {
                         s.verdict = 2;
                         s.phase = 2;
-                        return 0;
+                        return StepReturn::Continue;
                     }
                 };
                 let n = match wire::encode_propose(
@@ -172,7 +162,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     Err(_) => {
                         s.verdict = 2;
                         s.phase = 2;
-                        return 0;
+                        return StepReturn::Continue;
                     }
                 };
                 (sys.channel_write)(s.ops_out, s.buf.as_ptr(), n);
@@ -256,7 +246,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             s.verdict = 3;
                             s.phase = 2;
                         }
-                        return 0;
+                        return StepReturn::Continue;
                     }
                 }
                 s.phase = 2;
@@ -270,6 +260,6 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             },
             _ => {}
         }
-        0
+        StepReturn::Continue
     }
 }

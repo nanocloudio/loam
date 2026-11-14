@@ -1,7 +1,7 @@
 #![no_std]
 #![allow(
     dead_code,
-    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+    reason = "mounts the shared bodies and cores from modules/common whole; each shim drives a subset"
 )]
 
 // Metadata-plane throughput counter.
@@ -33,17 +33,10 @@
 
 use core::ffi::c_void;
 
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "shared fluxor SDK include; each module uses a subset"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[allow(
     dead_code,
@@ -70,7 +63,7 @@ const READ_BUF: usize = 512;
 const ASM: usize = 8192;
 const MAX_DRAIN_PER_STEP: u32 = 32;
 
-define_params! {
+fluxor_rt::define_params! {
     ModuleState;
 
     1, report_ticks, u32, 1000
@@ -105,11 +98,7 @@ pub struct ModuleState {
     asm_len: usize,
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: ModuleState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -166,17 +155,17 @@ pub unsafe extern "C" fn module_new(
 /// initialised, and the runtime steps it from one caller at a time.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> StepReturn {
     unsafe {
         if state_ptr.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state_ptr as *mut ModuleState);
         s.ticks = s.ticks.wrapping_add(1);
 
         let syscalls = match s.syscalls.as_ref() {
             Some(t) => t,
-            None => return -1,
+            None => return StepReturn::error(-1),
         };
 
         if s.in_chan >= 0 {
@@ -270,7 +259,7 @@ pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
             s.window_committed = 0;
             s.window_aborted = 0;
         }
-        0
+        StepReturn::Continue
     }
 }
 

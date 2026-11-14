@@ -29,11 +29,10 @@ mode                = "strict"
 
 [[ci.hygiene.allow_crate_root]]
 prefix = "modules/app/"
-reason = """A PIC module mounts the SDK runtime and params by include!, so its \
-compile sees the whole generated surface — define_params! emits parse_tlv and \
-dispatch_param into every module whether it takes params or not. The unused \
-items are not in the module's own source, so there is no item to move the \
-attribute onto: it is a property of how a PIC module is built."""
+reason = """A PIC module mounts the shared step bodies and cores under \
+modules/common/ whole, and each shim drives a subset of them. The unused items \
+are not in the module's own source, so there is no item to move the attribute \
+onto: it is a property of how a PIC module is built."""
 
 [[ci.hygiene.allow_crate_root]]
 prefix = "modules/common/"

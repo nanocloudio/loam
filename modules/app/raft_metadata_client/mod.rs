@@ -1,7 +1,7 @@
 #![no_std]
 #![allow(
     dead_code,
-    reason = "SDK runtime/params include! lands at crate root; each shim drives a subset"
+    reason = "mounts the shared bodies and cores from modules/common whole; each shim drives a subset"
 )]
 
 // Loam's raft_metadata_client PIC module. Implements the proposer
@@ -10,21 +10,14 @@
 //
 // The step body lives in `modules/common/replicated/raft_proposer_body.rs`;
 // this file is the `#[no_mangle] extern "C"` glue and the
-// `define_params!` schema for `wal_path` + `mode`.
+// `fluxor_rt::define_params!` schema for `wal_path` + `mode`.
 
 use core::ffi::c_void;
 
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "shared fluxor SDK include; each module uses a subset"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/mechanics/loam_limits.rs"]
 mod limits;
@@ -53,9 +46,8 @@ mod body;
 
 mod params_def {
     use super::body::{ModuleState, MODE_REPLICATED, MODE_SINGLE_REPLICA, WAL_PATH_BUF};
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         ModuleState;
         1, wal_path, str, 0
             => |s, d, len| {
@@ -81,11 +73,7 @@ mod params_def {
     }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<body::ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: body::ModuleState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -162,7 +150,7 @@ pub unsafe extern "C" fn module_new(
 /// initialised, and the runtime steps it from one caller at a time.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> StepReturn {
     let rc = unsafe { body::module_step_impl(state_ptr) };
     unsafe { heartbeat(state_ptr) };
     rc

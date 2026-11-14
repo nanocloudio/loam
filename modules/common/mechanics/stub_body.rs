@@ -39,11 +39,7 @@ struct ModuleState {
     ops_handled: u32,
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: ModuleState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -80,17 +76,17 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut ModuleState);
         s.ticks = s.ticks.wrapping_add(1);
 
         let syscalls = match s.syscalls.as_ref() {
             Some(t) => t,
-            None => return -1,
+            None => return StepReturn::error(-1),
         };
 
         // Bounded work: handle at most STUB_OPS_PER_STEP opcodes per
@@ -143,17 +139,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             handled = handled.wrapping_add(1);
             s.ops_handled = s.ops_handled.wrapping_add(1);
         }
-        0
+        StepReturn::Continue
     }
-}
-
-// ABI-surface attestation: `fluxor pack` refuses ELFs without this
-// symbol (compile-provenance pinning). Modules that include the full
-// SDK runtime.rs get it there; stub-bodied modules embed it here.
-#[used]
-pub static FLUXOR_ABI_SURFACE: [u8; 32] = crate::abi::abi_surface::ABI_SURFACE_DIGEST;
-
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
 }

@@ -32,6 +32,8 @@
 // read, until the name fence has answered 0; a provider that cannot
 // fence a name fails the open closed, as `wal_io`'s opener does.
 
+use fluxor_rt::StepReturn;
+
 const READ_BUF: usize = 4200;
 const SCRATCH: usize = 4200;
 pub const LOG_PATH_BUF: usize = 256;
@@ -407,30 +409,30 @@ unsafe fn read_records(s: &mut ModuleState, sys: &super::SyscallTable, emit: boo
     }
 }
 
-pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
+pub unsafe fn module_step_impl(state_ptr: *mut u8) -> StepReturn {
     if state_ptr.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let s = &mut *(state_ptr as *mut ModuleState);
     s.ticks = s.ticks.wrapping_add(1);
     let syscalls = match s.syscalls.as_ref() {
         Some(t) => t,
-        None => return -1,
+        None => return StepReturn::error(-1),
     };
 
     if !boot(s, syscalls) {
-        return 0;
+        return StepReturn::Continue;
     }
     if s.phase == PHASE_FAILED && s.fail_reported == 0 {
         s.fail_reported = 1;
-        return s.fail_rc;
+        return StepReturn::error(s.fail_rc);
     }
 
     if s.job != JOB_NONE {
         drive_job(s, syscalls);
         if s.job != JOB_NONE {
             // Undecided: the requests behind it wait for a later step.
-            return 0;
+            return StepReturn::Continue;
         }
     }
     let mut handled: u32 = 0;
@@ -454,7 +456,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
             break;
         }
     }
-    0
+    StepReturn::Continue
 }
 
 unsafe fn drive_job(s: &mut ModuleState, sys: &super::SyscallTable) {

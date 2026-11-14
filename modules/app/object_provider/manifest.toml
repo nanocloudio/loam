@@ -15,6 +15,7 @@ timer_class = "wall_clock"
 # keyed provider (reached by that volume's selector), leaving the graph's
 # default `storage.object` to another; without one it is the default.
 provides = ["storage.object"]
+provider_contracts = ["storage.object"]
 
 [[ports]]
 name = "admin_in"

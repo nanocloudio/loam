@@ -72,6 +72,7 @@
 use super::abi::contracts::mesh::capability as cap;
 use super::abi::contracts::storage::object as obj;
 use super::admin as aw;
+use fluxor_rt::StepReturn;
 
 pub const CONTRACT_STORAGE_OBJECT: u32 = super::abi::registry::storage_object::ID as u32;
 
@@ -2136,13 +2137,13 @@ unsafe fn free_stream(s: &mut ModuleState, i: usize) {
 
 /// # Safety
 /// `state_ptr` is this module's state, built by `module_new_impl`.
-pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
+pub unsafe fn module_step_impl(state_ptr: *mut u8) -> StepReturn {
     if state_ptr.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let s = &mut *(state_ptr as *mut ModuleState);
     if s.syscalls.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     s.now_ms = now_ms(s);
     read_answers(s);
@@ -2158,7 +2159,7 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> i32 {
         }
         sent += 1;
     }
-    0
+    StepReturn::Continue
 }
 
 /// Offer the owed record; true once the link has taken it.
