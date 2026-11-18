@@ -195,7 +195,7 @@ pub struct Probe {
     /// Magic bytes read so far.
     pub got: u8,
     pub fd: i32,
-    pub stat: [u8; 8],
+    pub stat: [u8; crate::abi::contracts::storage::fs::stat::LEN],
     pub magic: [u8; 4],
 }
 
@@ -263,7 +263,7 @@ pub struct Job {
     pub path: [u8; PATH_BUF],
     /// A staging, temporary or swept path.
     pub tmp: [u8; PATH_BUF],
-    pub stat: [u8; 8],
+    pub stat: [u8; crate::abi::contracts::storage::fs::stat::LEN],
     pub wf: WriteFence,
     pub probe: Probe,
     pub dir_n: u16,
@@ -508,7 +508,14 @@ unsafe fn close_fd(sys: &super::SyscallTable, fd: i32) {
     // CLOSE never waits and always releases the descriptor; it reports
     // no writeback outcome, so every durability claim is fenced before
     // it.
-    let _ = (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    let _ = (sys.provider_call)(
+        fd,
+        FS_CLOSE,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
 }
 
 unsafe fn unlink(sys: &super::SyscallTable, path: &[u8]) -> i32 {
@@ -530,8 +537,14 @@ unsafe fn poll_write_fence(
     loop {
         match wf.phase {
             WF_CREATE => {
-                let fd =
-                    (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_ptr() as *mut u8, path.len());
+                let fd = (sys.provider_call)(
+                    -1,
+                    FS_OPEN_CREATE,
+                    path.as_ptr() as *mut u8,
+                    path.len(),
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if pending(fd) {
                     return Poll::Pending;
                 }
@@ -555,7 +568,14 @@ unsafe fn poll_write_fence(
                     wf.phase = WF_FENCE;
                     continue;
                 }
-                let n = (sys.provider_call)(wf.fd, FS_WRITE, rest.as_ptr() as *mut u8, rest.len());
+                let n = (sys.provider_call)(
+                    wf.fd,
+                    FS_WRITE,
+                    core::ptr::null_mut(),
+                    0,
+                    rest.as_ptr() as *mut u8,
+                    rest.len(),
+                );
                 if pending(n) {
                     return Poll::Pending;
                 }
@@ -569,7 +589,14 @@ unsafe fn poll_write_fence(
             _ => {
                 // The fence is re-asked, identically, until it decides;
                 // only then is the file closed.
-                let rc = (sys.provider_call)(wf.fd, FS_FSYNC, core::ptr::null_mut(), 0);
+                let rc = (sys.provider_call)(
+                    wf.fd,
+                    FS_FSYNC,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if pending(rc) {
                     return Poll::Pending;
                 }
@@ -588,7 +615,14 @@ unsafe fn poll_probe(p: &mut Probe, sys: &super::SyscallTable, path: &[u8]) -> P
     loop {
         match p.phase {
             PR_OPEN => {
-                let fd = (sys.provider_call)(-1, FS_OPEN, path.as_ptr() as *mut u8, path.len());
+                let fd = (sys.provider_call)(
+                    -1,
+                    FS_OPEN,
+                    path.as_ptr() as *mut u8,
+                    path.len(),
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if pending(fd) {
                     return ProbePoll::Pending;
                 }
@@ -599,7 +633,14 @@ unsafe fn poll_probe(p: &mut Probe, sys: &super::SyscallTable, path: &[u8]) -> P
                 p.phase = PR_STAT;
             }
             PR_STAT => {
-                let rc = (sys.provider_call)(p.fd, FS_STAT, p.stat.as_mut_ptr(), p.stat.len());
+                let rc = (sys.provider_call)(
+                    p.fd,
+                    FS_STAT,
+                    p.stat.as_mut_ptr(),
+                    p.stat.len(),
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if pending(rc) {
                     return ProbePoll::Pending;
                 }
@@ -620,7 +661,14 @@ unsafe fn poll_probe(p: &mut Probe, sys: &super::SyscallTable, path: &[u8]) -> P
                 while (p.got as usize) < p.magic.len() {
                     let at = p.got as usize;
                     let want = p.magic.len() - at;
-                    let n = (sys.provider_call)(p.fd, FS_READ, p.magic.as_mut_ptr().add(at), want);
+                    let n = (sys.provider_call)(
+                        p.fd,
+                        FS_READ,
+                        core::ptr::null_mut(),
+                        0,
+                        p.magic.as_mut_ptr().add(at),
+                        want,
+                    );
                     if pending(n) {
                         return ProbePoll::Pending;
                     }
@@ -631,7 +679,8 @@ unsafe fn poll_probe(p: &mut Probe, sys: &super::SyscallTable, path: &[u8]) -> P
                 }
                 close_fd(sys, p.fd);
                 p.phase = PR_OPEN;
-                let size = u32::from_le_bytes([p.stat[0], p.stat[1], p.stat[2], p.stat[3]]);
+                let size = crate::abi::contracts::storage::fs::Stat::decode(&p.stat)
+                    .map_or(0, |st| u32::try_from(st.size).unwrap_or(u32::MAX));
                 let keyed = if p.got as usize >= p.magic.len()
                     && super::ec_wire::blob_is_shard_magic(&p.magic)
                 {
@@ -1130,7 +1179,14 @@ unsafe fn handle_get(s: &mut ModuleState, sys: &super::SyscallTable, bytes: &[u8
         match s.job.phase {
             GET_OPEN => {
                 let path = held(&s.job.path, s.job.plen);
-                let fd = (sys.provider_call)(-1, FS_OPEN, path.as_ptr() as *mut u8, path.len());
+                let fd = (sys.provider_call)(
+                    -1,
+                    FS_OPEN,
+                    path.as_ptr() as *mut u8,
+                    path.len(),
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if pending(fd) {
                     return false;
                 }
@@ -1145,12 +1201,14 @@ unsafe fn handle_get(s: &mut ModuleState, sys: &super::SyscallTable, bytes: &[u8
                 // Seek to 0 in case the FD was reused (slot table may
                 // have been recreated; provider seeks to 0 on open, but
                 // be safe).
-                let zero: [u8; 4] = 0u32.to_le_bytes();
+                let mut zero = crate::abi::contracts::storage::fs::seek::encode(0);
                 if pending((sys.provider_call)(
                     s.job.fd,
                     FS_SEEK,
-                    zero.as_ptr() as *mut u8,
-                    4,
+                    zero.as_mut_ptr(),
+                    zero.len(),
+                    core::ptr::null_mut(),
+                    0,
                 )) {
                     return false;
                 }
@@ -1168,7 +1226,14 @@ unsafe fn handle_get(s: &mut ModuleState, sys: &super::SyscallTable, bytes: &[u8
     while (s.job.filled as usize) < cap {
         let at = READ_DST_OFF + s.job.filled as usize;
         let want = cap - s.job.filled as usize;
-        let n = (sys.provider_call)(s.job.fd, FS_READ, s.scratch.as_mut_ptr().add(at), want);
+        let n = (sys.provider_call)(
+            s.job.fd,
+            FS_READ,
+            core::ptr::null_mut(),
+            0,
+            s.scratch.as_mut_ptr().add(at),
+            want,
+        );
         if pending(n) {
             return false;
         }
@@ -1479,7 +1544,14 @@ unsafe fn handle_scan(s: &mut ModuleState, sys: &super::SyscallTable, bytes: &[u
                     Some(d) => d,
                     None => &[],
                 };
-                let fd = (sys.provider_call)(-1, FS_OPENDIR, dir.as_ptr() as *mut u8, dir.len());
+                let fd = (sys.provider_call)(
+                    -1,
+                    FS_OPENDIR,
+                    dir.as_ptr() as *mut u8,
+                    dir.len(),
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if pending(fd) {
                     return false;
                 }
@@ -1493,8 +1565,14 @@ unsafe fn handle_scan(s: &mut ModuleState, sys: &super::SyscallTable, bytes: &[u
             SCAN_READDIR => {
                 // READDIR output: [count: u16 LE][ [len: u8][is_dir: u8][name] ]*
                 // repeated until the provider returns 0 ("drained").
-                let n =
-                    (sys.provider_call)(s.job.dir_fd, FS_READDIR, s.job.dir.as_mut_ptr(), DIR_BUF);
+                let n = (sys.provider_call)(
+                    s.job.dir_fd,
+                    FS_READDIR,
+                    core::ptr::null_mut(),
+                    0,
+                    s.job.dir.as_mut_ptr(),
+                    DIR_BUF,
+                );
                 if pending(n) {
                     return false;
                 }
@@ -1952,7 +2030,14 @@ unsafe fn handle_wopen(s: &mut ModuleState, sys: &super::SyscallTable, bytes: &[
         s.job.phase = WOPEN_CREATE;
     }
     let path = held(&s.job.tmp, s.job.tlen);
-    let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_ptr() as *mut u8, path.len());
+    let fd = (sys.provider_call)(
+        -1,
+        FS_OPEN_CREATE,
+        path.as_ptr() as *mut u8,
+        path.len(),
+        core::ptr::null_mut(),
+        0,
+    );
     if pending(fd) {
         return false;
     }
@@ -2032,7 +2117,14 @@ unsafe fn handle_wappend(s: &mut ModuleState, sys: &super::SyscallTable, bytes: 
         if rest.is_empty() {
             break;
         }
-        let n = (sys.provider_call)(fd, FS_WRITE, rest.as_ptr() as *mut u8, rest.len());
+        let n = (sys.provider_call)(
+            fd,
+            FS_WRITE,
+            core::ptr::null_mut(),
+            0,
+            rest.as_ptr() as *mut u8,
+            rest.len(),
+        );
         if pending(n) {
             // Parked mid-chunk is not idle: keep the reaper off it.
             s.wsessions[wid].last_tick = s.ticks;
@@ -2149,8 +2241,14 @@ unsafe fn handle_wcommit(s: &mut ModuleState, sys: &super::SyscallTable, bytes: 
                 // The stream has written every byte to the temporary and
                 // verified the digest; this fences those bytes, and only
                 // the name is left.
-                let rc =
-                    (sys.provider_call)(s.wsessions[wid].fd, FS_FSYNC, core::ptr::null_mut(), 0);
+                let rc = (sys.provider_call)(
+                    s.wsessions[wid].fd,
+                    FS_FSYNC,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if pending(rc) {
                     return false;
                 }
@@ -2196,8 +2294,14 @@ unsafe fn handle_wcommit(s: &mut ModuleState, sys: &super::SyscallTable, bytes: 
             }
             WC_CREATE => {
                 let path = held(&s.job.path, s.job.plen);
-                let fd =
-                    (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_ptr() as *mut u8, path.len());
+                let fd = (sys.provider_call)(
+                    -1,
+                    FS_OPEN_CREATE,
+                    path.as_ptr() as *mut u8,
+                    path.len(),
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if pending(fd) {
                     return false;
                 }
@@ -2210,9 +2314,15 @@ unsafe fn handle_wcommit(s: &mut ModuleState, sys: &super::SyscallTable, bytes: 
                 s.job.phase = WC_SEEK;
             }
             WC_SEEK => {
-                let zero: [u8; 4] = 0u32.to_le_bytes();
-                let rc =
-                    (sys.provider_call)(s.wsessions[wid].fd, FS_SEEK, zero.as_ptr() as *mut u8, 4);
+                let mut zero = crate::abi::contracts::storage::fs::seek::encode(0);
+                let rc = (sys.provider_call)(
+                    s.wsessions[wid].fd,
+                    FS_SEEK,
+                    zero.as_mut_ptr(),
+                    zero.len(),
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if pending(rc) {
                     return false;
                 }
@@ -2235,6 +2345,8 @@ unsafe fn handle_wcommit(s: &mut ModuleState, sys: &super::SyscallTable, bytes: 
                     let w = (sys.provider_call)(
                         s.job.fd,
                         FS_WRITE,
+                        core::ptr::null_mut(),
+                        0,
                         s.scratch.as_mut_ptr().add(at),
                         len,
                     );
@@ -2259,8 +2371,14 @@ unsafe fn handle_wcommit(s: &mut ModuleState, sys: &super::SyscallTable, bytes: 
                 let want = super::wire::MAX_BODY
                     .min((written - s.job.copied) as usize)
                     .min(s.scratch.len());
-                let n =
-                    (sys.provider_call)(s.wsessions[wid].fd, FS_READ, s.scratch.as_mut_ptr(), want);
+                let n = (sys.provider_call)(
+                    s.wsessions[wid].fd,
+                    FS_READ,
+                    core::ptr::null_mut(),
+                    0,
+                    s.scratch.as_mut_ptr(),
+                    want,
+                );
                 if pending(n) {
                     return false;
                 }
@@ -2272,7 +2390,14 @@ unsafe fn handle_wcommit(s: &mut ModuleState, sys: &super::SyscallTable, bytes: 
                 s.job.copied += n as u64;
             }
             WC_FENCE_OUT => {
-                let rc = (sys.provider_call)(s.job.fd, FS_FSYNC, core::ptr::null_mut(), 0);
+                let rc = (sys.provider_call)(
+                    s.job.fd,
+                    FS_FSYNC,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if pending(rc) {
                     return false;
                 }
@@ -2391,7 +2516,14 @@ unsafe fn handle_range(s: &mut ModuleState, sys: &super::SyscallTable, bytes: &[
         match s.job.phase {
             RANGE_OPEN => {
                 let path = held(&s.job.path, s.job.plen);
-                let fd = (sys.provider_call)(-1, FS_OPEN, path.as_ptr() as *mut u8, path.len());
+                let fd = (sys.provider_call)(
+                    -1,
+                    FS_OPEN,
+                    path.as_ptr() as *mut u8,
+                    path.len(),
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if pending(fd) {
                     return false;
                 }
@@ -2410,6 +2542,8 @@ unsafe fn handle_range(s: &mut ModuleState, sys: &super::SyscallTable, bytes: &[
                     FS_STAT,
                     s.job.stat.as_mut_ptr(),
                     s.job.stat.len(),
+                    core::ptr::null_mut(),
+                    0,
                 );
                 if pending(rc) {
                     return false;
@@ -2419,8 +2553,12 @@ unsafe fn handle_range(s: &mut ModuleState, sys: &super::SyscallTable, bytes: &[
                     nak(s, super::wire::ERR_IO);
                     return true;
                 }
-                let st = s.job.stat;
-                let size = u32::from_le_bytes([st[0], st[1], st[2], st[3]]) as u64;
+                let Some(st) = crate::abi::contracts::storage::fs::Stat::decode(&s.job.stat) else {
+                    close_fd(sys, s.job.fd);
+                    nak(s, super::wire::ERR_IO);
+                    return true;
+                };
+                let size = st.size;
                 let off = s.job.off;
                 if off >= size {
                     close_fd(sys, s.job.fd);
@@ -2438,12 +2576,14 @@ unsafe fn handle_range(s: &mut ModuleState, sys: &super::SyscallTable, bytes: &[
                 s.job.phase = RANGE_SEEK;
             }
             RANGE_SEEK => {
-                let off32: [u8; 4] = (s.job.off as u32).to_le_bytes();
+                let mut at = crate::abi::contracts::storage::fs::seek::encode(s.job.off);
                 if pending((sys.provider_call)(
                     s.job.fd,
                     FS_SEEK,
-                    off32.as_ptr() as *mut u8,
-                    4,
+                    at.as_mut_ptr(),
+                    at.len(),
+                    core::ptr::null_mut(),
+                    0,
                 )) {
                     return false;
                 }
@@ -2459,7 +2599,14 @@ unsafe fn handle_range(s: &mut ModuleState, sys: &super::SyscallTable, bytes: &[
     while (s.job.filled as usize) < take {
         let at = 5 + s.job.filled as usize;
         let want = take - s.job.filled as usize;
-        let n = (sys.provider_call)(s.job.fd, FS_READ, s.scratch.as_mut_ptr().add(at), want);
+        let n = (sys.provider_call)(
+            s.job.fd,
+            FS_READ,
+            core::ptr::null_mut(),
+            0,
+            s.scratch.as_mut_ptr().add(at),
+            want,
+        );
         if pending(n) {
             return false;
         }

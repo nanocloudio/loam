@@ -261,7 +261,7 @@ pub struct ModuleState {
     pub evictions: u32,
     pub snap_misses: u32,
     /// Live `namespace::SUBSCRIBE` registrations: each watches a prefix
-    /// and rings its subscriber's own kernel event (see `ring_sub`).
+    /// and rings the doorbell the kernel handed for it (see `ring_sub`).
     /// Records live on the module's heap, a page of `SUB_PAGE_RECORDS`
     /// at a time, taken as subscriptions arrive and never returned; this
     /// table indexes the pages, and its length is the handle band's
@@ -291,28 +291,26 @@ pub struct ModuleState {
 
 /// One `namespace::SUBSCRIBE` registration: a doorbell, not a stream.
 /// Nothing is ever written to a subscriber's channel; a change under
-/// the prefix sets `rung` and signals `event`, once until the
-/// subscriber takes it (`TAKE_RUNG`), and the subscriber reads what
-/// changed with `CHANGES`.
+/// the prefix rings the subscription's doorbell, its handle polls ready,
+/// and the subscriber reads what changed with `CHANGES`.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct SubSlot {
     pub in_use: u8,
-    /// Set by a change under the prefix, cleared by `TAKE_RUNG`. While
-    /// set, further changes signal nothing: the take is still to come.
-    pub rung: u8,
+    /// A ring came before the doorbell did (or `FLAG_RING_NOW` asked for
+    /// one): rung when the doorbell arrives.
+    pub owed: u8,
     /// A `CHANGES` naming this subscription was answered `EAGAIN`; the
-    /// next step rings it again, so a consumer woken only by its event
-    /// never stalls on the wait.
+    /// next step rings it again, so a consumer woken only by its
+    /// doorbell never stalls on the wait.
     pub deferred: u8,
     /// The subscriber's owner record: the handle answers it alone.
     pub owner: [u8; 8],
     /// The subscriber's module occupancy (`CALLER_MODULE`): checked
-    /// with `MODULE_LIVE` and against the event's owner before every
-    /// signal.
+    /// with `MODULE_LIVE` before every ring.
     pub module: [u8; 8],
-    /// The subscriber's tagged event fd.
-    pub event: i32,
+    /// The doorbell the kernel handed for it (`BIND_DOORBELL`), or -1.
+    pub doorbell: i32,
     /// While free: the next free record, as its index + 1 (0 = none).
     pub next_free: u32,
     pub prefix_len: u16,
@@ -3026,6 +3024,8 @@ unsafe fn compaction_step(s: &mut ModuleState, syscalls: &super::SyscallTable) {
                         super::abi::registry::fs::CLOSE,
                         core::ptr::null_mut(),
                         0,
+                        core::ptr::null_mut(),
+                        0,
                     );
                 }
                 s.snap_active = 1;
@@ -3306,7 +3306,7 @@ pub(super) fn apply_to_arena(
 //
 // What is implemented is exactly what `CAPS` reports, and that is now
 // the whole surface: the mandatory read ops, BIND, RENAME, DELETE,
-// and the change ops (SUBSCRIBE, TAKE_RUNG, CHANGES). They are what make loam
+// and the change ops (SUBSCRIBE, CHANGES). They are what make loam
 // usable as a control-plane store — level-triggered reconciliation is
 // how nanocloud's forty store-consuming modules are built, and a
 // store that must be polled cannot be that store.
@@ -3323,7 +3323,6 @@ pub const NS_OP_SUBSCRIBE: u32 = super::abi::registry::storage_namespace::SUBSCR
 pub const NS_OP_CHANGES: u32 = super::abi::registry::storage_namespace::CHANGES;
 pub const NS_OP_CLOSE: u32 = super::abi::registry::storage_namespace::CLOSE;
 pub const NS_OP_BIND: u32 = super::abi::registry::storage_namespace::BIND;
-pub const NS_OP_TAKE_RUNG: u32 = super::abi::registry::storage_namespace::TAKE_RUNG;
 pub const NS_OP_CAPS: u32 = super::abi::registry::storage_namespace::CAPS;
 
 /// `internal::reconfigure::OWNER_RELEASED`: the kernel tells a provider
@@ -3336,8 +3335,8 @@ pub const OWNER_RELEASED: u32 = super::abi::registry::reconfigure::OWNER_RELEASE
 /// mandatory read ops carry no bit.
 pub const NS_CAPS: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4);
 
-/// Subscription handles are returned above the LOOKUP handle space so
-/// `CLOSE` can tell the two apart from the handle alone — the contract
+/// Subscription indices are answered above the LOOKUP index space so
+/// `CLOSE` can tell the two apart from the index alone — the contract
 /// gives CLOSE one opcode for both.
 const SUB_HANDLE_BASE: i32 = 0x4000;
 
@@ -3367,7 +3366,14 @@ unsafe fn surface_retained(s: &ModuleState, path: &[u8]) -> Result<bool, i32> {
         return Ok(false);
     };
     let mut clock = [0u8; 8];
-    let rc = (sys.provider_call)(-1, TIMER_UNIX_MILLIS, clock.as_mut_ptr(), clock.len());
+    let rc = (sys.provider_call)(
+        -1,
+        TIMER_UNIX_MILLIS,
+        clock.as_mut_ptr(),
+        clock.len(),
+        core::ptr::null_mut(),
+        0,
+    );
     let now = if rc < 0 { 0 } else { u64::from_le_bytes(clock) };
     match key_retained(s, sys, &[], path, now) {
         Ok((retained, _)) => Ok(retained),
@@ -3426,27 +3432,6 @@ unsafe fn achieved_fence(s: &ModuleState) -> super::abi::fence::Fence {
     }
 }
 
-/// Pull the trailing `[fence_out_ptr u64][fence_out_cap u16]` pair
-/// out of an argument buffer at `off`. Absent is legal — a caller
-/// that does not want the fence simply omits it.
-fn read_fence_out(a: &[u8], off: usize) -> (*mut u8, usize) {
-    if a.len() < off + 10 {
-        return (core::ptr::null_mut(), 0);
-    }
-    let p = u64::from_le_bytes([
-        a[off],
-        a[off + 1],
-        a[off + 2],
-        a[off + 3],
-        a[off + 4],
-        a[off + 5],
-        a[off + 6],
-        a[off + 7],
-    ]);
-    let c = u16::from_le_bytes([a[off + 8], a[off + 9]]) as usize;
-    (p as *mut u8, c)
-}
-
 /// A stable 16-byte source id for a namespace root.
 ///
 /// `ViewConsistent` and `RevisionMonotone` carry an explicit source
@@ -3468,8 +3453,8 @@ fn view_source(root: &[u8]) -> [u8; 16] {
     out
 }
 
-/// Write a VIEW fence — what revision this read observed — into a
-/// caller-supplied out-parameter.
+/// Write a VIEW fence — what revision this read observed — into the
+/// fence trailer of `arg`.
 ///
 /// Distinct from `write_fence_out`, which reports DURABILITY. A read
 /// has not committed anything, so a durability fence answers a
@@ -3478,27 +3463,18 @@ fn view_source(root: &[u8]) -> [u8; 16] {
 /// The contract says so explicitly, and a snapshot depends on it: a
 /// manifest is only a point-in-time record if something states which
 /// point in time.
-unsafe fn write_view_fence_out(root: &[u8], revision: u64, ptr: *mut u8, cap: usize) {
-    if ptr.is_null() || cap < super::abi::fence::WIRE_MAX_LEN {
-        return;
-    }
-    let buf = core::slice::from_raw_parts_mut(ptr, cap);
-    let _ = super::abi::fence::Fence::ViewConsistent {
+fn write_view_fence_out(root: &[u8], revision: u64, arg: &mut [u8]) {
+    let f = super::abi::fence::Fence::ViewConsistent {
         source: view_source(root),
         revision,
-    }
-    .encode(buf);
+    };
+    let _ = super::abi::fence::trailer::put(arg, &f);
 }
 
-/// Write the achieved fence into a caller-supplied out-parameter.
-/// A short or absent buffer is the caller's error, not a reason to
-/// fail the operation that already happened.
-unsafe fn write_fence_out(s: &ModuleState, ptr: *mut u8, cap: usize) {
-    if ptr.is_null() || cap < super::abi::fence::WIRE_MAX_LEN {
-        return;
-    }
-    let buf = core::slice::from_raw_parts_mut(ptr, cap);
-    let _ = achieved_fence(s).encode(buf);
+/// Write the achieved fence into the fence trailer of `arg`, which the
+/// op's codec has already found room for.
+unsafe fn write_fence_out(s: &ModuleState, arg: &mut [u8]) {
+    let _ = super::abi::fence::trailer::put(arg, &achieved_fence(s));
 }
 
 /// Write a response, if anyone is listening.
@@ -3535,12 +3511,9 @@ unsafe fn respond(s: &mut ModuleState, syscalls: &super::SyscallTable, byte: u8)
 
 // ── Subscriptions: doorbells on the subscriber's own event ─────────
 
-/// `query_key::CALLER_MODULE`, `MODULE_LIVE`, `EVENT_OWNER` and
-/// `kernel_abi::event::SIGNAL`.
-const CALLER_MODULE: u32 = 10;
-const MODULE_LIVE: u32 = 11;
-const EVENT_OWNER: u32 = 12;
-const EVENT_SIGNAL: u32 = super::abi::registry::event::SIGNAL;
+/// `query_key::CALLER_MODULE` and `MODULE_LIVE`.
+const CALLER_MODULE: u32 = super::abi::registry::kernel::QUERY_CALLER_MODULE;
+const MODULE_LIVE: u32 = super::abi::registry::kernel::QUERY_MODULE_LIVE;
 
 /// An 8-byte record from `provider_query(handle, key)`, or `None` when
 /// the kernel answers none. All zero is a record too: module 0 at
@@ -3569,18 +3542,21 @@ unsafe fn module_live(s: &ModuleState, module: [u8; 8]) -> bool {
     ((*s.syscalls).provider_query)(-1, MODULE_LIVE, rec.as_mut_ptr(), rec.len()) == 1
 }
 
-/// The module occupancy owning event `event`, or `None` when it is not
-/// allocated.
-unsafe fn event_owner(s: &ModuleState, event: i32) -> Option<[u8; 8]> {
-    query8(s, event, EVENT_OWNER)
-}
-
-/// Signal `event`; negative when the kernel refused (a freed event).
-unsafe fn signal(s: &ModuleState, event: i32) -> i32 {
+/// Ring doorbell `d`; negative when the kernel refused it.
+unsafe fn ring_doorbell(s: &ModuleState, d: i32) -> i32 {
+    use super::abi::kernel_abi::doorbell;
     if s.syscalls.is_null() {
         return E_INVAL;
     }
-    ((*s.syscalls).provider_call)(event, EVENT_SIGNAL, core::ptr::null_mut(), 0)
+    let mut arg = doorbell::ring_arg(d as u32);
+    ((*s.syscalls).provider_call)(
+        -1,
+        doorbell::DOORBELL_RING,
+        arg.as_mut_ptr(),
+        arg.len(),
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 /// The subscription records that exist: every taken page's.
@@ -3624,8 +3600,9 @@ fn release_sub(s: &mut ModuleState, i: usize) {
         return;
     }
     r.in_use = 0;
-    r.rung = 0;
+    r.owed = 0;
     r.deferred = 0;
+    r.doorbell = -1;
     r.next_free = head;
     s.sub_free = i as u32 + 1;
 }
@@ -3638,26 +3615,32 @@ fn reap_sub(s: &mut ModuleState, i: usize) {
     }
 }
 
-/// Ring subscription `i`: set its rung bit and signal its event, once
-/// until it is taken. Before every signal the subscriber's module
-/// occupancy must still stand and its event still be that module's — a
-/// subscription whose module is gone, or whose event slot another
-/// module now holds, is dropped and never signalled, so a stale handle
-/// costs nobody a wake. `false` when it was dropped.
+/// Ring subscription `i`'s doorbell, or owe the ring until the doorbell
+/// arrives. Before every ring the subscriber's module occupancy must
+/// still stand — a subscription whose module is gone is dropped and
+/// never rung, so a stale handle costs nobody a wake. `false` when it
+/// was dropped.
 unsafe fn ring_sub(s: &mut ModuleState, i: usize) -> bool {
     let Some(r) = sub(s, i).filter(|r| r.in_use != 0) else {
         return false;
     };
-    if r.rung != 0 {
-        return true;
-    }
-    let (module, event) = (r.module, r.event);
-    if !module_live(s, module) || event_owner(s, event) != Some(module) || signal(s, event) < 0 {
+    let (module, doorbell) = (r.module, r.doorbell);
+    if !module_live(s, module) {
         reap_sub(s, i);
         return false;
     }
+    if doorbell < 0 {
+        if let Some(r) = sub_mut(s, i) {
+            r.owed = 1;
+        }
+        return true;
+    }
     if let Some(r) = sub_mut(s, i) {
-        r.rung = 1;
+        r.owed = 0;
+    }
+    if ring_doorbell(s, doorbell) < 0 {
+        reap_sub(s, i);
+        return false;
     }
     true
 }
@@ -3686,26 +3669,29 @@ unsafe fn ring_changes(s: &mut ModuleState) {
         }
         return;
     }
-    for k in 0..s.bindings.capacity() {
-        let Some(slot) = s.bindings.slot_ref(k) else {
+    // Each subscription rings once for the pass, however many of the
+    // keys it watches moved.
+    for i in 0..sub_cap(s) {
+        let Some(r) = sub(s, i).filter(|r| r.in_use != 0) else {
             continue;
         };
-        if !slot.occupied || slot.root_len != 0 || slot.change_rev <= from || slot.change_rev > head
-        {
-            continue;
-        }
-        let mut key = [0u8; super::limits::MAX_PATH];
-        let kl = (slot.path_len as usize).min(key.len());
-        key[..kl].copy_from_slice(&slot.path()[..kl]);
-        for i in 0..sub_cap(s) {
-            let watching = sub(s, i).is_some_and(|r| {
-                r.in_use != 0
-                    && r.rung == 0
-                    && super::change_wire::under_prefix(&key[..kl], r.prefix())
-            });
-            if watching {
-                ring_sub(s, i);
+        let mut watching = false;
+        for k in 0..s.bindings.capacity() {
+            let Some(slot) = s.bindings.slot_ref(k) else {
+                continue;
+            };
+            if slot.occupied
+                && slot.root_len == 0
+                && slot.change_rev > from
+                && slot.change_rev <= head
+                && super::change_wire::under_prefix(slot.path(), r.prefix())
+            {
+                watching = true;
+                break;
             }
+        }
+        if watching {
+            ring_sub(s, i);
         }
     }
 }
@@ -3902,13 +3888,15 @@ unsafe fn sub_by_caller(s: &ModuleState, idx: usize) -> bool {
 ///
 /// # Safety
 /// `state_ptr` must point at an initialized `ModuleState`; `arg` must
-/// be valid for `arg_len` bytes.
+/// be valid for `arg_len` bytes and `data` for `data_len`, disjoint.
 pub unsafe fn provider_dispatch_impl(
     state_ptr: *mut u8,
     handle: i32,
     opcode: u32,
     arg: *mut u8,
     arg_len: usize,
+    data: *mut u8,
+    data_len: usize,
 ) -> i32 {
     if state_ptr.is_null() {
         return E_INVAL;
@@ -3933,7 +3921,17 @@ pub unsafe fn provider_dispatch_impl(
         return if s.boot == BOOT_FAILED { E_IO } else { E_AGAIN };
     }
 
-    let rc = dispatch_op(s, handle, opcode, arg, arg_len);
+    let a: &mut [u8] = if arg.is_null() || arg_len == 0 {
+        &mut []
+    } else {
+        core::slice::from_raw_parts_mut(arg, arg_len)
+    };
+    let d: &mut [u8] = if data.is_null() || data_len == 0 {
+        &mut []
+    } else {
+        core::slice::from_raw_parts_mut(data, data_len)
+    };
+    let rc = dispatch_op(s, handle, opcode, a, d);
     // A write through this surface rings its subscribers before the
     // call returns, so the wake is as prompt as the change.
     ring_changes(s);
@@ -3944,29 +3942,29 @@ unsafe fn dispatch_op(
     s: &mut ModuleState,
     handle: i32,
     opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
+    a: &mut [u8],
+    d: &mut [u8],
 ) -> i32 {
+    use super::abi::contracts::storage::namespace as ns;
     if opcode == super::abi::fence::QUERY_OP {
-        if arg.is_null() || arg_len < super::abi::fence::WIRE_MAX_LEN {
+        if a.len() < super::abi::fence::WIRE_MAX_LEN {
             return E_INVAL;
         }
-        let buf = core::slice::from_raw_parts_mut(arg, arg_len);
-        return match achieved_fence(s).encode(buf) {
+        return match achieved_fence(s).encode(a) {
             Some(n) => n as i32,
             None => E_INVAL,
         };
     }
 
     match opcode {
-        NS_OP_CAPS => NS_CAPS as i32,
+        NS_OP_CAPS => super::abi::kernel_abi::caps_word::answer(a, NS_CAPS),
 
-        // `arg` is the path; returns a handle onto the resolved entry.
+        // `arg` is the path; answers an index onto the resolved entry.
         NS_OP_LOOKUP => {
-            if arg.is_null() || arg_len == 0 {
+            if a.is_empty() {
                 return E_INVAL;
             }
-            let path = core::slice::from_raw_parts(arg, arg_len);
+            let path: &[u8] = a;
             match live_slot(s, path) {
                 Some((idx, rev)) => alloc_handle(s, idx, rev),
                 None => E_NOENT,
@@ -3989,10 +3987,10 @@ unsafe fn dispatch_op(
             };
             let target = entry.object_id();
             let need = 1 + 8 + 2 + target.len();
-            if arg.is_null() || arg_len < need {
+            if a.len() < need {
                 return E_INVAL;
             }
-            let out = core::slice::from_raw_parts_mut(arg, arg_len);
+            let out = a;
             out[0] = entry.kind;
             out[1..9].copy_from_slice(&entry.revision.to_le_bytes());
             out[9..11].copy_from_slice(&(target.len() as u16).to_le_bytes());
@@ -4003,12 +4001,11 @@ unsafe fn dispatch_op(
         // One opcode closes both handle kinds; the base tells them
         // apart, so a caller never has to say which it holds.
         NS_OP_CLOSE => {
+            // The kernel closes a subscription handle for its minter
+            // alone, so the record is freed whoever is on the provider
+            // stack: a teardown closes it from another frame.
             if handle >= SUB_HANDLE_BASE {
-                let idx = (handle - SUB_HANDLE_BASE) as usize;
-                if !sub_by_caller(s, idx) {
-                    return E_INVAL;
-                }
-                release_sub(s, idx);
+                release_sub(s, (handle - SUB_HANDLE_BASE) as usize);
                 return 0;
             }
             let idx = handle as usize;
@@ -4019,47 +4016,12 @@ unsafe fn dispatch_op(
             0
         }
 
-        // [path_len u16][path][kind][flags][target_len u16][target]
-        // [fence_out_ptr u64][fence_out_cap u16]
+        // `namespace::bind`: the record, then the fence trailer.
         NS_OP_BIND => {
-            if arg.is_null() || arg_len < 2 {
+            let Some(req) = ns::bind::parse_request(a) else {
                 return E_INVAL;
-            }
-            let a = core::slice::from_raw_parts(arg, arg_len);
-            let path_len = u16::from_le_bytes([a[0], a[1]]) as usize;
-            let mut off = 2usize;
-            if arg_len < off + path_len + 4 {
-                return E_INVAL;
-            }
-            let path = &a[off..off + path_len];
-            off += path_len;
-            let kind = a[off];
-            let flags = a[off + 1];
-            off += 2;
-            let target_len = u16::from_le_bytes([a[off], a[off + 1]]) as usize;
-            off += 2;
-            if arg_len < off + target_len {
-                return E_INVAL;
-            }
-            let target = &a[off..off + target_len];
-            off += target_len;
-
-            let (fence_ptr, fence_cap) = if arg_len >= off + 10 {
-                let p = u64::from_le_bytes([
-                    a[off],
-                    a[off + 1],
-                    a[off + 2],
-                    a[off + 3],
-                    a[off + 4],
-                    a[off + 5],
-                    a[off + 6],
-                    a[off + 7],
-                ]);
-                let c = u16::from_le_bytes([a[off + 8], a[off + 9]]) as usize;
-                (p as *mut u8, c)
-            } else {
-                (core::ptr::null_mut(), 0)
             };
+            let (path, kind, flags, target) = (req.path, req.kind, req.flags, req.target);
 
             // The arena gates a rebind on a strictly higher revision.
             // Without a caller-supplied revision, a replace request
@@ -4098,7 +4060,7 @@ unsafe fn dispatch_op(
                 .bind(&[], path, target, kind, revision, &super::state::Meta::NONE)
             {
                 Ok(_) => {
-                    write_fence_out(s, fence_ptr, fence_cap);
+                    write_fence_out(s, a);
                     0
                 }
                 Err(super::state::ApplyError::KeyTooLong) => E_INVAL,
@@ -4110,16 +4072,12 @@ unsafe fn dispatch_op(
             }
         }
 
+        // `namespace::delete`: the record, then the fence trailer.
         NS_OP_DELETE => {
-            if arg.is_null() || arg_len < 2 {
+            let Some(req) = ns::delete::parse_request(a) else {
                 return E_INVAL;
-            }
-            let a = core::slice::from_raw_parts(arg, arg_len);
-            let path_len = u16::from_le_bytes([a[0], a[1]]) as usize;
-            if arg_len < 2 + path_len {
-                return E_INVAL;
-            }
-            let path = &a[2..2 + path_len];
+            };
+            let path = req.path;
             match live_volume(s, path) {
                 Ok(true) => return E_PERM,
                 Ok(false) => {}
@@ -4135,34 +4093,21 @@ unsafe fn dispatch_op(
                 None => return E_NOENT,
             };
             match s.bindings.tombstone(&[], path, rev.wrapping_add(1)) {
-                Ok(_) => 0,
+                Ok(_) => {
+                    write_fence_out(s, a);
+                    0
+                }
                 Err(super::state::ApplyError::KeyTooLong) => E_INVAL,
                 Err(_) => E_NOENT,
             }
         }
 
-        // [from_len u16][from][to_len u16][to]
-        // [fence_out_ptr u64][fence_out_cap u16]
+        // `namespace::rename`: the record, then the fence trailer.
         NS_OP_RENAME => {
-            if arg.is_null() || arg_len < 2 {
+            let Some(req) = ns::rename::parse_request(a) else {
                 return E_INVAL;
-            }
-            let a = core::slice::from_raw_parts(arg, arg_len);
-            let from_len = u16::from_le_bytes([a[0], a[1]]) as usize;
-            let mut off = 2usize;
-            if arg_len < off + from_len + 2 {
-                return E_INVAL;
-            }
-            let from = &a[off..off + from_len];
-            off += from_len;
-            let to_len = u16::from_le_bytes([a[off], a[off + 1]]) as usize;
-            off += 2;
-            if arg_len < off + to_len {
-                return E_INVAL;
-            }
-            let to = &a[off..off + to_len];
-            off += to_len;
-            let (fence_ptr, fence_cap) = read_fence_out(a, off);
+            };
+            let (from, to) = (req.src, req.dst);
 
             // Rename is a move, and a reader of the change stream has to
             // see both halves: the new name bound, and the old one gone.
@@ -4240,36 +4185,19 @@ unsafe fn dispatch_op(
             if src.expires_at != 0 {
                 let _ = s.bindings.set_expiry(&[], to, src.expires_at);
             }
-            write_fence_out(s, fence_ptr, fence_cap);
+            write_fence_out(s, a);
             0
         }
 
-        // [prefix_len u16][prefix][event i32][flags u8] (the contract's
-        // `subscribe` codec). Returns a subscription handle.
-        NS_OP_SUBSCRIBE => {
-            if arg.is_null() {
-                return E_INVAL;
-            }
-            ns_subscribe(s, core::slice::from_raw_parts(arg, arg_len))
-        }
+        // `namespace::subscribe`. Answers the subscription's index; the
+        // kernel then hands its doorbell (`BIND_DOORBELL`).
+        NS_OP_SUBSCRIBE => ns_subscribe(s, a),
 
-        // [event i32][out_ptr u64][out_cap u32] (the `take` codec).
-        NS_OP_TAKE_RUNG => {
-            if arg.is_null() {
-                return E_INVAL;
-            }
-            ns_take_rung(s, core::slice::from_raw_parts(arg, arg_len))
-        }
+        super::abi::kernel_abi::doorbell::BIND_DOORBELL => sub_bind_doorbell(s, handle, a),
 
-        // [prefix_len u16][prefix][sub i32][token_len u16][token]
-        // [out_ptr u64][out_cap u32][fence_ptr u64][fence_cap u16] (the
-        // `changes` codec): one bounded page of what changed.
-        NS_OP_CHANGES => {
-            if arg.is_null() {
-                return E_INVAL;
-            }
-            ns_changes(s, core::slice::from_raw_parts(arg, arg_len))
-        }
+        // `namespace::changes`: one bounded page of what changed, into
+        // `data`, its view fence into the trailer.
+        NS_OP_CHANGES => ns_changes(s, handle, a, d),
 
         // List the keys under a prefix, one page per call.
         //
@@ -4280,16 +4208,14 @@ unsafe fn dispatch_op(
         // it. The prefix filters the PATH, which is the only thing
         // this state can filter on.
         //
-        // arg is
-        //   [prefix_len u16][prefix][cursor_len u16][cursor]
-        //   [out_buf u64][out_cap u32][fence_ptr u64][fence_cap u16]
+        // `namespace::list`: the page into `data`, its view fence into
+        // the trailer.
         NS_OP_LIST => {
             use super::abi::contracts::storage::handle::STORAGE_KEY_MAX;
             use super::abi::contracts::storage::namespace::list as nl;
-            if arg.is_null() || s.syscalls.is_null() {
+            if s.syscalls.is_null() {
                 return E_INVAL;
             }
-            let a = core::slice::from_raw_parts(arg, arg_len);
             let Some(req) = nl::parse_request(a) else {
                 return E_INVAL;
             };
@@ -4300,11 +4226,7 @@ unsafe fn dispatch_op(
             {
                 return E_INVAL;
             }
-            let out = core::slice::from_raw_parts_mut(
-                req.out_ptr as usize as *mut u8,
-                req.out_cap as usize,
-            );
-            let mut w = nl::PageWriter::new(out);
+            let mut w = nl::PageWriter::new(d);
             let mut last = [0u8; STORAGE_KEY_MAX];
             let mut last_len = 0usize;
             let mut overflow = false;
@@ -4343,12 +4265,7 @@ unsafe fn dispatch_op(
             let Some(n) = w.finish(cursor) else {
                 return E_NOMEM;
             };
-            write_view_fence_out(
-                &[],
-                s.bindings.change_seq(),
-                req.fence_out_ptr as usize as *mut u8,
-                req.fence_out_cap as usize,
-            );
+            write_view_fence_out(&[], s.bindings.change_seq(), a);
             n as i32
         }
 
@@ -4365,13 +4282,12 @@ fn tombstone_rev(s: &ModuleState, path: &[u8]) -> Option<u64> {
     }
 }
 
-/// `SUBSCRIBE`: a subscription that rings the caller's own event
-/// whenever something under the prefix changes. The event must be the
-/// calling module's (`EVENT_OWNER`); the subscription is stamped with
-/// the caller's owner record and module occupancy, and is idempotent on
-/// (owner, occupancy, event, prefix). A workload owner past its quota,
-/// or a full table — each after its dead subscriptions are swept — is
-/// `ENOMEM`.
+/// `SUBSCRIBE`: a subscription whose doorbell rings whenever something
+/// under the prefix changes. It is stamped with the caller's owner record
+/// and module occupancy; the kernel wraps the index answered here in a
+/// handle of the caller's alone and hands the doorbell next
+/// (`sub_bind_doorbell`). A workload owner past its quota, or a full
+/// table — each after its dead subscriptions are swept — is `ENOMEM`.
 unsafe fn ns_subscribe(s: &mut ModuleState, a: &[u8]) -> i32 {
     use super::abi::contracts::storage::namespace::subscribe;
     let Some(req) = subscribe::parse(a) else {
@@ -4383,31 +4299,6 @@ unsafe fn ns_subscribe(s: &mut ModuleState, a: &[u8]) -> i32 {
     let (Some(owner), Some(module)) = (caller_owner(s), caller_module(s)) else {
         return E_INVAL;
     };
-    // The event must be the calling module's own: a subscription never
-    // wakes anyone else.
-    if event_owner(s, req.event) != Some(module) {
-        return E_INVAL;
-    }
-    let ring_now = req.flags & subscribe::FLAG_RING_NOW != 0;
-    // The same subscription asked again: the same handle.
-    for i in 0..sub_cap(s) {
-        let same = sub(s, i).is_some_and(|r| {
-            r.in_use != 0
-                && r.owner == owner
-                && r.module == module
-                && r.event == req.event
-                && r.prefix() == req.prefix
-        });
-        if same {
-            if ring_now {
-                if let Some(r) = sub_mut(s, i) {
-                    r.rung = 0;
-                }
-                ring_sub(s, i);
-            }
-            return SUB_HANDLE_BASE + i as i32;
-        }
-    }
     // A workload owner's quota; the system owner (slot 0) holds the
     // node's own controllers and is bounded by the table alone.
     let quota = if s.sub_quota == 0 {
@@ -4431,59 +4322,40 @@ unsafe fn ns_subscribe(s: &mut ModuleState, a: &[u8]) -> i32 {
     r.prefix_len = n as u16;
     r.owner = owner;
     r.module = module;
-    r.event = req.event;
-    r.rung = 0;
+    r.doorbell = -1;
+    r.owed = u8::from(req.flags & subscribe::FLAG_RING_NOW != 0);
     r.deferred = 0;
     r.next_free = 0;
     r.in_use = 1;
-    if ring_now {
-        ring_sub(s, i);
-    }
     SUB_HANDLE_BASE + i as i32
 }
 
-/// `TAKE_RUNG`: the caller's subscriptions on an event that have rung
-/// since it last asked, their bits cleared. When they do not all fit,
-/// `more` is set and the event signalled again, so the rest is taken on
-/// the next wake.
-unsafe fn ns_take_rung(s: &mut ModuleState, a: &[u8]) -> i32 {
-    use super::abi::contracts::storage::namespace::take;
-    let Some(req) = take::parse(a) else {
+/// `kernel::BIND_DOORBELL` for subscription `handle`: keep the doorbell,
+/// and ring it at once when a ring is owed. Refused for anything but a
+/// subscription of the caller's owner not yet bound.
+unsafe fn sub_bind_doorbell(s: &mut ModuleState, handle: i32, a: &[u8]) -> i32 {
+    use super::abi::kernel_abi::{doorbell, errno::EBADF};
+    let Some((d, _)) = doorbell::parse_bind(a) else {
         return E_INVAL;
     };
-    // SAFETY: the contract names `out_cap` writable bytes at `out_ptr`.
-    let out =
-        core::slice::from_raw_parts_mut(req.out_ptr as usize as *mut u8, req.out_cap as usize);
-    let Some(mut w) = take::Writer::new(out) else {
-        return E_NOMEM;
-    };
-    let (Some(owner), Some(module)) = (caller_owner(s), caller_module(s)) else {
-        return E_INVAL;
-    };
-    let mut more = false;
-    for i in 0..sub_cap(s) {
-        let Some(r) = sub_mut(s, i) else {
-            continue;
-        };
-        if r.in_use == 0
-            || r.rung == 0
-            || r.event != req.event
-            || r.owner != owner
-            || r.module != module
-        {
-            continue;
-        }
-        if !w.push(SUB_HANDLE_BASE + i as i32) {
-            more = true;
-            break;
-        }
-        r.rung = 0;
+    if handle < SUB_HANDLE_BASE {
+        return EBADF;
     }
-    let n = w.finish(more);
-    if more && event_owner(s, req.event) == Some(module) {
-        let _ = signal(s, req.event);
+    let i = (handle - SUB_HANDLE_BASE) as usize;
+    if !sub_by_caller(s, i) {
+        return EBADF;
     }
-    n as i32
+    let owed = match sub_mut(s, i) {
+        Some(r) if r.doorbell < 0 => {
+            r.doorbell = d as i32;
+            r.owed != 0
+        }
+        _ => return EBADF,
+    };
+    if owed {
+        ring_sub(s, i);
+    }
+    0
 }
 
 /// Provider-issued relist continuation: `[T_RELIST][pinned u64][cursor]`.
@@ -4500,19 +4372,24 @@ const T_RELIST: u8 = 1;
 /// by construction. A window the arena can no longer vouch for (below
 /// the change horizon: a slot evicted, a tombstone compacted away) or
 /// one past the head is LOST, never a short answer.
-unsafe fn ns_changes(s: &mut ModuleState, a: &[u8]) -> i32 {
+unsafe fn ns_changes(s: &mut ModuleState, handle: i32, a: &mut [u8], out: &mut [u8]) -> i32 {
     use super::abi::contracts::storage::namespace::changes;
+    // The subscription this read serves: one of the caller's, or none
+    // (`-1`). A read refused for now rings it again once the cause
+    // clears.
+    let sub = if handle < 0 {
+        None
+    } else if handle >= SUB_HANDLE_BASE && sub_by_caller(s, (handle - SUB_HANDLE_BASE) as usize) {
+        Some((handle - SUB_HANDLE_BASE) as usize)
+    } else {
+        return super::abi::kernel_abi::errno::EBADF;
+    };
     let Some(req) = changes::parse_request(a) else {
         return E_INVAL;
     };
-    // SAFETY: the contract names `out_cap` writable bytes at `out_ptr`.
-    let out =
-        core::slice::from_raw_parts_mut(req.out_ptr as usize as *mut u8, req.out_cap as usize);
-    // The subscription this read serves, when it is the caller's: a read
-    // refused for now rings it again once the cause clears.
-    let sub = (req.sub >= SUB_HANDLE_BASE)
-        .then(|| (req.sub - SUB_HANDLE_BASE) as usize)
-        .filter(|&i| sub_by_caller(s, i));
+    let mut prefix = [0u8; super::abi::contracts::storage::namespace::PATH_MAX];
+    let plen = req.prefix.len();
+    prefix[..plen].copy_from_slice(req.prefix);
     let head = s.bindings.change_seq();
     let rc = match req.token.len() {
         0 => relist_page(s, req.prefix, head, &[], out),
@@ -4534,12 +4411,7 @@ unsafe fn ns_changes(s: &mut ModuleState, a: &[u8]) -> i32 {
         return E_AGAIN;
     }
     if rc >= 0 {
-        write_view_fence_out(
-            req.prefix,
-            head,
-            req.fence_out_ptr as usize as *mut u8,
-            req.fence_out_cap as usize,
-        );
+        write_view_fence_out(&prefix[..plen], head, a);
     }
     rc
 }

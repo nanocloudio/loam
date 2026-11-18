@@ -52,11 +52,14 @@ const DIAL_RETRY_MS: u64 = 20;
 /// `EAGAIN`, as a transport's `MSG_ERROR` carries it.
 const EAGAIN: i32 = -11;
 
-pub const NET_FRAME_MAX: usize =
-    net_proto::FRAME_HDR + net_proto::CONN_ID_LEN + net_proto::MAX_DATA_FRAGMENT;
+pub const NET_FRAME_MAX: usize = crate::NET_IN_ACCEPTS_RECORD;
+/// The data one transport frame carries.
+const NET_DATA_MAX: usize = net_proto::data_capacity(crate::NET_IN_ACCEPTS_RECORD);
+/// The request bytes one `CMD_SEND` carries.
+const SEND_MAX: usize = net_proto::data_capacity(crate::NET_OUT_MAX_RECORD);
 /// Bytes of the gate's answers held: one whole answer, and behind it the
 /// network fragment, or the link record, that may follow it.
-const RX_MAX: usize = 4 + aw::RESPONSE_MAX + net_proto::MAX_DATA_FRAGMENT;
+const RX_MAX: usize = 4 + aw::RESPONSE_MAX + NET_DATA_MAX;
 const CAP_ANSWER_FRAME_MAX: usize = cap::FRAME_HDR + cap::ANSWER_GRANTED;
 
 pub const T_LINK: u8 = 1;
@@ -258,7 +261,14 @@ pub unsafe fn load_chain_file(
     ld: &mut ChainFileLoad,
 ) -> LoadPoll {
     if ld.phase == LOAD_IDLE {
-        let fd = (sys.provider_call)(-1, FS_OPEN, path.as_ptr() as *mut u8, path.len());
+        let fd = (sys.provider_call)(
+            -1,
+            FS_OPEN,
+            path.as_ptr() as *mut u8,
+            path.len(),
+            core::ptr::null_mut(),
+            0,
+        );
         if fd == EAGAIN || fd == EINPROGRESS {
             return LoadPoll::Pending;
         }
@@ -279,7 +289,14 @@ pub unsafe fn load_chain_file(
             // refused, not cut short.
             ld.phase = LOAD_PROBE;
             let mut probe = [0u8; 1];
-            let n = (sys.provider_call)(ld.fd, FS_READ, probe.as_mut_ptr(), 1);
+            let n = (sys.provider_call)(
+                ld.fd,
+                FS_READ,
+                core::ptr::null_mut(),
+                0,
+                probe.as_mut_ptr(),
+                1,
+            );
             if n == EAGAIN || n == EINPROGRESS {
                 return LoadPoll::Pending;
             }
@@ -292,6 +309,8 @@ pub unsafe fn load_chain_file(
         let n = (sys.provider_call)(
             ld.fd,
             FS_READ,
+            core::ptr::null_mut(),
+            0,
             scratch.as_mut_ptr().add(filled),
             scratch.len() - filled,
         );
@@ -326,7 +345,14 @@ pub unsafe fn load_chain_file(
 /// Close the load's descriptor and re-arm it, answering `out`.
 unsafe fn end_load(sys: &super::SyscallTable, ld: &mut ChainFileLoad, out: LoadPoll) -> LoadPoll {
     if ld.fd >= 0 {
-        (sys.provider_call)(ld.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            ld.fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
     }
     ld.fd = -1;
     ld.filled = 0;
@@ -467,9 +493,8 @@ unsafe fn flush(c: &mut Client, sys: &super::SyscallTable) {
             }
             while c.tx_sent < c.tx_len {
                 let at = c.tx_sent as usize;
-                let take = (c.tx_len as usize - at).min(net_proto::MAX_CMD_DATA);
-                let mut f =
-                    [0u8; net_proto::FRAME_HDR + net_proto::CONN_ID_LEN + net_proto::MAX_CMD_DATA];
+                let take = (c.tx_len as usize - at).min(SEND_MAX);
+                let mut f = [0u8; crate::NET_OUT_MAX_RECORD];
                 let plen = net_proto::CONN_ID_LEN + take;
                 f[0] = net_proto::CMD_SEND;
                 put(&mut f[1..3], &(plen as u16).to_le_bytes());
@@ -635,10 +660,13 @@ unsafe fn net_dial(c: &mut Client, sys: &super::SyscallTable) {
         let mut p = [0u8; net_proto::CONNECT_TO_MAX];
         let n = net_proto::write_connect_to(
             &mut p,
-            net_proto::SOCK_TYPE_STREAM,
-            port.unwrap_or(7443),
-            &target,
-            Some(c.tag),
+            &net_proto::ConnectTo {
+                sock_type: net_proto::SOCK_TYPE_STREAM,
+                flags: 0,
+                port: port.unwrap_or(7443),
+                target,
+                requester_tag: c.tag,
+            },
         );
         if n == 0 {
             fail(c, WHY_TRANSPORT);
@@ -653,7 +681,7 @@ unsafe fn net_dial(c: &mut Client, sys: &super::SyscallTable) {
 unsafe fn net_read(c: &mut Client, sys: &super::SyscallTable) {
     for _ in 0..16 {
         // Read only with room for the fragment a frame may carry.
-        if c.rx_len as usize + net_proto::MAX_DATA_FRAGMENT > RX_MAX {
+        if c.rx_len as usize + NET_DATA_MAX > RX_MAX {
             break;
         }
         let have = c.nf_len as usize;
@@ -696,24 +724,30 @@ unsafe fn net_read(c: &mut Client, sys: &super::SyscallTable) {
 
 unsafe fn net_event(c: &mut Client, sys: &super::SyscallTable, ty: u8, p: &[u8]) {
     match ty {
-        net_proto::MSG_CONNECTED if p.len() >= net_proto::CONNECTED_FIXED => {
-            let (conn, tag) = net_proto::connected_parts(p);
-            if tag != c.tag {
+        net_proto::MSG_CONNECTED => {
+            let Some(cn) = net_proto::connected_parts(p) else {
+                return;
+            };
+            let conn = cn.conn_id;
+            if cn.requester_tag != c.tag {
                 return;
             }
             if c.connected != 0 {
-                net_cmd(c, sys, net_proto::CMD_CLOSE, &conn.to_le_bytes());
+                net_cmd(c, sys, net_proto::CMD_CLOSE, &net_proto::close(conn, false));
                 return;
             }
             c.conn = conn;
             c.connected = 1;
             c.status = ST_PRESENTING;
         }
-        net_proto::MSG_DATA if p.len() > net_proto::CONN_ID_LEN => {
-            if c.connected == 0 || net_proto::conn_id(p) != c.conn {
+        net_proto::MSG_DATA => {
+            let Some((conn, data)) = net_proto::data_parts(p) else {
+                return;
+            };
+            if c.connected == 0 || conn != c.conn {
                 return;
             }
-            if !absorb(c, &p[net_proto::CONN_ID_LEN..]) {
+            if !absorb(c, data) {
                 fail(c, WHY_PROTOCOL);
                 return;
             }
@@ -721,9 +755,17 @@ unsafe fn net_event(c: &mut Client, sys: &super::SyscallTable, ty: u8, p: &[u8])
                 let _ = recv(c);
             }
         }
-        net_proto::MSG_CLOSED if p.len() >= net_proto::CONN_ID_LEN => {
-            if c.connected != 0 && net_proto::conn_id(p) == c.conn {
-                net_cmd(c, sys, net_proto::CMD_CLOSE, &c.conn.to_le_bytes());
+        net_proto::MSG_CLOSED => {
+            let Some((conn, _)) = net_proto::closed_parts(p) else {
+                return;
+            };
+            if c.connected != 0 && conn == c.conn {
+                net_cmd(
+                    c,
+                    sys,
+                    net_proto::CMD_CLOSE,
+                    &net_proto::close(c.conn, false),
+                );
                 fail(c, WHY_TRANSPORT);
             } else if c.connected == 0 && c.dialed != 0 && c.shared == 0 {
                 // A session `tls` ended before its handshake completed —
@@ -734,8 +776,10 @@ unsafe fn net_event(c: &mut Client, sys: &super::SyscallTable, ty: u8, p: &[u8])
                 fail(c, WHY_TRANSPORT);
             }
         }
-        net_proto::MSG_ERROR if p.len() > net_proto::CONN_ID_LEN => {
-            let (conn, errno, tag) = net_proto::error_parts(p);
+        net_proto::MSG_ERROR => {
+            let Some((conn, errno, tag)) = net_proto::error_parts(p) else {
+                return;
+            };
             if c.connected == 0 && tag == c.tag && errno as i32 == EAGAIN {
                 // Another dial over the same transport is in flight: dial
                 // again once it has had time to finish.
@@ -765,7 +809,7 @@ pub fn share_transport(c: &mut Client) {
 
 /// `c` can take the largest fragment a frame may carry.
 pub fn has_room(c: &Client) -> bool {
-    c.rx_len as usize + net_proto::MAX_DATA_FRAGMENT <= RX_MAX
+    c.rx_len as usize + NET_DATA_MAX <= RX_MAX
 }
 
 /// Hand `c` one transport event.
@@ -788,10 +832,12 @@ pub unsafe fn feed_all(clients: &mut [Client], sys: &super::SyscallTable, ty: u8
         feed(&mut clients[k], sys, ty, payload);
         k += 1;
     }
-    if ty != net_proto::MSG_CLOSED || payload.len() < net_proto::CONN_ID_LEN {
+    if ty != net_proto::MSG_CLOSED {
         return;
     }
-    let conn = net_proto::conn_id(payload);
+    let Some((conn, _)) = net_proto::closed_parts(payload) else {
+        return;
+    };
     let mut dialing = usize::MAX;
     let mut k = 0;
     while k < clients.len() {
@@ -877,7 +923,12 @@ pub unsafe fn close(c: &mut Client, sys: &super::SyscallTable) {
         }
         _ => {
             if c.connected != 0 {
-                net_cmd(c, sys, net_proto::CMD_CLOSE, &c.conn.to_le_bytes());
+                net_cmd(
+                    c,
+                    sys,
+                    net_proto::CMD_CLOSE,
+                    &net_proto::close(c.conn, false),
+                );
                 c.connected = 0;
             }
         }

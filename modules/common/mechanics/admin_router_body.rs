@@ -1262,7 +1262,14 @@ const TIMER_UNIX_MILLIS: u32 = crate::abi::registry::timer::UNIX_MILLIS;
 /// last one issued; 0 when there is no wall clock.
 unsafe fn stamp_now(s: &mut ModuleState, syscalls: &super::SyscallTable) -> u64 {
     let mut clock = [0u8; 8];
-    let rc = (syscalls.provider_call)(-1, TIMER_UNIX_MILLIS, clock.as_mut_ptr(), clock.len());
+    let rc = (syscalls.provider_call)(
+        -1,
+        TIMER_UNIX_MILLIS,
+        clock.as_mut_ptr(),
+        clock.len(),
+        core::ptr::null_mut(),
+        0,
+    );
     let wall = if rc < 0 { 0 } else { u64::from_le_bytes(clock) };
     if wall == 0 {
         return 0;

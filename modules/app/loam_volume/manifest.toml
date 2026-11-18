@@ -11,6 +11,8 @@ hardware_targets = ["bcm2712", "linux"]
 # ack proves. It carries no replica-group commit proof, so this module
 # does not claim `ReplicatedDurable` even on a replicated node.
 provides = ["storage.block"]
+provider_contracts = ["storage.block"]
+grants = ["lend.borrow"]
 deferred_ready = true
 
 # Acks from the node's admin surface: `admin_router.admin_out` when
@@ -45,6 +47,7 @@ name = "blocks"
 direction = "output"
 content_type = "OctetStream"
 required = true
+serves = "storage.block"
 
 [[ports]]
 name = "admin_out"

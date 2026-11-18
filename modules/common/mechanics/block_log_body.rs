@@ -191,7 +191,14 @@ pub unsafe fn open_log_from_state(state_ptr: *mut u8) -> i32 {
 unsafe fn boot(s: &mut ModuleState, sys: &super::SyscallTable) -> bool {
     if s.phase == PHASE_OPEN {
         let len = (s.log_path_len as usize).min(LOG_PATH_BUF);
-        let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.log_path.as_mut_ptr(), len);
+        let fd = (sys.provider_call)(
+            -1,
+            FS_OPEN_CREATE,
+            s.log_path.as_mut_ptr(),
+            len,
+            core::ptr::null_mut(),
+            0,
+        );
         if pending(fd) {
             return false;
         }
@@ -250,7 +257,14 @@ unsafe fn boot(s: &mut ModuleState, sys: &super::SyscallTable) -> bool {
 /// acknowledged: close it and fail the open closed.
 unsafe fn name_unfenceable(s: &mut ModuleState, sys: &super::SyscallTable) -> bool {
     if s.log_fd >= 0 {
-        let _ = (sys.provider_call)(s.log_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        let _ = (sys.provider_call)(
+            s.log_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
     }
     s.log_fd = -1;
     s.fail_rc = FAIL_NAME;
@@ -282,7 +296,7 @@ unsafe fn read_some(
     let mut filled = at;
     while filled < end {
         let want = end - filled;
-        let n = (sys.provider_call)(fd, FS_READ, buf.add(filled), want);
+        let n = (sys.provider_call)(fd, FS_READ, core::ptr::null_mut(), 0, buf.add(filled), want);
         if pending(n) {
             return ReadSome::Pending(filled);
         }
@@ -307,8 +321,15 @@ unsafe fn read_records(s: &mut ModuleState, sys: &super::SyscallTable, emit: boo
     loop {
         match s.stage {
             RD_SEEK => {
-                let zero: [u8; 4] = 0u32.to_le_bytes();
-                let rc = (sys.provider_call)(fd, FS_SEEK, zero.as_ptr() as *mut u8, 4);
+                let mut zero = crate::abi::contracts::storage::fs::seek::encode(0);
+                let rc = (sys.provider_call)(
+                    fd,
+                    FS_SEEK,
+                    zero.as_mut_ptr(),
+                    zero.len(),
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if pending(rc) {
                     return None;
                 }
@@ -398,8 +419,16 @@ unsafe fn read_records(s: &mut ModuleState, sys: &super::SyscallTable, emit: boo
                     return Some(());
                 }
                 // Seek file pointer back to end so subsequent appends work.
-                let off_bytes = (s.current_offset as i32).to_le_bytes();
-                let rc = (sys.provider_call)(fd, FS_SEEK, off_bytes.as_ptr() as *mut u8, 4);
+                let mut off_bytes =
+                    crate::abi::contracts::storage::fs::seek::encode(s.current_offset);
+                let rc = (sys.provider_call)(
+                    fd,
+                    FS_SEEK,
+                    off_bytes.as_mut_ptr(),
+                    off_bytes.len(),
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if pending(rc) {
                     return None;
                 }
@@ -516,9 +545,16 @@ unsafe fn drive_append(s: &mut ModuleState, sys: &super::SyscallTable) {
         match s.stage {
             AP_SEEK => {
                 // Seek to end (current_offset).
-                let off_bytes = (s.current_offset as i32).to_le_bytes();
-                let seek_rc =
-                    (sys.provider_call)(s.log_fd, FS_SEEK, off_bytes.as_ptr() as *mut u8, 4);
+                let mut off_bytes =
+                    crate::abi::contracts::storage::fs::seek::encode(s.current_offset);
+                let seek_rc = (sys.provider_call)(
+                    s.log_fd,
+                    FS_SEEK,
+                    off_bytes.as_mut_ptr(),
+                    off_bytes.len(),
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if pending(seek_rc) {
                     return;
                 }
@@ -535,8 +571,14 @@ unsafe fn drive_append(s: &mut ModuleState, sys: &super::SyscallTable) {
                     continue;
                 }
                 let want = end - off;
-                let wrote =
-                    (sys.provider_call)(s.log_fd, FS_WRITE, s.scratch.as_mut_ptr().add(off), want);
+                let wrote = (sys.provider_call)(
+                    s.log_fd,
+                    FS_WRITE,
+                    core::ptr::null_mut(),
+                    0,
+                    s.scratch.as_mut_ptr().add(off),
+                    want,
+                );
                 if pending(wrote) {
                     return;
                 }
@@ -549,7 +591,14 @@ unsafe fn drive_append(s: &mut ModuleState, sys: &super::SyscallTable) {
             }
             _ => {
                 // Re-asked byte-identically until it decides.
-                let rc = (sys.provider_call)(s.log_fd, FS_FSYNC, core::ptr::null_mut(), 0);
+                let rc = (sys.provider_call)(
+                    s.log_fd,
+                    FS_FSYNC,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if pending(rc) {
                     return;
                 }

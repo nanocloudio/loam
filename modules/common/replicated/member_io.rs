@@ -47,7 +47,14 @@ const TIMER_MILLIS: u32 = crate::abi::registry::timer::MILLIS;
 /// The monotonic clock, in milliseconds.
 pub unsafe fn now_ms(sys: &super::SyscallTable) -> u64 {
     let mut buf = [0u8; 8];
-    (sys.provider_call)(-1, TIMER_MILLIS, buf.as_mut_ptr(), buf.len());
+    (sys.provider_call)(
+        -1,
+        TIMER_MILLIS,
+        buf.as_mut_ptr(),
+        buf.len(),
+        core::ptr::null_mut(),
+        0,
+    );
     u64::from_le_bytes(buf)
 }
 

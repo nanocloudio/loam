@@ -30,7 +30,9 @@ buffer_size  = 8192
 name         = "net_in"
 direction    = "input"
 index        = 1
-content_type = "OctetStream"
+content_type = "NetProto"
+# Frame bytes, header included (`module_facts!` NET_IN_ACCEPTS_RECORD).
+accepts_record = 1483
 buffer_size  = 16384
 
 # stdout → cli_out.bytes_in. Takes a whole `OUT_MAX` (65536) write as one
@@ -54,7 +56,9 @@ buffer_size  = 16
 name         = "net_out"
 direction    = "output"
 index        = 2
-content_type = "OctetStream"
+content_type = "NetProto"
+# One request fragment per CMD_SEND (`module_facts!` NET_OUT_MAX_RECORD).
+max_record = 8197
 buffer_size  = 16384
 
 # Files a command reads and writes: the capability file, put/get data,

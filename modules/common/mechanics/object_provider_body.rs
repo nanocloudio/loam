@@ -18,7 +18,8 @@
 // Operations, and what each becomes on the admin wire:
 //
 //   PUT                one PUT_FILE, or OPEN / CHUNK… / COMMIT past one
-//                      body (the digest computed over the caller's buffer)
+//                      body (the digest computed over the caller's body,
+//                      each record of it staged by the ask that carries it)
 //   PUT_STREAMED_*     the bytes spooled to a file under `spool_dir` and
 //                      hashed as they arrive; COMMIT uploads the spool as
 //                      PUT does
@@ -143,24 +144,33 @@ const FS_UNLINK: u32 = super::abi::registry::fs::UNLINK;
 const TIMER_MILLIS: u32 = super::abi::registry::timer::MILLIS;
 const CALLER_OWNER: u32 = super::abi::kernel_abi::query_key::CALLER_OWNER;
 
-// Handles: `[gen:14][kind:4][index:8]` under the contract's tag.
+// Indices this provider answers, which the kernel wraps in its handles:
+// `[gen:5][kind:2][index:8]`, inside the handle's index field.
 const KIND_GRANT: i32 = 1;
 const KIND_READ: i32 = 2;
 const KIND_STREAM: i32 = 3;
+/// The low bits of a slot's generation an index carries.
+const INDEX_GEN_MASK: u16 = 0x1F;
+const _: () = assert!(10 + INDEX_GEN_MASK.count_ones() <= super::abi::registry::handle::INDEX_BITS);
 
 fn handle_of(kind: i32, gen: u16, index: usize) -> i32 {
-    let slot = (((gen as i32) & 0x3FFF) << 12) | (kind << 8) | (index as i32 & 0xFF);
-    super::abi::kernel_abi::fd::tag_fd(super::abi::kernel_abi::fd::FD_TAG_STORAGE_OBJECT, slot)
+    (((gen & INDEX_GEN_MASK) as i32) << 10) | ((kind & 0x3) << 8) | (index as i32 & 0xFF)
 }
 
-/// `(kind, gen, index)` of a handle, tagged or not.
+/// `(kind, gen, index)` of an index this provider answered; `gen` as the
+/// index carries it, to be checked with `gen_is`.
 fn handle_parts(handle: i32) -> (i32, u16, usize) {
-    let slot = handle & super::abi::kernel_abi::fd::SLOT_MASK;
     (
-        (slot >> 8) & 0xF,
-        ((slot >> 12) & 0x3FFF) as u16,
-        (slot & 0xFF) as usize,
+        (handle >> 8) & 0x3,
+        ((handle >> 10) as u16) & INDEX_GEN_MASK,
+        (handle & 0xFF) as usize,
     )
+}
+
+/// Whether a slot of generation `slot_gen` is the one an index naming
+/// `gen` was answered for.
+fn gen_is(slot_gen: u16, gen: u16) -> bool {
+    slot_gen & INDEX_GEN_MASK == gen
 }
 
 // ── State ──────────────────────────────────────────────────────────────────
@@ -327,7 +337,8 @@ pub struct Op {
     pub legal_hold: u8,
     /// RETAIN: the `hold` byte.
     pub retain_hold: u8,
-    // An upload.
+    // An upload. `mem` is the caller's body while the ask carrying it
+    // stages a record, and 0 otherwise.
     pub mem: u64,
     pub total: u64,
     pub sent: u64,
@@ -548,7 +559,14 @@ pub unsafe fn module_new_impl(
 
 unsafe fn now_ms(s: &ModuleState) -> u64 {
     let mut b = [0u8; 8];
-    (sys(s).provider_call)(-1, TIMER_MILLIS, b.as_mut_ptr(), 8);
+    (sys(s).provider_call)(
+        -1,
+        TIMER_MILLIS,
+        b.as_mut_ptr(),
+        8,
+        core::ptr::null_mut(),
+        0,
+    );
     u64::from_le_bytes(b)
 }
 
@@ -559,6 +577,8 @@ unsafe fn trusted_clock(s: &ModuleState) -> Option<cap::Clock> {
         super::abi::kernel_abi::timer::TRUSTED_UNIX,
         rec.as_mut_ptr(),
         rec.len(),
+        core::ptr::null_mut(),
+        0,
     );
     if rc < 0 {
         return None;
@@ -705,23 +725,19 @@ fn read_errno(status: u8) -> i32 {
     }
 }
 
-/// Answer the caller's fence: `fence` as the admin plane reported it,
-/// or `Volatile` when there is none to report — a read, or a write the
-/// plane answered without one.
-unsafe fn write_fence(ptr: u64, cap: u16, fence: &[u8]) {
-    if ptr == 0 || (cap as usize) < FENCE_LEN {
+/// Answer the caller's fence into the trailer of `arg`: `fence` as the
+/// admin plane reported it, or `Volatile` when there is none to report —
+/// a read, or a write the plane answered without one.
+fn write_fence(arg: &mut [u8], fence: &[u8]) {
+    use super::abi::fence::{trailer, Fence};
+    if fence.is_empty() || fence.len() > FENCE_LEN {
+        let _ = trailer::put(arg, &Fence::Volatile);
         return;
     }
-    let out = core::slice::from_raw_parts_mut(ptr as usize as *mut u8, cap as usize);
-    if fence.is_empty() || fence.len() > out.len() {
-        let _ = super::abi::fence::Fence::Volatile.encode(out);
-    } else {
-        put(out, fence);
+    if let Some((_, t)) = trailer::split(arg) {
+        t[..2].copy_from_slice(&(fence.len() as u16).to_le_bytes());
+        put(&mut t[2..], fence);
     }
-}
-
-fn fence_ok(ptr: u64, cap: u16) -> bool {
-    ptr != 0 && cap as usize >= FENCE_LEN
 }
 
 // ── Grants ─────────────────────────────────────────────────────────────────
@@ -740,7 +756,7 @@ unsafe fn admit(
         return Err(E_ACCES);
     }
     let g = &s.grants[i];
-    if g.state != G_GRANTED || g.collected == 0 || g.gen != gen || g.owner != owner {
+    if g.state != G_GRANTED || g.collected == 0 || !gen_is(g.gen, gen) || g.owner != owner {
         return Err(E_ACCES);
     }
     if !grant_live(s, i) {
@@ -768,14 +784,19 @@ unsafe fn grant_live(s: &ModuleState, i: usize) -> bool {
     }
 }
 
-unsafe fn present(s: &mut ModuleState, owner: Owner, arg: &mut [u8]) -> i32 {
-    let Some(p) = obj::grant::parse_present(arg) else {
-        return E_INVAL;
+/// `PRESENT`: the scope in `arg`, the chain in `chain` (the call's data).
+unsafe fn present(s: &mut ModuleState, owner: Owner, arg: &mut [u8], chain: &[u8]) -> i32 {
+    let mut scope_buf = [0u8; SCOPE_MAX];
+    let scope_len = match obj::grant::parse_present(arg) {
+        Some(sc) if obj::grant::valid_scope(sc) && chain.len() <= cap::MAX_CHAIN_BYTES => {
+            put(&mut scope_buf, sc);
+            sc.len()
+        }
+        _ => return E_INVAL,
     };
-    if !obj::grant::valid_scope(p.scope) || p.chain.len() > cap::MAX_CHAIN_BYTES {
-        return E_INVAL;
-    }
-    let ask = ask_of(owner, K_PRESENT, &[p.scope, p.chain]);
+    let scope = &scope_buf[..scope_len];
+    arg[obj::grant::REFUSAL_AT] = 0;
+    let ask = ask_of(owner, K_PRESENT, &[scope, chain]);
     let mut i = 0;
     while i < GRANTS {
         let g = &mut s.grants[i];
@@ -816,10 +837,10 @@ unsafe fn present(s: &mut ModuleState, owner: Owner, arg: &mut [u8]) -> i32 {
     g.owner = owner;
     g.ask = ask;
     g.session = ((gen as u32) << 8) | i as u32;
-    put(&mut g.scope, p.scope);
-    g.scope_len = p.scope.len() as u16;
-    put(&mut g.chain, p.chain);
-    g.chain_len = p.chain.len() as u16;
+    put(&mut g.scope, scope);
+    g.scope_len = scope.len() as u16;
+    put(&mut g.chain, chain);
+    g.chain_len = chain.len() as u16;
     g.permissions = 0;
     g.not_after = 0;
     g.decided_ms = now;
@@ -1002,14 +1023,16 @@ fn policy_of(o: &Op) -> aw::Policy<'_> {
 // ── Dispatch ───────────────────────────────────────────────────────────────
 
 /// # Safety
-/// The loader passes this module's own state and a caller buffer valid
-/// for `arg_len` bytes; pointers inside the argument are the caller's.
+/// The loader passes this module's own state, a caller `arg` valid for
+/// `arg_len` bytes and a disjoint `data` valid for `data_len`.
 pub unsafe fn provider_dispatch_impl(
     state_ptr: *mut u8,
     handle: i32,
     opcode: u32,
     arg: *mut u8,
     arg_len: usize,
+    data: *mut u8,
+    data_len: usize,
 ) -> i32 {
     if state_ptr.is_null() {
         return E_INVAL;
@@ -1018,93 +1041,89 @@ pub unsafe fn provider_dispatch_impl(
     if s.syscalls.is_null() {
         return E_INVAL;
     }
-    s.now_ms = now_ms(s);
-    let Some(owner) = caller(s) else {
-        return E_ACCES;
-    };
     let a: &mut [u8] = if arg.is_null() || arg_len == 0 {
         &mut []
     } else {
         core::slice::from_raw_parts_mut(arg, arg_len)
     };
+    let d: &mut [u8] = if data.is_null() || data_len == 0 {
+        &mut []
+    } else {
+        core::slice::from_raw_parts_mut(data, data_len)
+    };
+    if opcode == obj::CAPS {
+        return super::abi::kernel_abi::caps_word::answer(
+            a,
+            obj::caps::WRITE
+                | obj::caps::IF_ABSENT
+                | obj::caps::IF_ETAG
+                | obj::caps::STREAMED
+                | obj::caps::LIST
+                | obj::caps::KEEP
+                | obj::caps::GRANTS,
+        );
+    }
+    s.now_ms = now_ms(s);
+    let Some(owner) = caller(s) else {
+        return E_ACCES;
+    };
     match opcode {
-        obj::PRESENT => present(s, owner, a),
-        obj::PUT => op_put(s, handle, owner, a),
+        obj::PRESENT => present(s, owner, a, d),
+        obj::PUT => op_put(s, handle, owner, a, d),
         obj::GET => op_get(s, handle, owner, a),
         obj::HEAD => op_head(s, handle, owner, a),
-        obj::RANGE_GET => op_range(s, handle, owner, a),
+        obj::RANGE_GET => op_range(s, handle, owner, a, d),
         obj::DELETE => op_delete(s, handle, owner, a),
         obj::RETAIN => op_retain(s, handle, owner, a),
         obj::CLOSE => op_close(s, handle, owner),
-        obj::LIST => op_list(s, handle, owner, a),
+        obj::LIST => op_list(s, handle, owner, a, d),
         obj::PUT_STREAMED_OPEN => stream_open(s, handle, owner, a),
-        obj::PUT_STREAMED_WRITE => stream_write(s, handle, owner, a),
+        obj::PUT_STREAMED_WRITE => stream_write(s, handle, owner, a, d),
         obj::PUT_STREAMED_COMMIT => stream_commit(s, handle, owner, a),
         obj::PUT_STREAMED_ABORT => stream_abort(s, handle, owner),
         _ => E_NOSYS,
     }
 }
 
-/// `[key_len:u16][key][ct_len:u8][ct][body_ptr:u64][body_len:u64][pre:u8]
-/// [etag_len:u8][etag][Kept][fence_ptr:u64][fence_cap:u16]`
-unsafe fn op_put(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i32 {
-    let Some(kl) = u16_at(a, 0) else {
+/// `put::Request` in `arg`, the body in `body` (the call's data). Each ask
+/// carries the body again, and the record of it the gate is owed next is
+/// staged by the ask that finds the outbox free.
+unsafe fn op_put(s: &mut ModuleState, handle: i32, owner: Owner, a: &mut [u8], body: &[u8]) -> i32 {
+    let Some(req) = obj::put::parse(a) else {
         return E_INVAL;
     };
-    let kl = kl as usize;
-    let Some(key) = a.get(2..2 + kl) else {
-        return E_INVAL;
-    };
-    let mut p = 2 + kl;
-    let Some(&cl) = a.get(p) else { return E_INVAL };
-    let Some(ctype) = a.get(p + 1..p + 1 + cl as usize) else {
-        return E_INVAL;
-    };
-    p += 1 + cl as usize;
-    let (Some(body_ptr), Some(body_len), Some(&pre), Some(&el)) =
-        (u64_at(a, p), u64_at(a, p + 8), a.get(p + 16), a.get(p + 17))
-    else {
-        return E_INVAL;
-    };
-    p += 18;
-    let Some(etag) = a.get(p..p + el as usize) else {
-        return E_INVAL;
-    };
-    p += el as usize;
-    let Some((kept, p)) = obj::Kept::parse(a, p) else {
-        return E_INVAL;
-    };
-    let (Some(fence_ptr), Some(fence_cap)) = (u64_at(a, p), u16_at(a, p + 8)) else {
-        return E_INVAL;
-    };
-    if a.len() != p + 10 || !fence_ok(fence_ptr, fence_cap) {
+    let key = req.key;
+    if split_key(key).is_none() || req.content_type.len() > CTYPE_MAX {
         return E_INVAL;
     }
-    if split_key(key).is_none() || ctype.len() > CTYPE_MAX || (body_len != 0 && body_ptr == 0) {
-        return E_INVAL;
-    }
-    if body_len > super::body_wire::MAX_STREAM_TOTAL {
+    if body.len() as u64 > super::body_wire::MAX_STREAM_TOTAL {
         return E_INVAL;
     }
     let g = match admit(s, handle, owner, true, key) {
         Ok(g) => g,
         Err(e) => return e,
     };
-    let ask = ask_of(owner, K_PUT, &[a.get(..p).unwrap_or(&[])]);
+    let record = super::abi::fence::trailer::record(a).unwrap_or(&[]);
+    let ask = ask_of(owner, K_PUT, &[record]);
     if let Some(i) = find_op(s, owner, &ask) {
         if s.ops[i].state != O_DECIDED {
+            if s.ops[i].total != body.len() as u64 {
+                // Not the body this write was asked with.
+                return E_INVAL;
+            }
+            stage_from(s, i, body);
             return E_INPROGRESS;
         }
         let rc = s.ops[i].result;
         if rc == 0 {
             let f = s.ops[i].fence;
-            write_fence(fence_ptr, fence_cap, &f[..s.ops[i].fence_len as usize]);
+            write_fence(a, &f[..s.ops[i].fence_len as usize]);
         }
         free_op(s, i);
         return rc;
     }
     let mut expect = [0u8; OID_LEN];
-    let Some((mode, elen)) = condition(pre, etag, &mut expect) else {
+    let Some((mode, elen)) = condition(req.precondition, req.etag, &mut expect) else {
         return E_INVAL;
     };
     if mode == MODE_NEVER {
@@ -1113,54 +1132,48 @@ unsafe fn op_put(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i3
     let Some(i) = alloc_op(s, K_PUT, g, owner, ask) else {
         return E_BUSY;
     };
-    let body: &[u8] = if body_len == 0 {
-        &[]
-    } else {
-        core::slice::from_raw_parts(body_ptr as usize as *const u8, body_len as usize)
-    };
     let o = &mut s.ops[i];
-    set_write(o, key, ctype, mode, &expect[..elen]);
-    set_kept(o, &kept);
+    set_write(o, key, req.content_type, mode, &expect[..elen]);
+    set_kept(o, &req.kept);
     o.src = SRC_MEM;
-    o.mem = body_ptr;
-    o.total = body_len;
+    o.mem = 0;
+    o.total = body.len() as u64;
     o.digest = super::sha256(body);
-    o.stage = if body_len as usize <= MAX_BODY {
+    o.stage = if body.len() <= MAX_BODY {
         U_SINGLE
     } else {
         U_OPEN
     };
+    stage_from(s, i, body);
     E_INPROGRESS
 }
 
-/// `[key_len:u16][key][pre:u8][etag_len:u8][etag][fence_ptr:u64][fence_cap:u16]`
-unsafe fn op_delete(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i32 {
-    let Some(kl) = u16_at(a, 0) else {
+/// Stage write `i`'s next record from `body`, the caller's buffer for this
+/// call alone, when the outbox is free and the record is owed.
+unsafe fn stage_from(s: &mut ModuleState, i: usize, body: &[u8]) {
+    if s.out_len != 0 || s.ops[i].state != O_SEND || s.ops[i].src != SRC_MEM {
+        return;
+    }
+    s.ops[i].mem = body.as_ptr() as u64;
+    stage_op(s, i);
+    s.ops[i].mem = 0;
+}
+
+/// `delete::Request`, then the fence trailer.
+unsafe fn op_delete(s: &mut ModuleState, handle: i32, owner: Owner, a: &mut [u8]) -> i32 {
+    let Some(req) = obj::delete::parse_request(a) else {
         return E_INVAL;
     };
-    let kl = kl as usize;
-    let Some(key) = a.get(2..2 + kl) else {
-        return E_INVAL;
-    };
-    let p = 2 + kl;
-    let (Some(&pre), Some(&el)) = (a.get(p), a.get(p + 1)) else {
-        return E_INVAL;
-    };
-    let Some(etag) = a.get(p + 2..p + 2 + el as usize) else {
-        return E_INVAL;
-    };
-    let p = p + 2 + el as usize;
-    let (Some(fence_ptr), Some(fence_cap)) = (u64_at(a, p), u16_at(a, p + 8)) else {
-        return E_INVAL;
-    };
-    if a.len() != p + 10 || !fence_ok(fence_ptr, fence_cap) || split_key(key).is_none() {
+    let (key, pre, etag) = (req.key, req.precondition, req.etag);
+    if split_key(key).is_none() {
         return E_INVAL;
     }
     let g = match admit(s, handle, owner, true, key) {
         Ok(g) => g,
         Err(e) => return e,
     };
-    let ask = ask_of(owner, K_DELETE, &[&a[..p]]);
+    let record = super::abi::fence::trailer::record(a).unwrap_or(&[]);
+    let ask = ask_of(owner, K_DELETE, &[record]);
     if let Some(i) = find_op(s, owner, &ask) {
         if s.ops[i].state != O_DECIDED {
             return E_INPROGRESS;
@@ -1168,7 +1181,7 @@ unsafe fn op_delete(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) ->
         let rc = s.ops[i].result;
         if rc == 0 {
             let f = s.ops[i].fence;
-            write_fence(fence_ptr, fence_cap, &f[..s.ops[i].fence_len as usize]);
+            write_fence(a, &f[..s.ops[i].fence_len as usize]);
         }
         free_op(s, i);
         return rc;
@@ -1193,7 +1206,7 @@ unsafe fn op_delete(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) ->
 
 /// `retain::Request`: change a live object's retention or hold. A write, so
 /// it answers `EINPROGRESS` until the namespace has decided it in log order.
-unsafe fn op_retain(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i32 {
+unsafe fn op_retain(s: &mut ModuleState, handle: i32, owner: Owner, a: &mut [u8]) -> i32 {
     let Some(req) = obj::retain::parse_request(a) else {
         return E_INVAL;
     };
@@ -1204,8 +1217,8 @@ unsafe fn op_retain(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) ->
         Ok(g) => g,
         Err(e) => return e,
     };
-    let at = a.len() - 10;
-    let ask = ask_of(owner, K_RETAIN, &[&a[..at]]);
+    let record = super::abi::fence::trailer::record(a).unwrap_or(&[]);
+    let ask = ask_of(owner, K_RETAIN, &[record]);
     if let Some(i) = find_op(s, owner, &ask) {
         if s.ops[i].state != O_DECIDED {
             return E_INPROGRESS;
@@ -1213,11 +1226,7 @@ unsafe fn op_retain(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) ->
         let rc = s.ops[i].result;
         if rc == 0 {
             let f = s.ops[i].fence;
-            write_fence(
-                req.fence_out_ptr,
-                req.fence_out_cap,
-                &f[..s.ops[i].fence_len as usize],
-            );
+            write_fence(a, &f[..s.ops[i].fence_len as usize]);
         }
         free_op(s, i);
         return rc;
@@ -1225,10 +1234,11 @@ unsafe fn op_retain(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) ->
     let Some(i) = alloc_op(s, K_RETAIN, g, owner, ask) else {
         return E_BUSY;
     };
+    let (until, hold) = (req.retain_until_ms, req.hold);
     let o = &mut s.ops[i];
     set_write(o, req.key, &[], aw::WRITE_ANY, &[]);
-    o.retain_until_ms = req.retain_until_ms;
-    o.retain_hold = req.hold;
+    o.retain_until_ms = until;
+    o.retain_hold = hold;
     E_INPROGRESS
 }
 
@@ -1260,9 +1270,12 @@ unsafe fn lookup(
     Err(E_AGAIN)
 }
 
-/// `GET`: the argument is the key.
+/// `GET`: the argument is the `key` record.
 unsafe fn op_get(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i32 {
-    let i = match lookup(s, K_GET, handle, owner, a) {
+    let Some(key) = obj::key::parse(a) else {
+        return E_INVAL;
+    };
+    let i = match lookup(s, K_GET, handle, owner, key) {
         Ok(i) => i,
         Err(e) => return e,
     };
@@ -1303,27 +1316,12 @@ unsafe fn op_get(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i3
     handle_of(KIND_READ, gen, r)
 }
 
-/// `[key_len:u16][key][out_ptr:u64][out_cap:u32][fence_ptr:u64][fence_cap:u16]`
-unsafe fn op_head(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i32 {
-    let Some(kl) = u16_at(a, 0) else {
+/// `head`: the key, then room for the answer, then the fence trailer. The
+/// HEAD record is written over the `arg` from byte 0.
+unsafe fn op_head(s: &mut ModuleState, handle: i32, owner: Owner, a: &mut [u8]) -> i32 {
+    let Some(key) = obj::head::parse_request(a) else {
         return E_INVAL;
     };
-    let kl = kl as usize;
-    let Some(key) = a.get(2..2 + kl) else {
-        return E_INVAL;
-    };
-    let p = 2 + kl;
-    let (Some(out_ptr), Some(out_cap), Some(fence_ptr), Some(fence_cap)) = (
-        u64_at(a, p),
-        u32_at(a, p + 8),
-        u64_at(a, p + 12),
-        u16_at(a, p + 20),
-    ) else {
-        return E_INVAL;
-    };
-    if a.len() != p + 22 || out_ptr == 0 || !fence_ok(fence_ptr, fence_cap) {
-        return E_INVAL;
-    }
     let i = match lookup(s, K_HEAD, handle, owner, key) {
         Ok(i) => i,
         Err(e) => return e,
@@ -1333,7 +1331,10 @@ unsafe fn op_head(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i
         free_op(s, i);
         return o.result;
     }
-    let out = core::slice::from_raw_parts_mut(out_ptr as usize as *mut u8, out_cap as usize);
+    let Some(out) = obj::head::answer_area(a) else {
+        free_op(s, i);
+        return E_INVAL;
+    };
     let n = obj::range::encode_head(
         out,
         o.size,
@@ -1349,28 +1350,33 @@ unsafe fn op_head(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i
     free_op(s, i);
     match n {
         Some(n) => {
-            write_fence(fence_ptr, fence_cap, &[]);
+            write_fence(a, &[]);
             n as i32
         }
         None => E_NOMEM,
     }
 }
 
-/// `[offset:u64][length:u32][out_ptr:u64]` on a `GET` handle.
-unsafe fn op_range(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i32 {
+/// `[offset:u64]` on a `GET` handle; the range into `out` (the call's
+/// data), up to its length.
+unsafe fn op_range(
+    s: &mut ModuleState,
+    handle: i32,
+    owner: Owner,
+    a: &[u8],
+    out: &mut [u8],
+) -> i32 {
     let (kind, gen, r) = handle_parts(handle);
-    if kind != KIND_READ || r >= READS || s.reads[r].in_use == 0 || s.reads[r].gen != gen {
+    if kind != KIND_READ || r >= READS || s.reads[r].in_use == 0 || !gen_is(s.reads[r].gen, gen) {
         return E_INVAL;
     }
     if s.reads[r].owner != owner {
         return E_ACCES;
     }
-    let (Some(off), Some(len), Some(out_ptr)) = (u64_at(a, 0), u32_at(a, 8), u64_at(a, 12)) else {
+    let Some(off) = obj::range_get::parse(a) else {
         return E_INVAL;
     };
-    if a.len() != 20 || (len != 0 && out_ptr == 0) {
-        return E_INVAL;
-    }
+    let len = out.len();
     let g = s.reads[r].grant as usize;
     if s.grants[g].state != G_GRANTED || !grant_live(s, g) {
         return E_ACCES;
@@ -1387,14 +1393,9 @@ unsafe fn op_range(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> 
     let win_end = rd.win_off + rd.win_len as u64;
     if rd.win_len != 0 && off >= rd.win_off && off < win_end {
         let avail = (win_end - off) as usize;
-        let n = if (len as usize) < avail {
-            len as usize
-        } else {
-            avail
-        };
+        let n = if len < avail { len } else { avail };
         let from = (off - rd.win_off) as usize;
-        let out = core::slice::from_raw_parts_mut(out_ptr as usize as *mut u8, n);
-        put(out, &rd.win[from..from + n]);
+        put(&mut out[..n], &rd.win[from..from + n]);
         return n as i32;
     }
     if rd.fetch == 0 {
@@ -1412,7 +1413,13 @@ unsafe fn op_range(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> 
 }
 
 /// `LIST` under a grant: one page from the admin plane's listing.
-unsafe fn op_list(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i32 {
+unsafe fn op_list(
+    s: &mut ModuleState,
+    handle: i32,
+    owner: Owner,
+    a: &mut [u8],
+    out: &mut [u8],
+) -> i32 {
     let Some(req) = obj::list::parse_request(a) else {
         return E_INVAL;
     };
@@ -1452,8 +1459,6 @@ unsafe fn op_list(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i
             return rc;
         }
         let l = s.ops[i].list as usize;
-        let out =
-            core::slice::from_raw_parts_mut(req.out_ptr as usize as *mut u8, req.out_cap as usize);
         let rc = deliver_page(
             &s.lists[l].page[..s.lists[l].len as usize],
             out,
@@ -1461,7 +1466,7 @@ unsafe fn op_list(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i
         );
         free_op(s, i);
         if rc >= 0 {
-            write_fence(req.fence_out_ptr, req.fence_out_cap, &[]);
+            write_fence(a, &[]);
         }
         return rc;
     }
@@ -1520,7 +1525,9 @@ fn deliver_page(held: &[u8], out: &mut [u8], max_keys: u16) -> i32 {
 unsafe fn op_close(s: &mut ModuleState, handle: i32, owner: Owner) -> i32 {
     let (kind, gen, i) = handle_parts(handle);
     match kind {
-        KIND_GRANT if i < GRANTS && s.grants[i].gen == gen && s.grants[i].state == G_GRANTED => {
+        KIND_GRANT
+            if i < GRANTS && gen_is(s.grants[i].gen, gen) && s.grants[i].state == G_GRANTED =>
+        {
             if s.grants[i].owner != owner {
                 return E_ACCES;
             }
@@ -1542,14 +1549,14 @@ unsafe fn op_close(s: &mut ModuleState, handle: i32, owner: Owner) -> i32 {
             }
             0
         }
-        KIND_READ if i < READS && s.reads[i].in_use != 0 && s.reads[i].gen == gen => {
+        KIND_READ if i < READS && s.reads[i].in_use != 0 && gen_is(s.reads[i].gen, gen) => {
             if s.reads[i].owner != owner {
                 return E_ACCES;
             }
             s.reads[i].in_use = 0;
             0
         }
-        KIND_STREAM if i < STREAMS && s.streams[i].in_use != 0 && s.streams[i].gen == gen => {
+        KIND_STREAM if i < STREAMS && s.streams[i].in_use != 0 && gen_is(s.streams[i].gen, gen) => {
             if s.streams[i].owner != owner {
                 return E_ACCES;
             }
@@ -1562,36 +1569,20 @@ unsafe fn op_close(s: &mut ModuleState, handle: i32, owner: Owner) -> i32 {
 
 // ── Streamed writes ────────────────────────────────────────────────────────
 
-/// `[key_len:u16][key][ct_len:u8][ct][expected:u64][pre:u8][etag_len:u8][etag]
-/// [Kept]`
+/// `put`'s record, no trailer.
 unsafe fn stream_open(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i32 {
-    let Some(kl) = u16_at(a, 0) else {
+    let Some(req) = obj::put::parse_record(a) else {
         return E_INVAL;
     };
-    let kl = kl as usize;
-    let Some(key) = a.get(2..2 + kl) else {
-        return E_INVAL;
-    };
-    let mut p = 2 + kl;
-    let Some(&cl) = a.get(p) else { return E_INVAL };
-    let Some(ctype) = a.get(p + 1..p + 1 + cl as usize) else {
-        return E_INVAL;
-    };
-    p += 1 + cl as usize;
-    let (Some(expected), Some(&pre), Some(&el)) = (u64_at(a, p), a.get(p + 8), a.get(p + 9)) else {
-        return E_INVAL;
-    };
-    p += 10;
-    let Some(etag) = a.get(p..p + el as usize) else {
-        return E_INVAL;
-    };
-    let Some((kept, end)) = obj::Kept::parse(a, p + el as usize) else {
-        return E_INVAL;
-    };
-    if a.len() != end || split_key(key).is_none() || ctype.len() > CTYPE_MAX {
-        return E_INVAL;
-    }
-    if expected > super::body_wire::MAX_STREAM_TOTAL {
+    let (key, ctype, pre, etag, kept) = (
+        req.key,
+        req.content_type,
+        req.precondition,
+        req.etag,
+        req.kept,
+    );
+    let kl = key.len();
+    if split_key(key).is_none() || ctype.len() > CTYPE_MAX {
         return E_INVAL;
     }
     let g = match admit(s, handle, owner, true, key) {
@@ -1719,7 +1710,19 @@ unsafe fn fs_call(
     arg: *mut u8,
     len: usize,
 ) -> i32 {
-    ((*sys).provider_call)(handle, op, arg, len)
+    ((*sys).provider_call)(handle, op, arg, len, core::ptr::null_mut(), 0)
+}
+
+/// A bulk fs call (`READ`, `WRITE`): no argument, the bytes travel in
+/// `data`.
+unsafe fn fs_data(
+    sys: *const super::SyscallTable,
+    handle: i32,
+    op: u32,
+    data: *mut u8,
+    len: usize,
+) -> i32 {
+    ((*sys).provider_call)(handle, op, core::ptr::null_mut(), 0, data, len)
 }
 
 fn spill_release(sp: &mut Spool, spill: &mut Spill) {
@@ -1813,7 +1816,7 @@ unsafe fn spool_poll(
                 return;
             };
             let want = rest.len();
-            let rc = fs_call(sys, sp.fd, FS_WRITE, rest.as_mut_ptr(), want);
+            let rc = fs_data(sys, sp.fd, FS_WRITE, rest.as_mut_ptr(), want);
             if rc > 0 {
                 // A short count moved that much: the rest waits.
                 let moved = if (rc as usize) < want {
@@ -1926,7 +1929,11 @@ fn release_chunk(s: &mut ModuleState, i: usize) {
 
 unsafe fn stream_of(s: &ModuleState, handle: i32, owner: Owner) -> Result<usize, i32> {
     let (kind, gen, i) = handle_parts(handle);
-    if kind != KIND_STREAM || i >= STREAMS || s.streams[i].in_use == 0 || s.streams[i].gen != gen {
+    if kind != KIND_STREAM
+        || i >= STREAMS
+        || s.streams[i].in_use == 0
+        || !gen_is(s.streams[i].gen, gen)
+    {
         return Err(E_INVAL);
     }
     if s.streams[i].owner != owner {
@@ -1939,7 +1946,17 @@ unsafe fn stream_of(s: &ModuleState, handle: i32, owner: Owner) -> Result<usize,
     Ok(i)
 }
 
-unsafe fn stream_write(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i32 {
+/// No `arg`; the chunk in `a` (the call's data).
+unsafe fn stream_write(
+    s: &mut ModuleState,
+    handle: i32,
+    owner: Owner,
+    arg: &[u8],
+    a: &[u8],
+) -> i32 {
+    if !arg.is_empty() {
+        return E_INVAL;
+    }
     let i = match stream_of(s, handle, owner) {
         Ok(i) => i,
         Err(e) => return e,
@@ -1966,7 +1983,7 @@ unsafe fn stream_write(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8])
         _ => return E_INVAL,
     }
     if sp.st == SP_READY && sp.spill == 0 {
-        let rc = fs_call(sys, sp.fd, FS_WRITE, a.as_ptr() as *mut u8, a.len());
+        let rc = fs_data(sys, sp.fd, FS_WRITE, a.as_ptr() as *mut u8, a.len());
         let moved = if rc > 0 {
             if (rc as usize) < a.len() {
                 rc as usize
@@ -2002,23 +2019,20 @@ unsafe fn stream_write(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8])
     0
 }
 
-/// `[fence_ptr:u64][fence_cap:u16]`
-unsafe fn stream_commit(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]) -> i32 {
+/// `arg` is the fence trailer alone.
+unsafe fn stream_commit(s: &mut ModuleState, handle: i32, owner: Owner, a: &mut [u8]) -> i32 {
     let i = match stream_of(s, handle, owner) {
         Ok(i) => i,
         Err(e) => return e,
     };
-    let (Some(fence_ptr), Some(fence_cap)) = (u64_at(a, 0), u16_at(a, 8)) else {
-        return E_INVAL;
-    };
-    if a.len() != 10 || !fence_ok(fence_ptr, fence_cap) {
+    if a.len() != obj::COMMIT_ARG_LEN {
         return E_INVAL;
     }
     if s.streams[i].decided != 0 {
         let rc = s.streams[i].result;
         if rc == 0 {
             let f = s.streams[i].fence;
-            write_fence(fence_ptr, fence_cap, &f[..s.streams[i].fence_len as usize]);
+            write_fence(a, &f[..s.streams[i].fence_len as usize]);
         }
         return rc;
     }
@@ -2037,7 +2051,7 @@ unsafe fn stream_commit(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]
         st.fence = f;
         st.fence_len = fl;
         if rc == 0 {
-            write_fence(fence_ptr, fence_cap, &f[..fl as usize]);
+            write_fence(a, &f[..fl as usize]);
         }
         return rc;
     }
@@ -2102,7 +2116,11 @@ unsafe fn stream_commit(s: &mut ModuleState, handle: i32, owner: Owner, a: &[u8]
 
 unsafe fn stream_abort(s: &mut ModuleState, handle: i32, owner: Owner) -> i32 {
     let (kind, gen, i) = handle_parts(handle);
-    if kind != KIND_STREAM || i >= STREAMS || s.streams[i].in_use == 0 || s.streams[i].gen != gen {
+    if kind != KIND_STREAM
+        || i >= STREAMS
+        || s.streams[i].in_use == 0
+        || !gen_is(s.streams[i].gen, gen)
+    {
         return E_INVAL;
     }
     if s.streams[i].owner != owner {
@@ -2423,6 +2441,10 @@ unsafe fn upload_bytes(s: &mut ModuleState, i: usize, n: usize) -> Bytes {
         return Bytes::Ready(&[]);
     }
     if o.src == SRC_MEM {
+        // The caller's body is there only inside the ask that carries it.
+        if o.mem == 0 {
+            return Bytes::NotYet;
+        }
         let p = (o.mem as usize).wrapping_add(o.sent as usize) as *const u8;
         return Bytes::Ready(core::slice::from_raw_parts(p, n));
     }
@@ -2443,7 +2465,7 @@ unsafe fn upload_bytes(s: &mut ModuleState, i: usize, n: usize) -> Bytes {
             return Bytes::Failed;
         };
         let want = dst.len();
-        let rc = fs_call(s.syscalls, fd, FS_READ, dst.as_mut_ptr(), want);
+        let rc = fs_data(s.syscalls, fd, FS_READ, dst.as_mut_ptr(), want);
         if fs_pending(rc) {
             return Bytes::NotYet;
         }

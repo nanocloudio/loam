@@ -49,10 +49,9 @@
 // without a bound check, and per-step work bounded by the tables below.
 
 use core::convert::TryInto;
-use core::ffi::c_void;
 use fluxor_rt::StepReturn;
 
-use super::abi::contracts::storage::block::{self as blk, Caps, Cpl, Req};
+use super::abi::contracts::storage::block::{self as blk, Cpl, Description, Req};
 use super::abi::fence::Fence;
 use super::admin as aw;
 use super::map_wire as map;
@@ -182,6 +181,9 @@ pub struct Pending {
     /// The write generation that must be durable before it completes.
     pub target: u64,
     pub req: Req,
+    /// The request's buffer, borrowed from its consumer's lend from
+    /// `SUBMIT` until its completion is queued; 0 for none.
+    pub buf: usize,
 }
 
 #[repr(C)]
@@ -295,6 +297,10 @@ pub struct ModuleState {
     pub done: [Cpl; QUEUE_DEPTH],
     pub done_head: u32,
     pub done_count: u32,
+    /// This module's port reference on the `blocks` edge: the session its
+    /// consumer's lend is bound to. Set by `SUBMIT`.
+    pub session: i32,
+    pub _pad_session: u32,
     // ── Counters, readable by a host harness ──
     pub commits: u32,
     pub fetches: u32,
@@ -350,6 +356,8 @@ pub unsafe fn module_new_impl(
     let rc = (sys(s).provider_call)(
         -1,
         super::abi::registry::kernel::RANDOM_FILL,
+        core::ptr::null_mut(),
+        0,
         seed.as_mut_ptr(),
         seed.len(),
     );
@@ -459,7 +467,14 @@ unsafe fn sys(s: &ModuleState) -> &super::SyscallTable {
 
 unsafe fn now_ms(s: &ModuleState) -> u64 {
     let mut b = [0u8; 8];
-    (sys(s).provider_call)(-1, super::abi::registry::timer::MILLIS, b.as_mut_ptr(), 8);
+    (sys(s).provider_call)(
+        -1,
+        super::abi::registry::timer::MILLIS,
+        b.as_mut_ptr(),
+        8,
+        core::ptr::null_mut(),
+        0,
+    );
     u64::from_le_bytes(b)
 }
 
@@ -467,6 +482,8 @@ unsafe fn log(s: &ModuleState, level: u8, msg: &[u8]) {
     (sys(s).provider_call)(
         level as i32,
         super::abi::registry::kernel::LOG_WRITE,
+        core::ptr::null_mut(),
+        0,
         msg.as_ptr() as *mut u8,
         msg.len(),
     );
@@ -494,9 +511,9 @@ fn is_zero(b: &[u8]) -> bool {
     acc == 0
 }
 
-fn caps_of(s: &ModuleState) -> Caps {
+fn caps_of(s: &ModuleState) -> Description {
     let per = (s.extent_size >> s.block_shift).max(1);
-    Caps {
+    Description {
         logical_block_size: s.block_size,
         block_count: s.block_count,
         max_blocks: per,
@@ -504,7 +521,7 @@ fn caps_of(s: &ModuleState) -> Caps {
         // commit lands whole or not at all.
         atomic_blocks: per,
         queue_depth: QUEUE_DEPTH as u16,
-        flags: blk::caps::F_WRITE | blk::caps::F_FLUSH | blk::caps::F_ASYNC,
+        flags: blk::describe::F_WRITE | blk::describe::F_FLUSH | blk::describe::F_ASYNC,
         device_id: s.device_id,
     }
 }
@@ -1212,8 +1229,9 @@ fn spans(s: &ModuleState, r: &Req, out: &mut [Span; 2]) -> usize {
     n
 }
 
-/// Copy a read out of resident extents, or ask for the missing ones.
-unsafe fn read_now(s: &mut ModuleState, r: &Req) -> bool {
+/// Copy a read out of resident extents into `buf`, or ask for the missing
+/// ones.
+unsafe fn read_now(s: &mut ModuleState, r: &Req, buf: *mut u8) -> bool {
     let mut sp = [Span {
         idx: 0,
         in_ext: 0,
@@ -1233,11 +1251,7 @@ unsafe fn read_now(s: &mut ModuleState, r: &Req) -> bool {
     }
     for p in sp.iter().take(n) {
         if let Some(i) = find_extent(s, p.idx) {
-            core::ptr::copy_nonoverlapping(
-                s.ext[i].as_ptr().add(p.in_ext),
-                (r.buf_ptr as *mut u8).add(p.off),
-                p.take,
-            );
+            core::ptr::copy_nonoverlapping(s.ext[i].as_ptr().add(p.in_ext), buf.add(p.off), p.take);
             touch(s, i);
         }
     }
@@ -1253,7 +1267,7 @@ const W_ROOM: u8 = 2;
 
 /// Stage a write, or say why it must wait. Whole or not at all: every
 /// extent it touches is checked before any byte moves.
-unsafe fn write_now(s: &mut ModuleState, r: &Req) -> u8 {
+unsafe fn write_now(s: &mut ModuleState, r: &Req, src: *const u8) -> u8 {
     if s.commit != C_IDLE {
         return W_WAIT;
     }
@@ -1264,7 +1278,6 @@ unsafe fn write_now(s: &mut ModuleState, r: &Req) -> u8 {
         off: 0,
     }; 2];
     let n = spans(s, r, &mut sp);
-    let src = r.buf_ptr as *const u8;
     let mut resident = [usize::MAX; 2];
     let mut new_staged = 0usize;
     let mut new_slots = 0usize;
@@ -1353,8 +1366,15 @@ unsafe fn write_now(s: &mut ModuleState, r: &Req) -> u8 {
     W_DONE
 }
 
-/// Advance `r` as far as it can go now. `Some` is its completion.
-unsafe fn run(s: &mut ModuleState, r: &Req, stage: &mut u8, target: &mut u64) -> Option<Cpl> {
+/// Advance `r`, whose buffer is `buf`, as far as it can go now. `Some` is
+/// its completion.
+unsafe fn run(
+    s: &mut ModuleState,
+    r: &Req,
+    buf: *mut u8,
+    stage: &mut u8,
+    target: &mut u64,
+) -> Option<Cpl> {
     if s.phase == P_FAILED {
         return Some(Cpl::bare(r.tag, s.fail));
     }
@@ -1367,14 +1387,14 @@ unsafe fn run(s: &mut ModuleState, r: &Req, stage: &mut u8, target: &mut u64) ->
     if *stage == 1 {
         match r.op {
             blk::op::READ => {
-                return if read_now(s, r) {
+                return if read_now(s, r, buf) {
                     Some(Cpl::bare(r.tag, 0))
                 } else {
                     None
                 };
             }
             blk::op::WRITE => {
-                match write_now(s, r) {
+                match write_now(s, r, buf) {
                     W_DONE => {}
                     W_ROOM => return commit_wait(s, r.tag),
                     _ => return None,
@@ -1409,6 +1429,14 @@ fn commit_wait(s: &mut ModuleState, tag: u64) -> Option<Cpl> {
     None
 }
 
+/// Give back the buffer a queued request borrowed: before its completion
+/// becomes reapable.
+unsafe fn give_back(s: &ModuleState, p: &Pending) {
+    if p.buf != 0 {
+        fluxor_rt::blk_give_back(sys(s), s.session, &p.req);
+    }
+}
+
 fn push_done(s: &mut ModuleState, c: Cpl) {
     if s.done_count as usize >= QUEUE_DEPTH {
         return;
@@ -1435,9 +1463,10 @@ unsafe fn service(s: &mut ModuleState) {
             continue;
         }
         let mut p = s.pending[i];
-        match run(s, &p.req, &mut p.stage, &mut p.target) {
+        match run(s, &p.req, p.buf as *mut u8, &mut p.stage, &mut p.target) {
             Some(c) => {
                 s.pending[i].used = 0;
+                give_back(s, &p);
                 push_done(s, c);
             }
             None => s.pending[i] = p,
@@ -1447,7 +1476,7 @@ unsafe fn service(s: &mut ModuleState) {
 
 /// Fail every flush-bound request the commit that just gave up was to
 /// cover. Their writes stay staged for the next commit.
-fn fail_waiters(s: &mut ModuleState) {
+unsafe fn fail_waiters(s: &mut ModuleState) {
     for i in 0..QUEUE_DEPTH {
         let p = s.pending[i];
         if p.used == 0 || s.durable_gen >= p.target {
@@ -1456,6 +1485,7 @@ fn fail_waiters(s: &mut ModuleState) {
         let bound = p.stage == 2 || (p.stage == 0 && p.req.flags & blk::F_PREFLUSH != 0);
         if bound {
             s.pending[i].used = 0;
+            give_back(s, &p);
             push_done(s, Cpl::bare(p.req.tag, EIO));
             s.refused = 0;
         }
@@ -2051,56 +2081,96 @@ unsafe fn admitted(s: &ModuleState, body: &[u8]) -> Result<Req, i32> {
     }
 }
 
-/// The `storage.block` channel ioctl handler.
-pub unsafe extern "C" fn block_ioctl(state: *mut c_void, cmd: u32, arg: *mut u8) -> i32 {
+/// Serves `storage.block` to the consumer wired to `blocks`: `DESCRIBE`,
+/// `EXEC`, `SUBMIT` and `REAP`. `handle` is this module's own port
+/// reference on that edge, the session its consumer's lend is bound to.
+///
+/// # Safety
+/// `state` is the instance `module_new_impl` initialised; `arg[..arg_len]`
+/// and `data[..data_len]` are valid for the call.
+pub unsafe fn provider_dispatch(
+    state: *mut u8,
+    handle: i32,
+    op: u32,
+    arg: *mut u8,
+    arg_len: usize,
+    data: *mut u8,
+    data_len: usize,
+) -> i32 {
+    use super::abi::registry::storage_block as SB;
     if state.is_null() || arg.is_null() {
         return EINVAL;
     }
     let s = &mut *(state as *mut ModuleState);
-    match cmd {
-        blk::ioctl::CAPS => match s.phase {
+    let arg = core::slice::from_raw_parts_mut(arg, arg_len);
+    match op {
+        SB::DESCRIBE => match s.phase {
             P_READY => {
-                caps_of(s).encode(core::slice::from_raw_parts_mut(arg, blk::caps::LEN));
-                blk::caps::LEN as i32
+                if caps_of(s).encode(arg) {
+                    0
+                } else {
+                    EINVAL
+                }
             }
             P_FAILED => s.fail,
             _ => EAGAIN,
         },
-        blk::ioctl::EXEC => {
-            let r = match admitted(s, core::slice::from_raw_parts(arg, blk::req::LEN)) {
+        SB::EXEC => {
+            if arg.len() < blk::exec::ARG_LEN {
+                return EINVAL;
+            }
+            let r = match admitted(s, arg) {
                 Ok(r) => r,
                 Err(rc) => return rc,
             };
+            let want = if r.has_buffer() {
+                r.buf_len as usize
+            } else {
+                0
+            };
+            if data_len != want || (want != 0 && data.is_null()) {
+                return EINVAL;
+            }
             let mut stage = 0u8;
             let mut target = s.write_gen;
-            match run(s, &r, &mut stage, &mut target) {
+            match run(s, &r, data, &mut stage, &mut target) {
                 Some(c) => {
-                    c.encode(core::slice::from_raw_parts_mut(
-                        arg.add(blk::req::LEN),
-                        blk::cpl::LEN,
-                    ));
+                    c.encode(&mut arg[blk::exec::CPL..]);
                     c.status
                 }
                 None => EAGAIN,
             }
         }
-        blk::ioctl::SUBMIT => {
-            let r = match admitted(s, core::slice::from_raw_parts(arg, blk::req::LEN)) {
+        SB::SUBMIT => {
+            let r = match admitted(s, arg) {
                 Ok(r) => r,
                 Err(rc) => return rc,
             };
             if queued(s) >= QUEUE_DEPTH {
                 return EAGAIN;
             }
+            let buf = if r.has_buffer() {
+                match fluxor_rt::blk_borrow(sys(s), handle, &r) {
+                    Ok(b) => b as usize,
+                    Err(rc) => return rc,
+                }
+            } else {
+                0
+            };
+            s.session = handle;
             let mut p = Pending {
                 used: 1,
                 stage: 0,
                 _pad: [0; 6],
                 target: s.write_gen,
                 req: r,
+                buf,
             };
-            match run(s, &r, &mut p.stage, &mut p.target) {
-                Some(c) => push_done(s, c),
+            match run(s, &r, buf as *mut u8, &mut p.stage, &mut p.target) {
+                Some(c) => {
+                    give_back(s, &p);
+                    push_done(s, c);
+                }
                 None => {
                     for i in 0..QUEUE_DEPTH {
                         if s.pending[i].used == 0 {
@@ -2112,14 +2182,16 @@ pub unsafe extern "C" fn block_ioctl(state: *mut c_void, cmd: u32, arg: *mut u8)
             }
             0
         }
-        blk::ioctl::REAP => {
+        SB::REAP => {
             if s.done_count == 0 {
                 return 0;
             }
             let c = s.done[s.done_head as usize & (QUEUE_DEPTH - 1)];
+            if !c.encode(arg) {
+                return EINVAL;
+            }
             s.done_head = ((s.done_head as usize + 1) & (QUEUE_DEPTH - 1)) as u32;
             s.done_count -= 1;
-            c.encode(core::slice::from_raw_parts_mut(arg, blk::cpl::LEN));
             1
         }
         _ => ENOSYS,

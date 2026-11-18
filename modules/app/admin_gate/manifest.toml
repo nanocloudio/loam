@@ -28,7 +28,9 @@ timer_class = "wall_clock"
 [[ports]]
 name = "net_in"
 direction = "input"
-content_type = "OctetStream"
+content_type = "NetProto"
+# Frame bytes, header included (`module_facts!` NET_IN_ACCEPTS_RECORD).
+accepts_record = 1483
 buffer_size = 16384
 
 [[ports]]
@@ -69,7 +71,9 @@ buffer_size = 131072
 [[ports]]
 name = "net_out"
 direction = "output"
-content_type = "OctetStream"
+content_type = "NetProto"
+# One answer fragment per CMD_SEND (`module_facts!` NET_OUT_MAX_RECORD).
+max_record = 8197
 buffer_size = 16384
 
 [[ports]]

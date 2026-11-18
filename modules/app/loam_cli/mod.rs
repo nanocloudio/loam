@@ -44,7 +44,15 @@ const NET_IN: u8 = 1;
 const EXIT_OUT: u8 = 1;
 const NET_OUT: u8 = 2;
 
-fluxor_rt::module_facts! { state: body::ModuleState }
+// `net_in` reads what `tls.clear_out` writes; `net_out` writes one request
+// fragment per `CMD_SEND`, what `tls.clear_in` accepts.
+fluxor_rt::module_facts! {
+    state: body::ModuleState,
+    records: [
+        in 1 NET_IN_ACCEPTS_RECORD = abi::contracts::net::datagram::TRANSPORT_RECORD_MAX,
+        out 2 NET_OUT_MAX_RECORD = 8197,
+    ],
+}
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

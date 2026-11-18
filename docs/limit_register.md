@@ -203,7 +203,10 @@ ceiling answers `EBUSY` or `ENOMEM`.
 | Gate reassembly | `admin_gate_body::RX_MAX` | `mechanics/admin_gate_body.rs` | derived | Derived: one whole request and the network fragment behind it |
 | Gate presentation frame | `CAP_FRAME_MAX` | `mechanics/admin_gate_body.rs` | derived | Derived: the capability contract's largest presentation |
 | Peer identity | `ID_MAX` | `mechanics/admin_gate_body.rs` | 32 | Derived: `peer_identity`'s fingerprint, which a session's lease holders are bound to |
-| Network frame | `NET_FRAME_MAX` | `mechanics/admin_gate_body.rs`, `mechanics/admin_client.rs` | derived, 1465 | Derived: one `net_proto` data frame — header, connection id, `MAX_DATA_FRAGMENT` |
+| Network frame | `NET_FRAME_MAX` | `mechanics/admin_gate_body.rs`, `mechanics/admin_client.rs` | derived, 1483 | Derived: one `net_proto` frame as the transport writes it — the `net_in` port's `accepts_record` (`NET_IN_ACCEPTS_RECORD`), which is `tls.clear_out`'s `max_record`; the composer refuses an edge whose producer writes more |
+| Network data | `NET_DATA_MAX` | `mechanics/admin_client.rs` | derived, 1478 | Derived: the data one such frame carries (`net_proto::data_capacity(NET_IN_ACCEPTS_RECORD)`), the fragment a client's reassembly keeps room for |
+| Network send | `SEND_MAX` | `mechanics/admin_gate_body.rs`, `mechanics/admin_client.rs` | derived, 8192 | Derived: the bytes one `CMD_SEND` carries (`net_proto::data_capacity(NET_OUT_MAX_RECORD)`), the `net_out` port's `max_record` (8197) that `tls.clear_in` accepts; a longer answer or request goes as several |
+| Gate command frame | `CMD_FRAME_MAX` | `mechanics/admin_gate_body.rs` | derived, 6 | Derived: the longer of the two commands the gate's listener sends, `CMD_BIND` and `CMD_CLOSE`, with its header |
 | Client chains | `MAX_CHAINS` | `mechanics/admin_client.rs` | 8 | Derived: what one session may hold (`MAX_SESSION_GRANTS`); a capability file with more is refused |
 | Capability file | `CAP_FILE_MAX` | `mechanics/admin_client.rs` | derived, 11008 | Derived: `MAX_CHAINS` lines of the longest chain text |
 | Client authority | `AUTHORITY_MAX` | `mechanics/admin_client.rs` | 128 | Policy: the longest `host[:port]` a client dials |

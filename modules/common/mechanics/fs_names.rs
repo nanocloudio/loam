@@ -33,7 +33,7 @@
 
 /// The kernel's provider dispatch entry point, taken by pointer so
 /// this file names no type from its includer's module tree.
-pub type ProviderCall = unsafe extern "C" fn(i32, u32, *mut u8, usize) -> i32;
+pub type ProviderCall = unsafe extern "C" fn(i32, u32, *mut u8, usize, *mut u8, usize) -> i32;
 
 pub const FS_OPEN: u32 = crate::abi::registry::fs::OPEN;
 pub const FS_CLOSE: u32 = crate::abi::registry::fs::CLOSE;
@@ -44,10 +44,10 @@ pub const FS_CAPS: u32 = crate::abi::registry::fs::CAPS;
 
 /// `caps::RENAME` — atomic replace, both parent directories durable on
 /// return.
-pub const CAP_RENAME: u32 = 1 << 8;
+pub const CAP_RENAME: u32 = crate::abi::contracts::storage::fs::caps::RENAME;
 /// `caps::FSYNC_NAME` — durable publication of a parent-directory
 /// entry the provider last minted for a path.
-pub const CAP_FSYNC_NAME: u32 = 1 << 11;
+pub const CAP_FSYNC_NAME: u32 = crate::abi::contracts::storage::fs::caps::FSYNC_NAME;
 
 /// The provider's capability bitmap, or `None` when it did not answer.
 ///
@@ -62,9 +62,17 @@ pub const CAP_FSYNC_NAME: u32 = 1 << 11;
 ///
 /// So: `None` means ask again, and a caller must not record it.
 pub unsafe fn caps(call: ProviderCall) -> Option<u32> {
-    let mut out = [0u8; 4];
-    if call(-1, FS_CAPS, out.as_mut_ptr(), out.len()) >= 4 {
-        Some(u32::from_le_bytes(out))
+    let mut out = [0u8; crate::abi::kernel_abi::caps_word::LEN];
+    if call(
+        -1,
+        FS_CAPS,
+        out.as_mut_ptr(),
+        out.len(),
+        core::ptr::null_mut(),
+        0,
+    ) == 0
+    {
+        crate::abi::kernel_abi::caps_word::parse(&out)
     } else {
         None
     }
@@ -94,7 +102,14 @@ pub const fn pending(rc: i32) -> bool {
 /// [`pending`] while it is not decided (re-ask with the same `path` on a
 /// later step), any other negative a failure.
 pub unsafe fn fsync_name(call: ProviderCall, path: &[u8]) -> i32 {
-    call(-1, FS_FSYNC_NAME, path.as_ptr() as *mut u8, path.len())
+    call(
+        -1,
+        FS_FSYNC_NAME,
+        path.as_ptr() as *mut u8,
+        path.len(),
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 /// `RENAME`'s framing: a `u16` length before each of the two paths.
@@ -134,7 +149,14 @@ pub unsafe fn rename(call: ProviderCall, src: &[u8], dst: &[u8]) -> i32 {
     let at = 2 + src.len();
     arg[at..at + 2].copy_from_slice(&(dst.len() as u16).to_le_bytes());
     arg[at + 2..needed].copy_from_slice(dst);
-    call(-1, FS_RENAME, arg.as_mut_ptr(), needed)
+    call(
+        -1,
+        FS_RENAME,
+        arg.as_mut_ptr(),
+        needed,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 /// Remove `path`. The name is not retired until a `fsync_name` covers
@@ -145,7 +167,14 @@ pub unsafe fn rename(call: ProviderCall, src: &[u8], dst: &[u8]) -> i32 {
 /// [`pending`] undecided (re-ask with the same `path`), `ENOENT` already
 /// gone, any other negative a failure.
 pub unsafe fn unlink(call: ProviderCall, path: &[u8]) -> i32 {
-    call(-1, FS_UNLINK, path.as_ptr() as *mut u8, path.len())
+    call(
+        -1,
+        FS_UNLINK,
+        path.as_ptr() as *mut u8,
+        path.len(),
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 /// Whether `path` still resolves: `Some(true)` it does, `Some(false)` it
@@ -154,13 +183,27 @@ pub unsafe fn unlink(call: ProviderCall, path: &[u8]) -> i32 {
 /// "could not remove" without depending on a provider's errno mapping
 /// beyond that: a pending answer is never read as absence.
 pub unsafe fn name_present(call: ProviderCall, path: &[u8]) -> Option<bool> {
-    let fd = call(-1, FS_OPEN, path.as_ptr() as *mut u8, path.len());
+    let fd = call(
+        -1,
+        FS_OPEN,
+        path.as_ptr() as *mut u8,
+        path.len(),
+        core::ptr::null_mut(),
+        0,
+    );
     if pending(fd) {
         return None;
     }
     if fd < 0 {
         return Some(false);
     }
-    let _ = call(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    let _ = call(
+        fd,
+        FS_CLOSE,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
     Some(true)
 }

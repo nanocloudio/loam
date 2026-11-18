@@ -84,6 +84,13 @@ mod params_def {
 
 fluxor_rt::module_facts! { state: body::ModuleState }
 
+/// With `admin` set, `admin_in` carries what `tls.clear_out` writes, one
+/// frame of at most this many bytes, header included.
+pub const NET_IN_ACCEPTS_RECORD: usize = abi::contracts::net::datagram::TRANSPORT_RECORD_MAX;
+/// With `admin` set, `admin_out` carries one request fragment per
+/// `CMD_SEND`, what `tls.clear_in` accepts.
+pub const NET_OUT_MAX_RECORD: usize = 8197;
+
 #[no_mangle]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
@@ -131,16 +138,28 @@ pub unsafe extern "C" fn module_new(
         }
         let tag = dev_requester_tag(&*sys);
         body::connect(state_ptr, in_chan, admin_out, tag);
-        if out_chan >= 0 {
-            dev_channel_register_ioctl(
-                &*sys,
-                out_chan,
-                state_ptr as *mut c_void,
-                Some(body::block_ioctl),
-            );
-        }
         0
     }
+}
+
+/// `storage.block` for the consumer wired to `blocks`.
+///
+/// # Safety
+/// Kernel provider-dispatch entry point: `state` is the instance block this
+/// module's `module_new` initialised; `arg[..arg_len]` and
+/// `data[..data_len]` are valid for the call.
+#[no_mangle]
+#[link_section = ".text.module_provider_dispatch"]
+pub unsafe extern "C" fn module_provider_dispatch(
+    state: *mut u8,
+    handle: i32,
+    op: u32,
+    arg: *mut u8,
+    arg_len: usize,
+    data: *mut u8,
+    data_len: usize,
+) -> i32 {
+    unsafe { body::provider_dispatch(state, handle, op, arg, arg_len, data, data_len) }
 }
 
 /// The extended entries past the schema's end marker, `[tag][0x00][len BE]

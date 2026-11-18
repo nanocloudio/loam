@@ -48,7 +48,7 @@ const FS_CAPS: u32 = super::abi::registry::fs::CAPS;
 
 /// `caps::FSYNC_ASYNC` — the provider implements the pipelined
 /// `WRITE_ASYNC` + `FSYNC_SUBMIT` + `FSYNC_POLL` tier.
-const CAP_FSYNC_ASYNC: u32 = 1 << 10;
+const CAP_FSYNC_ASYNC: u32 = super::abi::contracts::storage::fs::caps::FSYNC_ASYNC;
 
 /// Per-record cap. Matches `loam_wire::MAX_STRING`-bounded events
 /// plus their 16-byte fixed prefix, with headroom.
@@ -193,8 +193,14 @@ impl WalOpener {
                     } else {
                         FS_OPEN
                     };
-                    let fd =
-                        (syscalls.provider_call)(-1, opcode, path.as_ptr() as *mut u8, path.len());
+                    let fd = (syscalls.provider_call)(
+                        -1,
+                        opcode,
+                        path.as_ptr() as *mut u8,
+                        path.len(),
+                        core::ptr::null_mut(),
+                        0,
+                    );
                     if pending(fd) {
                         return OpenPoll::Pending;
                     }
@@ -274,21 +280,38 @@ impl Default for WalOpener {
     }
 }
 
-/// FS_STAT into a transient 8-byte buffer; returns the file size
-/// in bytes. Layout per the fs contract (`fluxor_abi::contracts::storage::fs`):
-/// `[size: u32 LE, mtime: u32 LE]`.
+/// FS_STAT's size, in bytes. The answer is one
+/// `fluxor_abi::contracts::storage::fs::Stat` record; a size past `u32`
+/// is `EOVERFLOW`, beyond any WAL this module writes.
 unsafe fn wal_size(syscalls: &SyscallTable, fd: i32) -> Result<u32, WalReplayError> {
-    let mut buf = [0u8; 8];
-    let rc = (syscalls.provider_call)(fd, FS_STAT, buf.as_mut_ptr(), buf.len());
+    let mut buf = [0u8; super::abi::contracts::storage::fs::stat::LEN];
+    let rc = (syscalls.provider_call)(
+        fd,
+        FS_STAT,
+        buf.as_mut_ptr(),
+        buf.len(),
+        core::ptr::null_mut(),
+        0,
+    );
     if rc < 0 {
         return Err(WalReplayError::StatFailed(rc));
     }
-    Ok(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
+    let Some(st) = super::abi::contracts::storage::fs::Stat::decode(&buf) else {
+        return Err(WalReplayError::StatFailed(-22));
+    };
+    u32::try_from(st.size).map_err(|_| WalReplayError::StatFailed(-75))
 }
 
-unsafe fn fs_seek(syscalls: &SyscallTable, fd: i32, offset: i32) -> i32 {
-    let bytes = offset.to_le_bytes();
-    (syscalls.provider_call)(fd, FS_SEEK, bytes.as_ptr() as *mut u8, bytes.len())
+unsafe fn fs_seek(syscalls: &SyscallTable, fd: i32, offset: u32) -> i32 {
+    let mut bytes = super::abi::contracts::storage::fs::seek::encode(u64::from(offset));
+    (syscalls.provider_call)(
+        fd,
+        FS_SEEK,
+        bytes.as_mut_ptr(),
+        bytes.len(),
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 // ── Resumable append ──────────────────────────────────────────────
@@ -452,7 +475,7 @@ impl WalAppender {
                     if size > i32::MAX as u32 {
                         return self.fail(WalAppendError::SeekFailed(-22));
                     }
-                    let rc = fs_seek(syscalls, fd, size as i32);
+                    let rc = fs_seek(syscalls, fd, size);
                     if pending(rc) {
                         return AppendState::Pending;
                     }
@@ -472,6 +495,8 @@ impl WalAppender {
                     let rc = (syscalls.provider_call)(
                         fd,
                         opcode,
+                        core::ptr::null_mut(),
+                        0,
                         self.frame.as_mut_ptr().add(off),
                         want,
                     );
@@ -514,6 +539,8 @@ impl WalAppender {
                         FS_FSYNC_SUBMIT,
                         self.ticket.as_mut_ptr(),
                         self.ticket.len(),
+                        core::ptr::null_mut(),
+                        0,
                     );
                     if pending(rc) {
                         return AppendState::Pending;
@@ -529,6 +556,8 @@ impl WalAppender {
                         FS_FSYNC_POLL,
                         self.ticket.as_mut_ptr(),
                         self.ticket.len(),
+                        core::ptr::null_mut(),
+                        0,
                     );
                     if pending(rc) {
                         return AppendState::Pending;
@@ -544,7 +573,14 @@ impl WalAppender {
                 _ => {
                     // Re-asked byte-identically (same fd, no arg) until it
                     // decides: `EINPROGRESS` is taken-not-decided.
-                    let rc = (syscalls.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
+                    let rc = (syscalls.provider_call)(
+                        fd,
+                        FS_FSYNC,
+                        core::ptr::null_mut(),
+                        0,
+                        core::ptr::null_mut(),
+                        0,
+                    );
                     if pending(rc) {
                         return AppendState::Pending;
                     }
@@ -561,14 +597,21 @@ impl WalAppender {
     /// that does not answer keeps the synchronous tier.
     unsafe fn async_tier(&mut self, syscalls: &SyscallTable, fd: i32) -> bool {
         if self.caps_known == 0 {
-            let mut out = [0u8; 4];
-            let rc = (syscalls.provider_call)(fd, FS_CAPS, out.as_mut_ptr(), out.len());
+            let mut out = [0u8; super::abi::kernel_abi::caps_word::LEN];
+            let rc = (syscalls.provider_call)(
+                fd,
+                FS_CAPS,
+                out.as_mut_ptr(),
+                out.len(),
+                core::ptr::null_mut(),
+                0,
+            );
             // Only a real answer is recorded. A provider still attaching its
             // volume refuses the query, and latching that refusal would hold
             // this appender on the blocking fence tier for good — on a
             // provider that implements the pipelined one.
-            if rc >= 4 {
-                self.caps = u32::from_le_bytes(out);
+            if let (0, Some(word)) = (rc, super::abi::kernel_abi::caps_word::parse(&out)) {
+                self.caps = word;
                 self.caps_known = 1;
             }
         }
@@ -830,7 +873,8 @@ unsafe fn read_some(
     let mut filled = at;
     while filled < end {
         let want = end - filled;
-        let n = (syscalls.provider_call)(fd, FS_READ, buf.add(filled), want);
+        let n =
+            (syscalls.provider_call)(fd, FS_READ, core::ptr::null_mut(), 0, buf.add(filled), want);
         if pending(n) {
             return ReadSome::Pending(filled);
         }
@@ -848,7 +892,14 @@ unsafe fn read_some(
 }
 
 pub unsafe fn wal_close(syscalls: &SyscallTable, fd: i32) -> i32 {
-    (syscalls.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0)
+    (syscalls.provider_call)(
+        fd,
+        FS_CLOSE,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 // ── Resumable rotation ────────────────────────────────────────────
@@ -1063,6 +1114,8 @@ impl WalRotator {
                         FS_OPEN_CREATE,
                         stage.as_ptr() as *mut u8,
                         stage.len(),
+                        core::ptr::null_mut(),
+                        0,
                     );
                     if pending(sfd) {
                         return RotateOutcome::Pending;
@@ -1101,6 +1154,8 @@ impl WalRotator {
                     let rc = (syscalls.provider_call)(
                         self.stage_fd,
                         FS_WRITE,
+                        core::ptr::null_mut(),
+                        0,
                         scratch.as_mut_ptr().add(off),
                         want,
                     );
@@ -1122,8 +1177,14 @@ impl WalRotator {
                 ROT_FSYNC => {
                     // Fence before close: `CLOSE` reports no writeback
                     // failure, so durability comes only from here.
-                    let rc =
-                        (syscalls.provider_call)(self.stage_fd, FS_FSYNC, core::ptr::null_mut(), 0);
+                    let rc = (syscalls.provider_call)(
+                        self.stage_fd,
+                        FS_FSYNC,
+                        core::ptr::null_mut(),
+                        0,
+                        core::ptr::null_mut(),
+                        0,
+                    );
                     if pending(rc) {
                         return RotateOutcome::Pending;
                     }

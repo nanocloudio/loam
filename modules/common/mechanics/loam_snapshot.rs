@@ -288,8 +288,15 @@ pub enum SnapRead<T> {
 
 /// SAFETY: `syscalls` must be a valid provider table.
 unsafe fn seek(syscalls: &super::SyscallTable, fd: i32, off: u32) -> SnapRead<()> {
-    let b = off.to_le_bytes();
-    let rc = (syscalls.provider_call)(fd, FS_SEEK, b.as_ptr() as *mut u8, 4);
+    let mut b = crate::abi::contracts::storage::fs::seek::encode(u64::from(off));
+    let rc = (syscalls.provider_call)(
+        fd,
+        FS_SEEK,
+        b.as_mut_ptr(),
+        b.len(),
+        core::ptr::null_mut(),
+        0,
+    );
     if super::fs_names::pending(rc) {
         return SnapRead::Pending;
     }
@@ -309,7 +316,14 @@ unsafe fn read_exact(syscalls: &super::SyscallTable, fd: i32, buf: &mut [u8]) ->
     let mut filled = 0usize;
     while filled < buf.len() {
         let want = buf.len() - filled;
-        let n = (syscalls.provider_call)(fd, FS_READ, buf.as_mut_ptr().add(filled), want);
+        let n = (syscalls.provider_call)(
+            fd,
+            FS_READ,
+            core::ptr::null_mut(),
+            0,
+            buf.as_mut_ptr().add(filled),
+            want,
+        );
         if super::fs_names::pending(n) {
             return SnapRead::Pending;
         }
@@ -391,8 +405,14 @@ impl SnapOpener {
         loop {
             match self.phase {
                 SO_OPEN => {
-                    let fd =
-                        (syscalls.provider_call)(-1, FS_OPEN, path.as_ptr() as *mut u8, path.len());
+                    let fd = (syscalls.provider_call)(
+                        -1,
+                        FS_OPEN,
+                        path.as_ptr() as *mut u8,
+                        path.len(),
+                        core::ptr::null_mut(),
+                        0,
+                    );
                     if super::fs_names::pending(fd) {
                         return SnapOpenPoll::Pending;
                     }
@@ -434,12 +454,14 @@ impl SnapOpener {
                     if magic != SNAP_MAGIC {
                         return self.invalid(syscalls);
                     }
-                    let mut stat = [0u8; 8];
+                    let mut stat = [0u8; crate::abi::contracts::storage::fs::stat::LEN];
                     let rc = (syscalls.provider_call)(
                         self.fd_plus1 - 1,
                         FS_STAT,
                         stat.as_mut_ptr(),
                         stat.len(),
+                        core::ptr::null_mut(),
+                        0,
                     );
                     if super::fs_names::pending(rc) {
                         return SnapOpenPoll::Pending;
@@ -447,7 +469,10 @@ impl SnapOpener {
                     if rc < 0 {
                         return self.invalid(syscalls);
                     }
-                    let size = u32::from_le_bytes([stat[0], stat[1], stat[2], stat[3]]) as u64;
+                    let Some(st) = crate::abi::contracts::storage::fs::Stat::decode(&stat) else {
+                        return self.invalid(syscalls);
+                    };
+                    let size = st.size;
                     let expect = SNAP_HDR as u64 + count as u64 * REC_SIZE as u64;
                     if size != expect {
                         return self.invalid(syscalls);
@@ -475,7 +500,14 @@ impl SnapOpener {
     /// SAFETY: valid syscalls table.
     pub unsafe fn abandon(&mut self, syscalls: &super::SyscallTable) {
         if self.fd_plus1 > 0 {
-            let _ = (syscalls.provider_call)(self.fd_plus1 - 1, FS_CLOSE, core::ptr::null_mut(), 0);
+            let _ = (syscalls.provider_call)(
+                self.fd_plus1 - 1,
+                FS_CLOSE,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
         }
         *self = Self::new();
     }
@@ -528,12 +560,21 @@ impl SnapBestOpener {
                 SnapOpenPoll::Invalid => {}
                 SnapOpenPoll::Opened(s) => {
                     if self.has_best != 0 && self.best.generation >= s.generation {
-                        let _ = (syscalls.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+                        let _ = (syscalls.provider_call)(
+                            s.fd,
+                            FS_CLOSE,
+                            core::ptr::null_mut(),
+                            0,
+                            core::ptr::null_mut(),
+                            0,
+                        );
                     } else {
                         if self.has_best != 0 {
                             let _ = (syscalls.provider_call)(
                                 self.best.fd,
                                 FS_CLOSE,
+                                core::ptr::null_mut(),
+                                0,
                                 core::ptr::null_mut(),
                                 0,
                             );
@@ -561,7 +602,14 @@ impl SnapBestOpener {
     pub unsafe fn abandon(&mut self, syscalls: &super::SyscallTable) {
         self.one.abandon(syscalls);
         if self.has_best != 0 {
-            let _ = (syscalls.provider_call)(self.best.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            let _ = (syscalls.provider_call)(
+                self.best.fd,
+                FS_CLOSE,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
         }
         *self = Self::new();
     }
@@ -779,6 +827,8 @@ impl SnapWriter {
             let rc = (syscalls.provider_call)(
                 self.fd_plus1 - 1,
                 FS_WRITE,
+                core::ptr::null_mut(),
+                0,
                 self.stage.as_mut_ptr().add(off),
                 want,
             );
@@ -827,6 +877,8 @@ impl SnapWriter {
                         FS_OPEN_CREATE,
                         p.as_ptr() as *mut u8,
                         p.len(),
+                        core::ptr::null_mut(),
+                        0,
                     );
                     if super::fs_names::pending(fd) {
                         return WritePoll::Pending;
@@ -915,6 +967,8 @@ impl SnapWriter {
                         FS_FSYNC,
                         core::ptr::null_mut(),
                         0,
+                        core::ptr::null_mut(),
+                        0,
                     );
                     if super::fs_names::pending(rc) {
                         return WritePoll::Pending;
@@ -968,6 +1022,8 @@ impl SnapWriter {
                         FS_CLOSE,
                         core::ptr::null_mut(),
                         0,
+                        core::ptr::null_mut(),
+                        0,
                     );
                     self.fd_plus1 = 0;
                     self.phase = W_DONE;
@@ -987,7 +1043,14 @@ impl SnapWriter {
     /// SAFETY: valid syscalls table.
     pub unsafe fn abandon(&mut self, syscalls: &super::SyscallTable) {
         if self.fd_plus1 > 0 {
-            let _ = (syscalls.provider_call)(self.fd_plus1 - 1, FS_CLOSE, core::ptr::null_mut(), 0);
+            let _ = (syscalls.provider_call)(
+                self.fd_plus1 - 1,
+                FS_CLOSE,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
         }
         self.fd_plus1 = 0;
         self.stage_len = 0;

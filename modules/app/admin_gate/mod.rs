@@ -112,7 +112,16 @@ unsafe fn refuse(sys: &SyscallTable, why: &[u8]) -> i32 {
     -22
 }
 
-fluxor_rt::module_facts! { state: body::ModuleState }
+// `net_in` reads what `tls.clear_out` writes, one transport segment's worth;
+// `net_out` writes one answer fragment per `CMD_SEND`, what `tls.clear_in`
+// accepts.
+fluxor_rt::module_facts! {
+    state: body::ModuleState,
+    records: [
+        in 0 NET_IN_ACCEPTS_RECORD = abi::contracts::net::datagram::TRANSPORT_RECORD_MAX,
+        out 0 NET_OUT_MAX_RECORD = 8197,
+    ],
+}
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

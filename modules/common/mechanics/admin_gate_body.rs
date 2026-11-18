@@ -85,10 +85,18 @@ const CAP_FRAME_MAX: usize = cap::FRAME_HDR + cap::PRESENT_MAX;
 /// A session's reassembly: a whole request, and the one transport
 /// fragment that may arrive behind a partial one. Network bytes are read
 /// only while nothing is owed (`read_net`), so a session never holds more.
-const RX_MAX: usize = aw::REQUEST_MAX + net_proto::MAX_DATA_FRAGMENT;
+const RX_MAX: usize = aw::REQUEST_MAX + net_proto::data_capacity(crate::NET_IN_ACCEPTS_RECORD);
 /// One net_proto frame from the transport.
-const NET_FRAME_MAX: usize =
-    net_proto::FRAME_HDR + net_proto::CONN_ID_LEN + net_proto::MAX_DATA_FRAGMENT;
+const NET_FRAME_MAX: usize = crate::NET_IN_ACCEPTS_RECORD;
+/// The one frame `net_cmd` sends: a `CMD_BIND` or a `CMD_CLOSE`.
+const CMD_FRAME_MAX: usize = net_proto::FRAME_HDR
+    + if net_proto::BIND_LEN > net_proto::CLOSE_LEN {
+        net_proto::BIND_LEN
+    } else {
+        net_proto::CLOSE_LEN
+    };
+/// The answer bytes one `CMD_SEND` carries.
+const SEND_MAX: usize = net_proto::data_capacity(crate::NET_OUT_MAX_RECORD);
 /// Identity bytes kept per session: a key fingerprint, or a link's tag.
 const ID_MAX: usize = peer_identity::MAX_FINGERPRINT;
 /// Steps between `CMD_BIND` attempts until the transport answers.
@@ -309,6 +317,8 @@ unsafe fn clock(s: &ModuleState) -> Option<cap::Clock> {
         super::abi::kernel_abi::timer::TRUSTED_UNIX,
         rec.as_mut_ptr(),
         rec.len(),
+        core::ptr::null_mut(),
+        0,
     );
     if rc < 0 {
         return None;
@@ -357,7 +367,7 @@ unsafe fn net_cmd(s: &ModuleState, ty: u8, payload: &[u8]) -> bool {
     if s.net_out < 0 {
         return false;
     }
-    let mut f = [0u8; net_proto::FRAME_HDR + net_proto::CONN_ID_LEN + net_proto::MAX_CMD_DATA];
+    let mut f = [0u8; CMD_FRAME_MAX];
     let n = net_proto::FRAME_HDR + payload.len();
     if n > f.len() {
         return false;
@@ -376,7 +386,7 @@ unsafe fn bind_listener(s: &mut ModuleState) {
         s.bind_wait -= 1;
         return;
     }
-    if net_cmd(s, net_proto::CMD_BIND, &s.port.to_le_bytes()) {
+    if net_cmd(s, net_proto::CMD_BIND, &net_proto::bind(s.port, 0)) {
         s.bind_wait = BIND_RETRY_STEPS;
     }
 }
@@ -512,14 +522,13 @@ unsafe fn net_event(s: &mut ModuleState, ty: u8, p: &[u8]) {
     match ty {
         net_proto::MSG_BOUND => s.bound = 1,
         net_proto::MSG_ACCEPTED => {
-            if p.len() < net_proto::ACCEPTED_FIXED {
+            let Some(a) = net_proto::accepted_parts(p) else {
+                return;
+            };
+            if a.local_port != s.port {
                 return;
             }
-            let (conn, local_port) = net_proto::accepted_parts(p);
-            if local_port != s.port {
-                return;
-            }
-            let gen = net_proto::session_generation(p, net_proto::ACCEPTED_FIXED);
+            let (conn, gen) = (a.conn_id, a.opening.generation);
             let i = match net_find(s, conn, gen) {
                 Some(i) => Some(i),
                 None => net_alloc(s, conn, gen),
@@ -528,19 +537,17 @@ unsafe fn net_event(s: &mut ModuleState, ty: u8, p: &[u8]) {
                 Some(i) => s.net[i].accepted = 1,
                 None => {
                     s.sessions_refused = s.sessions_refused.wrapping_add(1);
-                    net_cmd(s, net_proto::CMD_CLOSE, &conn.to_le_bytes());
+                    net_cmd(s, net_proto::CMD_CLOSE, &net_proto::close(conn, false));
                 }
             }
         }
         net_proto::MSG_DATA => {
-            if p.len() < net_proto::CONN_ID_LEN {
+            let Some((conn, data)) = net_proto::data_parts(p) else {
                 return;
-            }
-            let conn = net_proto::conn_id(p);
+            };
             let Some(i) = net_by_conn(s, conn) else {
                 return;
             };
-            let data = &p[net_proto::CONN_ID_LEN..];
             let n = &mut s.net[i];
             let at = n.rx_len as usize;
             if n.closing != 0 {
@@ -557,14 +564,13 @@ unsafe fn net_event(s: &mut ModuleState, ty: u8, p: &[u8]) {
             serve_net(s, i);
         }
         net_proto::MSG_CLOSED => {
-            if p.len() < net_proto::CONN_ID_LEN {
+            let Some((conn, _)) = net_proto::closed_parts(p) else {
                 return;
-            }
-            let conn = net_proto::conn_id(p);
+            };
             if let Some(i) = net_by_conn(s, conn) {
                 end_net(s, i);
             }
-            net_cmd(s, net_proto::CMD_CLOSE, &conn.to_le_bytes());
+            net_cmd(s, net_proto::CMD_CLOSE, &net_proto::close(conn, false));
         }
         _ => {}
     }
@@ -580,7 +586,7 @@ unsafe fn end_net(s: &mut ModuleState, i: usize) {
 unsafe fn close_net(s: &mut ModuleState, i: usize) {
     let conn = s.net[i].conn;
     end_net(s, i);
-    net_cmd(s, net_proto::CMD_CLOSE, &conn.to_le_bytes());
+    net_cmd(s, net_proto::CMD_CLOSE, &net_proto::close(conn, false));
 }
 
 /// Serve the whole frames at the front of a network session's bytes.
@@ -1188,9 +1194,8 @@ unsafe fn flush_answer(s: &mut ModuleState) -> bool {
         KIND_NET => {
             while s.out.sent < s.out.len {
                 let at = s.out.sent as usize;
-                let take = (s.out.len as usize - at).min(net_proto::MAX_CMD_DATA);
-                let mut f =
-                    [0u8; net_proto::FRAME_HDR + net_proto::CONN_ID_LEN + net_proto::MAX_CMD_DATA];
+                let take = (s.out.len as usize - at).min(SEND_MAX);
+                let mut f = [0u8; crate::NET_OUT_MAX_RECORD];
                 let plen = net_proto::CONN_ID_LEN + take;
                 f[0] = net_proto::CMD_SEND;
                 put(&mut f[1..3], &(plen as u16).to_le_bytes());
@@ -1203,7 +1208,11 @@ unsafe fn flush_answer(s: &mut ModuleState) -> bool {
                 s.out.sent += take as u32;
             }
             if s.out.close_after != 0 {
-                if !net_cmd(s, net_proto::CMD_CLOSE, &s.out.conn.to_le_bytes()) {
+                if !net_cmd(
+                    s,
+                    net_proto::CMD_CLOSE,
+                    &net_proto::close(s.out.conn, false),
+                ) {
                     return false;
                 }
                 s.out.close_after = 0;

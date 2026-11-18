@@ -158,8 +158,8 @@ pub unsafe extern "C" fn module_step(state_ptr: *mut u8) -> StepReturn {
 // advertises a surface nothing can reach.
 
 /// # Safety
-/// The loader passes this module's own state pointer and a caller
-/// buffer valid for `arg_len` bytes.
+/// The loader passes this module's own state pointer, a caller `arg`
+/// valid for `arg_len` bytes and a disjoint `data` valid for `data_len`.
 #[export_name = "module_provider_dispatch"]
 #[link_section = ".text.module_provider_dispatch"]
 pub unsafe extern "C" fn namespace_provider_dispatch(
@@ -168,8 +168,10 @@ pub unsafe extern "C" fn namespace_provider_dispatch(
     opcode: u32,
     arg: *mut u8,
     arg_len: usize,
+    data: *mut u8,
+    data_len: usize,
 ) -> i32 {
-    body::provider_dispatch_impl(state_ptr, handle, opcode, arg, arg_len)
+    body::provider_dispatch_impl(state_ptr, handle, opcode, arg, arg_len, data, data_len)
 }
 
 // Panic handler comes from `runtime.rs` via the include! above.

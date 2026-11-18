@@ -705,7 +705,7 @@ unsafe fn path_call(s: &ModuleState, op: u32, path: &[u8]) -> i32 {
         return -22;
     }
     put(&mut p, path);
-    (sys(s).provider_call)(-1, op, p.as_mut_ptr(), path.len())
+    (sys(s).provider_call)(-1, op, p.as_mut_ptr(), path.len(), core::ptr::null_mut(), 0)
 }
 
 unsafe fn fs_open(s: &ModuleState, path: &[u8]) -> FdPoll {
@@ -761,7 +761,14 @@ unsafe fn fs_unlink(s: &ModuleState, path: &[u8]) -> Io {
 unsafe fn fs_close(s: &mut ModuleState) {
     if s.fd >= 0 {
         let fd = s.fd;
-        let _ = (sys(s).provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        let _ = (sys(s).provider_call)(
+            fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.fd = -1;
     }
 }
@@ -769,7 +776,14 @@ unsafe fn fs_close(s: &mut ModuleState) {
 unsafe fn fs_close2(s: &mut ModuleState) {
     if s.fd2 >= 0 {
         let fd = s.fd2;
-        let _ = (sys(s).provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        let _ = (sys(s).provider_call)(
+            fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.fd2 = -1;
     }
 }
@@ -777,7 +791,14 @@ unsafe fn fs_close2(s: &mut ModuleState) {
 /// Fence `fd`'s bytes: `Done` once the provider answers that they are
 /// durable.
 unsafe fn fs_fsync(s: &ModuleState, fd: i32) -> Io {
-    let rc = (sys(s).provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
+    let rc = (sys(s).provider_call)(
+        fd,
+        FS_FSYNC,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
     if pending(rc) {
         Io::Pending
     } else if rc < 0 {
@@ -820,7 +841,14 @@ unsafe fn fs_fill(s: &mut ModuleState, n: usize) -> Fill {
         if got == n {
             return Fill::Done(got);
         }
-        let rc = (sys(s).provider_call)(fd, FS_READ, s.buf.as_mut_ptr().add(got), n - got);
+        let rc = (sys(s).provider_call)(
+            fd,
+            FS_READ,
+            core::ptr::null_mut(),
+            0,
+            s.buf.as_mut_ptr().add(got),
+            n - got,
+        );
         if pending(rc) {
             return Fill::Pending;
         }
@@ -872,7 +900,14 @@ unsafe fn fs_drain(s: &mut ModuleState, fd: i32) -> Io {
             return Io::Failed;
         };
         let len = b.len();
-        let rc = (sys(s).provider_call)(fd, FS_WRITE, b.as_ptr() as *mut u8, len);
+        let rc = (sys(s).provider_call)(
+            fd,
+            FS_WRITE,
+            core::ptr::null_mut(),
+            0,
+            b.as_ptr() as *mut u8,
+            len,
+        );
         if pending(rc) {
             return Io::Pending;
         }
@@ -971,7 +1006,14 @@ fn answer(s: &ModuleState) -> &'static [u8] {
 /// Fresh random bytes; false when the platform has none. A holder and a
 /// volume id must be distinct from every other, so there is no stand-in.
 unsafe fn random(s: &ModuleState, out: &mut [u8]) -> bool {
-    (sys(s).provider_call)(-1, RANDOM, out.as_mut_ptr(), out.len()) >= 0
+    (sys(s).provider_call)(
+        -1,
+        RANDOM,
+        core::ptr::null_mut(),
+        0,
+        out.as_mut_ptr(),
+        out.len(),
+    ) >= 0
 }
 
 fn digest_of(oid: &[u8]) -> Option<[u8; 32]> {
@@ -1017,7 +1059,14 @@ pub unsafe fn module_step_impl(state_ptr: *mut u8) -> StepReturn {
         return StepReturn::Done;
     }
     let mut b = [0u8; 8];
-    (sys(s).provider_call)(-1, TIMER_MILLIS, b.as_mut_ptr(), 8);
+    (sys(s).provider_call)(
+        -1,
+        TIMER_MILLIS,
+        b.as_mut_ptr(),
+        8,
+        core::ptr::null_mut(),
+        0,
+    );
     s.now_ms = u64::from_le_bytes(b);
 
     if s.done != 0 {
@@ -2474,7 +2523,14 @@ unsafe fn mf_fill(s: &mut ModuleState) -> Io {
         return Io::Done;
     }
     let fd = s.fd2;
-    let rc = (sys(s).provider_call)(fd, FS_READ, s.mf.as_mut_ptr().add(at), room);
+    let rc = (sys(s).provider_call)(
+        fd,
+        FS_READ,
+        core::ptr::null_mut(),
+        0,
+        s.mf.as_mut_ptr().add(at),
+        room,
+    );
     if pending(rc) {
         return Io::Pending;
     }
@@ -2813,8 +2869,15 @@ unsafe fn screate_next(s: &mut ModuleState, src: &[u8], snap: &[u8]) {
 unsafe fn screate_finish(s: &mut ModuleState, src: &[u8], file: &[u8]) {
     let fd = s.fd2;
     if s.st == SC_SEEK {
-        let zero = [0u8; 4];
-        let rc = (sys(s).provider_call)(fd, FS_SEEK, zero.as_ptr() as *mut u8, 4);
+        let mut zero = super::abi::contracts::storage::fs::seek::encode(0);
+        let rc = (sys(s).provider_call)(
+            fd,
+            FS_SEEK,
+            zero.as_mut_ptr(),
+            zero.len(),
+            core::ptr::null_mut(),
+            0,
+        );
         if pending(rc) {
             return;
         }
