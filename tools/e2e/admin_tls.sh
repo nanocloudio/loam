@@ -145,7 +145,7 @@ grep -q "forbidden" "$W/out" || {
 }
 pass "a capability that does not reach the root is refused"
 
-# An install builds the bundle in place, with the identity it finds:
+# An install builds the package in place, with the identity it finds:
 # the operator's applet is installed again after the foreign one.
 install_applet "$W/foreign-home" "$W/foreign"
 if loam_as "$W/foreign-home" "$W/ops.cap" "$PORT" ls tenant; then

@@ -118,7 +118,7 @@ fluxor run loam-s3 \
 ```
 
 Each credentials line is an access key, its secret, the bucket scope
-it may sign for, and the capability it acts under. The bundle's graph
+it may sign for, and the capability it acts under. The package's graph
 is wave's `http` and `s3_serve` over an include of the `loam-node`
 stack (below), whose exchange front it leaves unwired and without a
 capability: `s3_serve` is its only door. Every request is
@@ -271,7 +271,7 @@ fluxor run loam-admin \
 ```
 
 A client certificate must chain to `ca`. The operator applet is the
-client: installed once (the bundle carries no credential), and run with
+client: installed once (the package carries no credential), and run with
 the operator's certificate and key under `~/.config/loam/` (`client.der`,
 `client.key.der`, DER) — `fluxor exec` gives them to the applet on each
 run, or `--identity CERT,KEY` names others — the node's address and a
@@ -425,4 +425,4 @@ store alongside loam's (declared in `fluxor.toml`, staged by
 `fluxor sync`). [`examples/linux/clustor_multi3.yaml`](../examples/linux/clustor_multi3.yaml)
 is the three-node shape and `tools/e2e/multi3_bringup.sh` brings it
 up; the composed deployment profiles are not yet published as
-self-contained service bundles.
+self-contained service packages.

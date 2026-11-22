@@ -100,7 +100,7 @@ cleanup() {
   done
   # The setsid'd `fluxor run` gets its own session (group kill by
   # subshell pid misses it), and its fluxor-linux grandchild's argv
-  # is the graph.img path, not the yaml — match BOTH patterns or
+  # is the node.img path, not the yaml — match BOTH patterns or
   # a leaked node squats on a peer port and wrecks the next run.
   pkill -TERM -f "loam-multi3-n[0-9].yaml" 2>/dev/null
   pkill -TERM -f "target/linux/loam-multi3-n" 2>/dev/null

@@ -9,7 +9,7 @@
 # certificate and key — is `file` params: files the caller supplies, which
 # the run checks are there and renders as absolute paths; `tls` reads them
 # at runtime and re-reads them when they change, so a rotated certificate
-# takes effect without a restart. The bundle carries none of them.
+# takes effect without a restart. The package carries none of them.
 #
 # The device is `loam_volume`: the volume's writer, holding its lease,
 # staging writes and committing them at a flush as one revision. It

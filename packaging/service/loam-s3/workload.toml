@@ -1,13 +1,13 @@
 # loam-s3: an S3 endpoint over a loam storage node.
 #
 #   fluxor publish                           # in this project
-#   # in the consumer: [dependencies] loam = "…", [uses] bundles = ["loam-s3"]
+#   # in the consumer: [dependencies] loam = "…", [uses] packages = ["loam-s3"]
 #   fluxor update && fluxor sync
 #   fluxor run loam-s3 --params loam-s3.toml
 #
 # wave's `http` and `s3_serve` terminate S3 and SigV4 in front of an
 # include of the `loam-node` stack (packaging/stack/loam-node.yaml);
-# the bundle carries the graph with that include expanded. Every object
+# the package carries the graph with that include expanded. Every object
 # goes through the node's `storage.object` provider, which presents each
 # access key's capability to the node's admin plane and works under the
 # grant it is given. Credentials name a scope and a capability per access

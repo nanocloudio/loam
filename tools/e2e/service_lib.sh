@@ -1,7 +1,7 @@
 # Shared setup for the service gates (s3_service, admin_tls, nbd, fleet).
 #
-# Each gate runs loam's bundles the way an operator does — `fluxor run`
-# of a bundle by name, or of a graph, with `--param` values — and drives
+# Each gate runs loam's packages the way an operator does — `fluxor run`
+# of a package by name, or of a graph, with `--param` values — and drives
 # them from outside with real clients: curl, the `loam` applet, an NBD
 # client. Everything a gate creates lives under one work directory; every
 # graph it starts is stopped by its own process tree, never by a name

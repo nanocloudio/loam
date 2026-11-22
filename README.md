@@ -64,7 +64,7 @@ dependency versions, run `fluxor update` and commit the lockfile.
 
 ## Services
 
-Loam runs as service bundles: a graph, the modules it pins, and a
+Loam runs as service packages: a graph, the modules it pins, and a
 declared parameter schema. Each is run with its parameters, from
 the store once published or from its manifest in this checkout:
 
@@ -88,7 +88,7 @@ The mutual-TLS services take their CA, certificate and key as `file`
 params: files the caller supplies
 (`--param ca=ca.pem --param cert=node.der --param key=node.key.der`),
 which the run renders as absolute paths and `tls` reads at runtime,
-re-reading them when they change. The bundles carry none of them.
+re-reading them when they change. The packages carry none of them.
 
 | Stack | What it is |
 |---|---|
@@ -122,7 +122,7 @@ holds one `fxcap1.` chain per line (`fluxor modules cap mint`).
 |---|---|
 | `modules/app/` | One directory per PIC module: `mod.rs` + `manifest.toml`. |
 | `modules/common/` | Shared `no_std` source, split by storage tier: `mechanics/` (single-node) and `replicated/` (quorum; may reach clustor). |
-| `packaging/` | What loam ships: the `loam-node` stack, the service bundles and the applet's bundle. |
+| `packaging/` | What loam ships: the `loam-node` stack, the service packages and the applet's package. |
 | `examples/` | Reference graphs: the metadata plane, composed nodes, the body plane smoke. |
 | `tests/harness/` | The module harness: every unit test, over the same sources the modules build. |
 | `tools/` | CI gates, graph and service gates, diagnostics — see [`tools/README.md`](tools/README.md). |
@@ -190,8 +190,8 @@ deployment shapes.
 
 Siblings consume loam through the store, never through its checkout:
 `fluxor publish` puts loam's modules, its `loam-node` stack and its
-bundles into the store. A consumer lists `loam` under `[dependencies]`,
-names each bundle it runs under `[uses] bundles` and includes the stack
+packages into the store. A consumer lists `loam` under `[dependencies]`,
+names each package it runs under `[uses] packages` and includes the stack
 by name; `fluxor update` pins exactly those references in its
 `fluxor.lock`, and `fluxor sync` materialises them. A consumer either
 runs a loam service with its params (`fluxor run loam-s3 --param …`)

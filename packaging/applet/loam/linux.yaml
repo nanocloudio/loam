@@ -8,7 +8,7 @@
 # `FLUXOR_CA_BUNDLE` names, when set) and name the host the applet dials. The node accepts the applet by the OPERATOR's certificate, which
 # each run brings — `fluxor exec` gives `$HOME/.config/loam/client.der` and
 # `client.key.der` (or `--identity CERT,KEY`) to the client `tls` below. The
-# bundle carries no credential, so one published applet serves every
+# package carries no credential, so one published applet serves every
 # operator. Capabilities authorise what it does.
 target: linux
 tick_us: 100

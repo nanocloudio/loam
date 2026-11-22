@@ -9,7 +9,7 @@ version = "0.0.1"
 [dependencies]
 fluxor  = "0.0.1"
 clustor = "0.0.1"
-# wave owns the HTTP and S3 protocol tier: the loam-s3 bundle runs its
+# wave owns the HTTP and S3 protocol tier: the loam-s3 package runs its
 # `http` and `s3_serve` modules in front of loam's `storage.object`.
 wave    = "0.0.1"
 
@@ -71,8 +71,8 @@ same multi-consumer cause as modules/common/, on the test side."""
 # request answered. `body_publication.sh` gates the fence the body store
 # negotiates from a live filesystem provider.
 #
-# Service gates — loam's bundles run as an operator runs them and driven
-# from outside: `s3_service.sh` (the loam-s3 bundle under curl and wave's
+# Service gates — loam's packages run as an operator runs them and driven
+# from outside: `s3_service.sh` (the loam-s3 package under curl and wave's
 # S3 traffic driver, and restart durability), `admin_tls.sh` (the admin
 # plane over mutual TLS, driven by the `loam` applet), `nbd.sh` (a volume
 # as an NBD device: durability across kill -9, the writer lease) and

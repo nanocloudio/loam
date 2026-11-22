@@ -7,7 +7,7 @@
 # certificate and key — is `file` params: files the caller supplies, which
 # the run checks are there and renders as absolute paths; `tls` reads them
 # at runtime and re-reads them when they change, so a rotated certificate
-# takes effect without a restart. The bundle carries none of them.
+# takes effect without a restart. The package carries none of them.
 #
 # Every session presents mesh capability chains before it is admitted to
 # anything; a chain verifies against `mesh_roots`, and its leaf names the

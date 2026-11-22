@@ -14,7 +14,7 @@ convention shared with wave, spectra and quantum.
 | Script | What it gates |
 | --- | --- |
 | `shadow_guard.sh` | The shadow-tracked `tests/` and `examples/` are materialised, so nothing passes vacuously |
-| `shipping_surface.sh` | The shipping surface carries no cargo dependency: no crate but the test harness, no binary, modules mount only `modules/common` and the fluxor SDK, the bundles' modules are built |
+| `shipping_surface.sh` | The shipping surface carries no cargo dependency: no crate but the test harness, no binary, modules mount only `modules/common` and the fluxor SDK, the packages' modules are built |
 | `tier_guard.sh` | The storage tier boundary: mechanics vs replicated rosters, no upward reach, no clustor from mechanics |
 | `limit_guard.sh` | The limit register against the capacity profiles |
 | `profile_matrix.sh` | The harness under the minimal, embedded and server profiles (`fluxor ci` runs the default) |
@@ -23,7 +23,7 @@ convention shared with wave, spectra and quantum.
 
 | Script | What it gates |
 | --- | --- |
-| `s3_service.sh` | The loam-s3 bundle: an object's life under curl, refusals, wave's S3 traffic driver, restart durability |
+| `s3_service.sh` | The loam-s3 package: an object's life under curl, refusals, wave's S3 traffic driver, restart durability |
 | `admin_tls.sh` | The admin plane over mutual TLS, driven by the `loam` applet: files, volumes, snapshots, export, and the refusals |
 | `nbd.sh` | A volume as an NBD device: flush durability across kill -9, FUA, the writer lease, an ungranted device |
 | `fleet.sh` | Bodies on two loam-body nodes over remote_channel: replication, a node lost and regained |

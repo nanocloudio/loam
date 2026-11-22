@@ -57,7 +57,7 @@ execs=$(grep -nE 'cargo (run|build|install)' tools/ci/*.sh tools/e2e/*.sh Makefi
 strays=$(find modules/common -type f -not -name '*.rs' | head -3 | tr '\n' ' ')
 [ -z "$strays" ] && ok "modules/common holds only sources" || no "non-source files in modules/common: $strays"
 
-# 7. The operator applet and every module a bundle runs are built, and
+# 7. The operator applet and every module a package runs are built, and
 #    the applet is a real PIC object rather than a stub.
 fmods=target/fluxor/aarch64/modules
 sz=$(stat -c %s "$fmods/loam_cli.fmod" 2>/dev/null || echo 0)
@@ -68,7 +68,7 @@ for m in admin_gate admin_router namespace_router object_index body_store \
   body_fanout_router object_provider loam_volume loam_cli; do
   [ -s "$fmods/$m.fmod" ] || missing="$missing $m"
 done
-[ -z "$missing" ] && ok "every module the bundles run is built" || no "not built:$missing"
+[ -z "$missing" ] && ok "every module the packages run is built" || no "not built:$missing"
 
 if [ "$failed" = 0 ]; then
   echo "shipping_surface: ok"

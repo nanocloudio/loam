@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The loam-s3 service bundle, run as an operator runs it:
+# The loam-s3 service package, run as an operator runs it:
 #
 #   fluxor run packaging/service/loam-s3/workload.toml --param …
 #
@@ -7,7 +7,7 @@
 # wave's S3 traffic driver.
 #
 # Gates:
-#   - the bundle refuses to run without a required parameter;
+#   - the package refuses to run without a required parameter;
 #   - an object's life: PUT (a single record, a 256 KiB body and a streamed
 #     multi-megabyte body), GET identical, HEAD's length, a range, the listing, a
 #     conditional create refused when the key exists, DELETE, then 404,
@@ -25,9 +25,9 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/service_lib.sh"
 
 WAVE_ROOT="${WAVE_ROOT:-$ROOT/../wave}"
-BUNDLE="packaging/service/loam-s3/workload.toml"
+PACKAGE="packaging/service/loam-s3/workload.toml"
 
-echo "s3_service: the loam-s3 bundle"
+echo "s3_service: the loam-s3 package"
 
 MESH=$(mesh_root "$W")
 {
@@ -42,14 +42,14 @@ params=(--param "port=$PORT" --param "credentials=$W/credentials" --param "mesh_
   --param "spool_dir=$W/spool" --param gc_interval=100 --param max_object_mib=64 --param part_min_kib=64)
 
 # A required parameter left out is refused before anything runs.
-if (cd "$ROOT" && timeout 120 fluxor run "$BUNDLE" --param "port=$PORT") >"$W/refused.log" 2>&1; then
-  fail "the bundle ran without its required parameters"
+if (cd "$ROOT" && timeout 120 fluxor run "$PACKAGE" --param "port=$PORT") >"$W/refused.log" 2>&1; then
+  fail "the package ran without its required parameters"
 fi
 grep -q "credentials" "$W/refused.log" || fail "the refusal does not name the missing parameter"
 pass "a missing required parameter is refused"
 
 start() {
-  graph_start "$W/run$1.log" "$BUNDLE" "${params[@]}"
+  graph_start "$W/run$1.log" "$PACKAGE" "${params[@]}"
   S3=$GRAPH_PID
   wait_log "$W/run$1.log" "s3_serve\] serving"
 }
