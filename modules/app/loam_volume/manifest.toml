@@ -55,9 +55,12 @@ direction = "output"
 content_type = "OctetStream"
 buffer_size = 131072
 
+# Only a `capability` file is read through `fs`; chains handed in
+# `capability_chains` never open one.
 [[resources]]
 requires_contract = "fs"
 access = "read"
+active_when_params = ["capability"]
 
 [observability]
 exempt = "block source — block I/O is observed at the consumer above it; commit and fetch counters are in-arena and readable by the host harness"

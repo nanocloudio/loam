@@ -336,7 +336,11 @@ The loam-crypt-nbd service
 ([`packaging/service/loam-crypt-nbd/`](../packaging/service/loam-crypt-nbd/))
 puts fluxor's `crypt_block` between the device and the volume, so the
 node holding the volume stores only ciphertext; it takes loam-nbd's
-params and `crypt_key`, the key vault entry it encrypts under.
+params, `crypt_key`, the vault label of the volume's master key, and
+`vault` (default `vault.img`), the host file the graph's key vault
+keeps that master in, sealed under a key derived from the host's
+`FLUXOR_SEAL_KEY`. The master is made at the first mount; the same
+`FLUXOR_SEAL_KEY` and image open the volume again after a restart.
 
 ## Snapshots, clones and export
 

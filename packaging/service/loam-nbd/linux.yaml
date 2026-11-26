@@ -89,6 +89,11 @@ modules:
   - name: nbd_serve
     port: ${param:port}
 
+  # The key vault: tls imports the node's private key from `key` into it at
+  # start. Nothing in it outlives the instance, so it seals nothing.
+  - name: key_vault
+    seal: none
+
 wiring:
   - from: linux_net.net_out
     to: admin_tls.cipher_in

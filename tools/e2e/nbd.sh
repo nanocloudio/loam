@@ -17,7 +17,11 @@
 #   - a FUA write is durable without a flush;
 #   - a second device on the same volume is refused while the first holds
 #     the lease;
-#   - a device whose capability does not reach the volume never serves.
+#   - a device whose capability does not reach the volume never serves;
+#   - the volume claims `fs` only to read a `capability` file: on a node
+#     with no `fs` provider, a graph without that parameter composes (a
+#     node agent hands a workload its chains in `capability_chains`), and
+#     one naming a file is refused.
 #
 #   tools/e2e/nbd.sh
 set -euo pipefail
@@ -25,6 +29,53 @@ set -euo pipefail
 
 NBD="python3 $ROOT/tools/e2e/nbd_client.py"
 echo "nbd: a loam volume as an NBD device"
+
+# A pi5 node serving no `fs`: the volume over an NBD export on the
+# node's own net stack, with or without a capability file.
+volume_graph() { # <capability line or empty>
+  cat <<EOF
+target: pi5
+scheduler:
+  accept_cycles: true
+modules:
+  - name: rp1_gem
+  - name: ip
+    use_dhcp: 1
+  - name: loam_volume
+    variant: node
+    root: tenant
+    path: /vols/v0
+$1
+  - name: nbd_serve
+    port: 10809
+wiring:
+  - from: rp1_gem.frames_rx
+    to: ip.frames_rx
+  - from: ip.frames_tx
+    to: rp1_gem.frames_tx
+  - from: loam_volume.blocks
+    to: nbd_serve.blocks
+  - from: ip.net_out
+    to: nbd_serve.net_in
+  - from: nbd_serve.net_out
+    to: ip.net_in
+EOF
+}
+volume_graph "" >"$W/no_fs_chains.yaml"
+volume_graph "    capability: /etc/loam/volume.cap" >"$W/no_fs_file.yaml"
+(cd "$ROOT" && fluxor build --check "$W/no_fs_chains.yaml") >"$W/no_fs_chains.log" 2>&1 || {
+  cat "$W/no_fs_chains.log" >&2
+  fail "a volume reading no capability file needs an fs provider"
+}
+pass "a volume reading no capability file composes without an fs provider"
+if (cd "$ROOT" && fluxor build --check "$W/no_fs_file.yaml") >"$W/no_fs_file.log" 2>&1; then
+  fail "a volume naming a capability file composed without an fs provider"
+fi
+grep -q '`loam_volume` requires `fs`' "$W/no_fs_file.log" || {
+  cat "$W/no_fs_file.log" >&2
+  fail "a volume naming a capability file was refused for another reason"
+}
+pass "a volume naming a capability file is refused without an fs provider"
 
 make_pki "$W/pki"
 MESH=$(mesh_root "$W")

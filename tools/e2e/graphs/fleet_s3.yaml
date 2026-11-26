@@ -141,6 +141,12 @@ modules:
     authority: "${param:member_b}"
     channels: "OctetStream:len32:61485"
 
+  # The key vault: both tls clients import the node's private key from
+  # `key` into it at start. Nothing in it outlives the instance, so it
+  # seals nothing.
+  - name: key_vault
+    seal: none
+
 wiring:
   - from: linux_net.net_out
     to: http.net_in

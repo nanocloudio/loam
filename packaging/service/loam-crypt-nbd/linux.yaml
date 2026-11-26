@@ -20,7 +20,11 @@
 # The node's certificate is checked against the host's trusted CAs
 # (`FLUXOR_CA_BUNDLE` names another bundle). Linux attaches the export
 # with `nbd-client <host> <port> /dev/nbd0` and puts its own filesystem
-# on it. `crypt_key` names the key in the node's key vault.
+# on it. `crypt_key` labels the volume's master key in the graph's key
+# vault, which persists it sealed, under a key derived from the host's
+# FLUXOR_SEAL_KEY, in the `vault` image: the master is made at the first
+# mount and the volume opens again after a restart. The same vault holds
+# the node's private key, imported from `key` at start.
 
 target: linux
 
@@ -80,7 +84,12 @@ params:
     type: string
     required: true
     example: loam-db0
-    description: The key vault entry crypt_block encrypts the volume under
+    description: The key vault label of the volume's master key
+  vault:
+    type: string
+    default: vault.img
+    example: /var/lib/loam/vault.img
+    description: "The key vault's image, a host file: two 8 KiB A/B slots holding the sealed master key"
 
 modules:
   - name: tls
@@ -108,6 +117,16 @@ modules:
   - name: nbd_serve
     port: ${param:port}
 
+  # The key vault, its labelled keys sealed on `vault_disk`.
+  - name: key_vault
+    image: 8192
+  - name: vault_disk
+    type: file_block
+    path: "${param:vault}"
+    # The host's filesystem, whatever the graph serves as its own.
+    volume: platform
+    blocks: 32
+
 wiring:
   - from: linux_net.net_out
     to: tls.cipher_in
@@ -127,3 +146,6 @@ wiring:
     to: crypt_block.lower
   - from: crypt_block.blocks
     to: nbd_serve.blocks
+
+  - from: vault_disk.blocks
+    to: key_vault.blocks

@@ -28,6 +28,11 @@ modules:
     peer_auth: ca_dns
     trust: system
     ecdh_bits_per_step: 32
+  # The key vault: tls imports the operator's key, which `fluxor exec`
+  # hands it, into it at start. Nothing in it outlives the run, so it
+  # seals nothing.
+  - name: key_vault
+    seal: none
 
 wiring:
   - from: cli_in.args_out

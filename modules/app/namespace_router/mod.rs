@@ -19,9 +19,6 @@ use fluxor_abi as abi;
 // non-trivial slice indexing. See `fluxor/modules/sdk/runtime.rs`.
 use fluxor_rt::*;
 
-// `fluxor_rt::define_params!` macro + TLV/schema constants. Exports `SCHEMA_MAX`
-// referenced by the macro-generated `PARAM_SCHEMA` table.
-
 #[path = "../../common/mechanics/loam_change_wire.rs"]
 mod change_wire;
 

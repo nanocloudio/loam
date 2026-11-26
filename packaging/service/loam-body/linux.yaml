@@ -72,6 +72,11 @@ modules:
     variant: node
     root_dir: "${param:body_dir}"
 
+  # The key vault: tls imports the node's private key from `key` into it at
+  # start. Nothing in it outlives the instance, so it seals nothing.
+  - name: key_vault
+    seal: none
+
 wiring:
   - from: linux_net.net_out
     to: body_tls.cipher_in

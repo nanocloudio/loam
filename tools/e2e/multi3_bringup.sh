@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 3-node replicated loam metadata bring-up.
 #
-# Renders examples/linux/clustor_multi3.yaml per node and spawns three
+# Runs examples/linux/clustor_multi3.yaml once per node, its params naming
+# the node, as three
 # `fluxor run` processes — one full loam + replica graph each — then
 # watches for the acceptance shape:
 #
@@ -28,8 +29,7 @@ WAIT_SECS=45
 echo "[bringup] run dir: $RUN_DIR"
 
 # ── 0. Pre-flight: no stale nodes from a previous run ─────────────
-pkill -9 -f "loam-multi3-n[0-9].yaml" 2>/dev/null
-pkill -9 -f "target/linux/loam-multi3-n" 2>/dev/null
+pkill -9 -f "loam-multi3-n[0-9]-proposer.wal" 2>/dev/null
 sleep 1
 if ss -tln 2>/dev/null | grep -qE ":(929[0-2]|1929[0-2]) "; then
   echo "[bringup] FATAL: ports 9290-9292/19290-19292 still bound (stale processes?)"
@@ -69,25 +69,19 @@ for i in 0 1 2; do
   : > "/tmp/loam-multi3-n$i-proposer.wal"
 done
 
-# ── 3. Render per-node configs ────────────────────────────────────
-for i in 0 1 2; do
-  fluxor render-template "$LOAM_ROOT/examples/linux/clustor_multi3.yaml" \
-    --var SELF_ID="$i" \
-    --var LISTEN_PORT=$((BASE_PORT + i)) \
-    --var PEER0_PORT=$BASE_PORT \
-    --var PEER1_PORT=$((BASE_PORT + 1)) \
-    --var PEER2_PORT=$((BASE_PORT + 2)) \
-    --var HTTP_PORT=$((HTTP_BASE + i)) \
-    --var PROPOSER_WAL="/tmp/loam-multi3-n$i-proposer.wal" \
-    > "$RUN_DIR/loam-multi3-n$i.yaml" || exit 1
-done
-
-# ── 4. Spawn the three nodes ──────────────────────────────────────
+# ── 3. Spawn the three nodes ──────────────────────────────────────
 PIDS=()
 for i in 0 1 2; do
   ( cd "$RUN_DIR/node$i" && \
     FLUXOR_INSTALL_ROOT="$FLUXOR_CHECKOUT" \
-    setsid fluxor run "$RUN_DIR/loam-multi3-n$i.yaml" \
+    setsid fluxor run examples/linux/clustor_multi3.yaml \
+      --param self_id="$i" \
+      --param listen_port=$((BASE_PORT + i)) \
+      --param peer0_port=$BASE_PORT \
+      --param peer1_port=$((BASE_PORT + 1)) \
+      --param peer2_port=$((BASE_PORT + 2)) \
+      --param http_port=$((HTTP_BASE + i)) \
+      --param proposer_wal="/tmp/loam-multi3-n$i-proposer.wal" \
       > "$RUN_DIR/n$i.stdout" 2> "$RUN_DIR/n$i.stderr" ) &
   PIDS+=($!)
   echo "[bringup] node $i spawned (logs: $RUN_DIR/n$i.*)"
@@ -99,18 +93,16 @@ cleanup() {
     kill -TERM "$pid" 2>/dev/null
   done
   # The setsid'd `fluxor run` gets its own session (group kill by
-  # subshell pid misses it), and its fluxor-linux grandchild's argv
-  # is the node.img path, not the yaml — match BOTH patterns or
-  # a leaked node squats on a peer port and wrecks the next run.
-  pkill -TERM -f "loam-multi3-n[0-9].yaml" 2>/dev/null
-  pkill -TERM -f "target/linux/loam-multi3-n" 2>/dev/null
+  # subshell pid misses it); its argv names the node's proposer WAL,
+  # and it takes its runtime down when it ends. A leaked node squats
+  # on a peer port and wrecks the next run.
+  pkill -TERM -f "loam-multi3-n[0-9]-proposer.wal" 2>/dev/null
   sleep 1
-  pkill -9 -f "loam-multi3-n[0-9].yaml" 2>/dev/null
-  pkill -9 -f "target/linux/loam-multi3-n" 2>/dev/null
+  pkill -9 -f "loam-multi3-n[0-9]-proposer.wal" 2>/dev/null
 }
 trap cleanup EXIT
 
-# ── 5. Watch for the acceptance shape ─────────────────────────────
+# ── 4. Watch for the acceptance shape ─────────────────────────────
 deadline=$((SECONDS + WAIT_SECS))
 pass_nodes=""
 while [ $SECONDS -lt $deadline ]; do

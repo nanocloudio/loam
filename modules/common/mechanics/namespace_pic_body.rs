@@ -3326,9 +3326,11 @@ pub const NS_OP_BIND: u32 = super::abi::registry::storage_namespace::BIND;
 pub const NS_OP_CAPS: u32 = super::abi::registry::storage_namespace::CAPS;
 
 /// `internal::reconfigure::OWNER_RELEASED`: the kernel tells a provider
-/// that exports `module_observes_owner_release` that an owner is going
-/// away; the argument is its 8-byte owner record.
+/// that observes owner release that an owner is going away. The argument
+/// is `[slot u16][0 u16][gen u32][owner_uid 16]`; its first 8 bytes are
+/// the record `CALLER_OWNER` answers, which is what this provider stamps.
 pub const OWNER_RELEASED: u32 = super::abi::registry::reconfigure::OWNER_RELEASED;
+pub const OWNER_RELEASED_ARG_LEN: usize = super::abi::internal::reconfigure::OWNER_RELEASED_ARG_LEN;
 
 /// Capability bits this provider sets: BIND(0), RENAME(1), DELETE(2),
 /// SUBSCRIBE(3), CHANGES(4). Every optional op on the surface. The
@@ -3854,8 +3856,7 @@ unsafe fn alloc_handle(s: &mut ModuleState, slot: u32, revision: u64) -> i32 {
     E_MFILE
 }
 
-/// `query_key::CALLER_OWNER`.
-const CALLER_OWNER: u32 = 9;
+const CALLER_OWNER: u32 = super::abi::kernel_abi::query_key::CALLER_OWNER;
 
 /// The owner record of the module calling in; `None` when the kernel cannot
 /// name one, and then nothing is opened for it.
@@ -3906,7 +3907,7 @@ pub unsafe fn provider_dispatch_impl(
     // An owner going away: its subscriptions and handles go now. Before
     // the boot gate — a release never waits for the store.
     if opcode == OWNER_RELEASED {
-        if !arg.is_null() && arg_len >= 8 {
+        if !arg.is_null() && arg_len >= OWNER_RELEASED_ARG_LEN {
             let mut owner = [0u8; 8];
             core::ptr::copy_nonoverlapping(arg as *const u8, owner.as_mut_ptr(), 8);
             owner_released(s, owner);
